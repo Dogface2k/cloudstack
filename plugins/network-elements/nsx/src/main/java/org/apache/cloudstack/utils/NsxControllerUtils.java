@@ -51,6 +51,15 @@ public class NsxControllerUtils {
     }
 
     public NsxAnswer sendNsxCommand(NsxCommand cmd, long zoneId) throws IllegalArgumentException {
+        NsxAnswer answer = sendNsxCommandForResult(cmd, zoneId);
+        if (!answer.getResult()) {
+            logger.error("NSX API Command failed");
+            throw new InvalidParameterValueException("Failed API call to NSX controller");
+        }
+        return answer;
+    }
+
+    public NsxAnswer sendNsxCommandForResult(NsxCommand cmd, long zoneId) throws IllegalArgumentException {
         NsxProviderVO nsxProviderVO = nsxProviderDao.findByZoneId(zoneId);
         if (nsxProviderVO == null) {
             logger.error("No NSX controller was found!");
@@ -58,7 +67,7 @@ public class NsxControllerUtils {
         }
         Answer answer = agentMgr.easySend(nsxProviderVO.getHostId(), cmd);
 
-        if (answer == null || !answer.getResult()) {
+        if (answer == null) {
             logger.error("NSX API Command failed");
             throw new InvalidParameterValueException("Failed API call to NSX controller");
         }

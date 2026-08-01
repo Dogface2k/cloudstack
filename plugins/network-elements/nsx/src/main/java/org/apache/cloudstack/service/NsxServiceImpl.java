@@ -46,36 +46,40 @@ import org.apache.cloudstack.agent.api.DeleteNsxTier1GatewayCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxVpnConnectionCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxVpnGatewayCommand;
 import org.apache.cloudstack.agent.api.GetNsxVpnSessionStatusCommand;
+import org.apache.cloudstack.agent.api.UpdateNsxVpnConnectionStateCommand;
 import org.apache.cloudstack.framework.config.ConfigKey;
 import org.apache.cloudstack.framework.config.Configurable;
 import org.apache.cloudstack.managed.context.ManagedContextRunnable;
 import org.apache.cloudstack.resource.NsxNetworkRule;
+import org.apache.cloudstack.resourcedetail.dao.UserIpAddressDetailsDao;
 import org.apache.cloudstack.utils.NsxControllerUtils;
 import org.apache.cloudstack.utils.NsxHelper;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import com.cloud.alert.AlertManager;
+import com.cloud.domain.DomainVO;
+import com.cloud.domain.dao.DomainDao;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
 import com.cloud.network.SDNProviderNetworkRule;
 import com.cloud.network.Site2SiteVpnConnection;
 import com.cloud.network.dao.NetworkVO;
+import com.cloud.network.dao.NsxVrfGatewayDao;
 import com.cloud.network.dao.Site2SiteVpnConnectionDao;
 import com.cloud.network.dao.Site2SiteVpnConnectionVO;
 import com.cloud.network.dao.Site2SiteVpnGatewayDao;
 import com.cloud.network.dao.Site2SiteVpnGatewayVO;
+import com.cloud.network.element.NsxVrfGatewayVO;
 import com.cloud.network.nsx.NsxService;
+import com.cloud.network.nsx.NsxVpnGatewayResult;
 import com.cloud.network.vpc.Vpc;
+import com.cloud.network.vpc.VpcManager;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.network.vpc.dao.VpcOfferingServiceMapDao;
 import com.cloud.utils.component.ManagerBase;
 import com.cloud.utils.concurrency.NamedThreadFactory;
-import com.cloud.domain.DomainVO;
-import com.cloud.domain.dao.DomainDao;
-import com.cloud.network.dao.NsxVrfGatewayDao;
-import com.cloud.network.element.NsxVrfGatewayVO;
 import com.cloud.utils.exception.CloudRuntimeException;
 import org.apache.commons.lang3.StringUtils;
 
@@ -89,17 +93,14 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
     public static final ConfigKey<String> NSX_VRF_SCOPE = new ConfigKey<>(String.class,
             "nsx.vrf.scope", "Advanced", "NONE",
             "Routing domain granularity for NSX zones. NONE (default) attaches every tenant's Tier-1 " +
-                    "gateways to the zone-wide Tier-0, which is the behaviour before per-tenant VRFs existed. " +
-                    "ACCOUNT or DOMAIN instead attaches them to the VRF (or dedicated) Tier-0 registered for " +
-                    "that tenant, giving each tenant its own routing table",
+                    "gateways to the zone-wide Tier-0. ACCOUNT or DOMAIN attaches them to the registered " +
+                    "tenant-specific Tier-0 or VRF gateway",
             true, ConfigKey.Scope.Zone, null, null, null, null, null,
             ConfigKey.Kind.Select, "NONE,ACCOUNT,DOMAIN");
 
     public static final ConfigKey<Boolean> NSX_VRF_FALLBACK_TO_SHARED_TIER0 = new ConfigKey<>("Advanced", Boolean.class,
             "nsx.vrf.fallback.to.shared.tier0", "false",
-            "Only consulted when nsx.vrf.scope is not NONE. When false, creating a network or VPC for a tenant " +
-                    "with no NSX VRF gateway registered fails. When true, such tenants silently fall back to the " +
-                    "zone-wide Tier-0 — convenient, but it puts them back in the shared routing table",
+            "Allow a tenant without an assigned NSX VRF gateway to use the zone-wide Tier-0 when nsx.vrf.scope is enabled",
             true, ConfigKey.Scope.Zone);
 
     protected static final String NSX_VRF_SCOPE_NONE = "NONE";
@@ -113,7 +114,7 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
     protected static final int VPN_STATUS_POLL_DEFAULT_INTERVAL = 60;
 
     private static final List<Site2SiteVpnConnection.State> VPN_POLLED_STATES = List.of(
-            Site2SiteVpnConnection.State.Connecting, Site2SiteVpnConnection.State.Connected,
+            Site2SiteVpnConnection.State.Pending, Site2SiteVpnConnection.State.Connecting, Site2SiteVpnConnection.State.Connected,
             Site2SiteVpnConnection.State.Disconnected);
 
     @Inject
@@ -123,15 +124,19 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
     @Inject
     VpcOfferingServiceMapDao vpcOfferingServiceMapDao;
     @Inject
+    VpcManager vpcManager;
+    @Inject
     Site2SiteVpnConnectionDao site2SiteVpnConnectionDao;
     @Inject
     Site2SiteVpnGatewayDao site2SiteVpnGatewayDao;
     @Inject
-    AlertManager alertManager;
-    @Inject
     NsxVrfGatewayDao nsxVrfGatewayDao;
     @Inject
     DomainDao domainDao;
+    @Inject
+    UserIpAddressDetailsDao userIpAddressDetailsDao;
+    @Inject
+    AlertManager alertManager;
 
     protected Logger logger = LogManager.getLogger(getClass());
 
@@ -140,12 +145,17 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
 
     @Override
     public boolean configure(String name, Map<String, Object> params) throws ConfigurationException {
+        super.configure(name, params);
         vpnStatusPollExecutor = Executors.newSingleThreadScheduledExecutor(new NamedThreadFactory("Nsx-Vpn-Status-Poll"));
         return true;
     }
 
     @Override
     public boolean start() {
+        super.start();
+        if (vpnStatusPollExecutor == null) {
+            throw new IllegalStateException("NSX VPN status poller was not configured");
+        }
         Integer configuredInterval = NSX_VPN_STATUS_POLL_INTERVAL.value();
         int pollInterval = Objects.isNull(configuredInterval) ? VPN_STATUS_POLL_DEFAULT_INTERVAL : configuredInterval;
         if (pollInterval < VPN_STATUS_POLL_MIN_INTERVAL) {
@@ -162,7 +172,7 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         if (Objects.nonNull(vpnStatusPollExecutor)) {
             vpnStatusPollExecutor.shutdownNow();
         }
-        return true;
+        return super.stop();
     }
 
     public boolean createVpcNetwork(Long zoneId, long accountId, long domainId, Long vpcId, String vpcName, boolean sourceNatEnabled) {
@@ -173,11 +183,6 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         return result.getResult();
     }
 
-    /**
-     * Points the new Tier-1 gateway at the tenant's own Tier-0 and edge cluster, when the
-     * zone is VRF-segregated and the tenant has one registered. Leaves the command
-     * untouched otherwise, so the resource falls back to the zone-wide values.
-     */
     protected void applyVrfGateway(CreateNsxTier1GatewayCommand cmd, Long zoneId, long accountId, long domainId) {
         NsxVrfGatewayVO gateway = resolveVrfGateway(zoneId, accountId, domainId);
         if (gateway == null) {
@@ -187,19 +192,6 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         cmd.setEdgeCluster(gateway.getEdgeCluster());
     }
 
-    /**
-     * Finds the NSX VRF gateway a tenant's Tier-1 gateways should attach to.
-     *
-     * Resolution order is exact account, then the tenant's domain, then each ancestor
-     * domain in turn — so a reseller can register one routing domain per customer rather
-     * than one per CloudStack account.
-     *
-     * @return the tenant's gateway, or null when the zone is not VRF-segregated or when
-     *         no gateway is registered and falling back to the shared Tier-0 is allowed
-     * @throws CloudRuntimeException when the zone is VRF-segregated, the tenant has no
-     *         gateway, and fallback is disabled — silently dropping a tenant into the
-     *         shared routing table of a zone declared segregated is the worse failure
-     */
     protected NsxVrfGatewayVO resolveVrfGateway(Long zoneId, long accountId, long domainId) {
         if (zoneId == null) {
             return null;
@@ -216,30 +208,24 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         if (gateway == null) {
             gateway = findVrfGatewayForDomainChain(zoneId, domainId);
         }
-
         if (gateway != null) {
             logger.debug("Resolved NSX VRF gateway {} for account {} in zone {}", gateway, accountId, zoneId);
             return gateway;
         }
-
         if (isVrfFallbackToSharedTier0Allowed(zoneId)) {
-            logger.warn("Zone {} has {}={} but account {} has no NSX VRF gateway registered; falling back to the " +
-                            "zone-wide tier 0 because {} is enabled. This tenant shares a routing table with the others",
-                    zoneId, NSX_VRF_SCOPE.key(), scope, accountId, NSX_VRF_FALLBACK_TO_SHARED_TIER0.key());
+            logger.warn("Account {} has no NSX VRF gateway in zone {}; using the shared Tier-0 because {} is enabled",
+                    accountId, zoneId, NSX_VRF_FALLBACK_TO_SHARED_TIER0.key());
             return null;
         }
         throw new CloudRuntimeException(String.format(
-                "Zone %s is segregated by %s=%s but account %s has no NSX VRF gateway registered. Register one with " +
-                        "addNsxVrfGateway and assign it, or enable %s to allow the shared tier 0",
+                "Zone %s uses %s=%s, but account %s has no NSX VRF gateway. Assign one or enable %s",
                 zoneId, NSX_VRF_SCOPE.key(), scope, accountId, NSX_VRF_FALLBACK_TO_SHARED_TIER0.key()));
     }
 
-    /** Seam over the zone-scoped setting, so the resolution logic is unit-testable. */
     protected String getVrfScope(long zoneId) {
         return NSX_VRF_SCOPE.valueIn(zoneId);
     }
 
-    /** Seam over the zone-scoped setting, so the resolution logic is unit-testable. */
     protected boolean isVrfFallbackToSharedTier0Allowed(long zoneId) {
         return Boolean.TRUE.equals(NSX_VRF_FALLBACK_TO_SHARED_TIER0.valueIn(zoneId));
     }
@@ -388,11 +374,11 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         return result.getResult();
     }
 
-    public boolean createVpnGateway(Vpc vpc, String localEndpointIp) {
+    public NsxVpnGatewayResult createVpnGateway(Vpc vpc, String localEndpointIp) {
         CreateNsxVpnGatewayCommand createNsxVpnGatewayCommand = new CreateNsxVpnGatewayCommand(vpc.getDomainId(),
                 vpc.getAccountId(), vpc.getZoneId(), vpc.getId(), vpc.getName(), localEndpointIp);
-        NsxAnswer result = nsxControllerUtils.sendNsxCommand(createNsxVpnGatewayCommand, vpc.getZoneId());
-        return result.getResult();
+        NsxAnswer result = nsxControllerUtils.sendNsxCommandForResult(createNsxVpnGatewayCommand, vpc.getZoneId());
+        return new NsxVpnGatewayResult(result.getResult(), result.isEndpointMayBeInUse());
     }
 
     public boolean deleteVpnGateway(Vpc vpc) {
@@ -418,6 +404,13 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         DeleteNsxVpnConnectionCommand deleteNsxVpnConnectionCommand = new DeleteNsxVpnConnectionCommand(vpc.getDomainId(),
                 vpc.getAccountId(), vpc.getZoneId(), vpc.getId(), vpc.getName(), connectionUuid);
         NsxAnswer result = nsxControllerUtils.sendNsxCommand(deleteNsxVpnConnectionCommand, vpc.getZoneId());
+        return result.getResult();
+    }
+
+    public boolean updateVpnConnectionState(Vpc vpc, String connectionUuid, boolean enabled) {
+        UpdateNsxVpnConnectionStateCommand command = new UpdateNsxVpnConnectionStateCommand(vpc.getDomainId(),
+                vpc.getAccountId(), vpc.getZoneId(), vpc.getId(), vpc.getName(), connectionUuid, enabled);
+        NsxAnswer result = nsxControllerUtils.sendNsxCommand(command, vpc.getZoneId());
         return result.getResult();
     }
 
@@ -448,8 +441,7 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
                         continue;
                     }
                     VpcVO vpc = vpcDao.findById(vpnGateway.getVpcId());
-                    if (vpc == null || vpcOfferingServiceMapDao.findByServiceProviderAndOfferingId(
-                            Network.Service.Vpn.getName(), Network.Provider.Nsx.getName(), vpc.getVpcOfferingId()) == null) {
+                    if (vpc == null || !isVpnProvidedByNsx(vpc, vpnGateway)) {
                         continue;
                     }
                     polledConnectionIds.add(connection.getId());
@@ -461,6 +453,23 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
                 logger.warn("Failed to poll the status of the NSX Site-to-Site VPN connections: {}", e.getMessage(), e);
             }
         }
+    }
+
+    private boolean isVpnProvidedByNsx(Vpc vpc) {
+        if (vpcManager != null) {
+            return vpcManager.isProviderSupportServiceInVpc(vpc.getId(), Network.Service.Vpn, Network.Provider.Nsx);
+        }
+        return vpcOfferingServiceMapDao.findByServiceProviderAndOfferingId(
+                Network.Service.Vpn.getName(), Network.Provider.Nsx.getName(), vpc.getVpcOfferingId()) != null;
+    }
+
+    private boolean isVpnProvidedByNsx(Vpc vpc, Site2SiteVpnGatewayVO vpnGateway) {
+        if (isVpnProvidedByNsx(vpc)) {
+            return true;
+        }
+        return userIpAddressDetailsDao != null
+                && vpnGateway != null
+                && userIpAddressDetailsDao.findDetail(vpnGateway.getAddrId(), NsxElement.NSX_VPN_GATEWAY_IP_DETAIL) != null;
     }
 
     protected void pollVpnConnectionStatus(Site2SiteVpnConnectionVO connection, VpcVO vpc) {
@@ -491,8 +500,14 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         } else if (VPN_SESSION_STATUS_DOWN.equals(status) || VPN_SESSION_STATUS_DEGRADED.equals(status)) {
             newState = Site2SiteVpnConnection.State.Disconnected;
         } else if (VPN_SESSION_STATUS_NOT_FOUND.equals(status)) {
-            if (connection.getState() == Site2SiteVpnConnection.State.Connecting) {
+            if (connection.getState() == Site2SiteVpnConnection.State.Pending
+                    || connection.getState() == Site2SiteVpnConnection.State.Connecting) {
                 // the async connection job may still be creating the session on NSX
+                return;
+            }
+            if (connection.getState() == Site2SiteVpnConnection.State.Disconnected) {
+                // stop intentionally disables the session; a subsequent status lookup may report it
+                // as absent while the connection remains a valid, stopped CloudStack resource
                 return;
             }
             // an established session vanished from NSX: flag the connection for a manual reset

@@ -37,6 +37,7 @@ import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.LoadBalancerVMMapDao;
+import com.cloud.network.dao.LoadBalancerDao;
 import com.cloud.network.dao.LoadBalancerVO;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
@@ -48,11 +49,13 @@ import com.cloud.network.dao.Site2SiteVpnGatewayDao;
 import com.cloud.network.dao.Site2SiteVpnGatewayVO;
 import com.cloud.network.element.PortForwardingServiceProvider;
 import com.cloud.network.lb.LoadBalancingRule;
+import com.cloud.network.nsx.NsxVpnGatewayResult;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.FirewallRuleVO;
 import com.cloud.network.rules.PortForwardingRule;
 import com.cloud.network.rules.PortForwardingRuleVO;
 import com.cloud.network.rules.StaticNatImpl;
+import com.cloud.network.rules.dao.PortForwardingRulesDao;
 import com.cloud.network.vpc.NetworkACLItem;
 import com.cloud.network.vpc.NetworkACLItemVO;
 import com.cloud.network.vpc.Vpc;
@@ -104,6 +107,7 @@ import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -147,6 +151,8 @@ public class NsxElementTest {
     @Mock
     LoadBalancerVMMapDao lbVmMapDao;
     @Mock
+    LoadBalancerDao loadBalancerDao;
+    @Mock
     FirewallRuleDetailsDao firewallRuleDetailsDao;
     @Mock
     IpAddressManager ipAddressManager;
@@ -160,6 +166,8 @@ public class NsxElementTest {
     UserIpAddressDetailsDao userIpAddressDetailsDao;
     @Mock
     FirewallRulesDao firewallRulesDao;
+    @Mock
+    PortForwardingRulesDao portForwardingRulesDao;
 
     NsxElement nsxElement;
     ReservationContext reservationContext;
@@ -184,6 +192,7 @@ public class NsxElementTest {
         nsxElement.vmInstanceDao = vmInstanceDao;
         nsxElement.vpcDao = vpcDao;
         nsxElement.lbVmMapDao = lbVmMapDao;
+        nsxElement.loadBalancerDao = loadBalancerDao;
         nsxElement.firewallRuleDetailsDao = firewallRuleDetailsDao;
         nsxElement.ipAddressManager = ipAddressManager;
         nsxElement.vpcService = vpcService;
@@ -191,6 +200,11 @@ public class NsxElementTest {
         nsxElement.customerGatewayDao = customerGatewayDao;
         nsxElement.userIpAddressDetailsDao = userIpAddressDetailsDao;
         nsxElement.firewallRulesDao = firewallRulesDao;
+        nsxElement.portForwardingRulesDao = portForwardingRulesDao;
+        Mockito.lenient().when(ipAddressManager.disassociatePublicIpAddress(any(), anyLong(), any())).thenReturn(true);
+        Mockito.lenient().when(loadBalancerDao.listByIpAddress(anyLong())).thenReturn(List.of());
+        Mockito.lenient().when(firewallRulesDao.listByIpAndNotRevoked(anyLong())).thenReturn(List.of());
+        Mockito.lenient().when(portForwardingRulesDao.listByIpAndNotRevoked(anyLong())).thenReturn(List.of());
 
         Field field = ApiDBUtils.class.getDeclaredField("s_ipAddressDao");
         field.setAccessible(true);
@@ -523,6 +537,8 @@ public class NsxElementTest {
         IPAddressVO ipAddressVO = Mockito.mock(IPAddressVO.class);
         when(ipAddressDao.findById(id)).thenReturn(ipAddressVO);
         Mockito.lenient().when(ipAddressVO.getAddress()).thenReturn(new Ip(address));
+        Mockito.lenient().when(ipAddressVO.readyToUse()).thenReturn(true);
+        Mockito.lenient().when(ipAddressVO.getRemoved()).thenReturn(null);
         return ipAddressVO;
     }
 
@@ -534,11 +550,64 @@ public class NsxElementTest {
         IPAddressVO ipAddressVO = mockIpAddressVO(20L, "10.1.13.20");
         when(ipAddressVO.getId()).thenReturn(20L);
         when(ipAddressVO.getVpcId()).thenReturn(9L);
-        when(firewallRulesDao.countRulesByIpId(20L)).thenReturn(0L);
-        when(nsxService.createVpnGateway(vpcVO, "10.1.13.20")).thenReturn(true);
+        when(loadBalancerDao.listByIpAddress(20L)).thenReturn(List.of());
+        when(nsxService.createVpnGateway(vpcVO, "10.1.13.20")).thenReturn(new NsxVpnGatewayResult(true, true));
 
         IpAddress result = nsxElement.acquireVpnGatewayIp(vpcVO, requestedIp);
         assertEquals(ipAddressVO, result);
+        verify(userIpAddressDetailsDao).addDetail(20L, "nsxVpnGatewayIp", "false", false);
+    }
+
+    @Test
+    public void testAcquireVpnGatewayIpDoesNotCallNsxWhenRequestedIpOwnershipCannotBeRecorded() {
+        VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+        IpAddress requestedIp = Mockito.mock(IpAddress.class);
+        when(requestedIp.getId()).thenReturn(20L);
+        IPAddressVO ipAddressVO = mockIpAddressVO(20L, "10.1.13.20");
+        when(ipAddressVO.getId()).thenReturn(20L);
+        when(ipAddressVO.getVpcId()).thenReturn(9L);
+        when(loadBalancerDao.listByIpAddress(20L)).thenReturn(List.of());
+        Mockito.doThrow(new CloudRuntimeException("marker write failed")).when(userIpAddressDetailsDao)
+                .addDetail(20L, "nsxVpnGatewayIp", "false", false);
+
+        Assert.assertThrows(CloudRuntimeException.class,
+                () -> nsxElement.acquireVpnGatewayIp(vpcVO, requestedIp));
+
+        verify(nsxService, never()).createVpnGateway(any(Vpc.class), anyString());
+    }
+
+    @Test
+    public void testAcquireVpnGatewayIpRemovesRequestedIpOwnershipWhenNsxRejectsGateway() {
+        VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+        IpAddress requestedIp = Mockito.mock(IpAddress.class);
+        when(requestedIp.getId()).thenReturn(20L);
+        IPAddressVO ipAddressVO = mockIpAddressVO(20L, "10.1.13.20");
+        when(ipAddressVO.getId()).thenReturn(20L);
+        when(ipAddressVO.getVpcId()).thenReturn(9L);
+        when(loadBalancerDao.listByIpAddress(20L)).thenReturn(List.of());
+        when(nsxService.createVpnGateway(vpcVO, "10.1.13.20")).thenReturn(new NsxVpnGatewayResult(false, false));
+
+        Assert.assertThrows(CloudRuntimeException.class,
+                () -> nsxElement.acquireVpnGatewayIp(vpcVO, requestedIp));
+
+        verify(userIpAddressDetailsDao).removeDetail(20L, "nsxVpnGatewayIp");
+    }
+
+    @Test
+    public void testAcquireVpnGatewayIpRetainsRequestedIpOwnershipWhenNsxResultIsAmbiguous() {
+        VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+        IpAddress requestedIp = Mockito.mock(IpAddress.class);
+        when(requestedIp.getId()).thenReturn(20L);
+        IPAddressVO ipAddressVO = mockIpAddressVO(20L, "10.1.13.20");
+        when(ipAddressVO.getId()).thenReturn(20L);
+        when(ipAddressVO.getVpcId()).thenReturn(9L);
+        when(loadBalancerDao.listByIpAddress(20L)).thenReturn(List.of());
+        when(nsxService.createVpnGateway(vpcVO, "10.1.13.20")).thenReturn(new NsxVpnGatewayResult(false, true));
+
+        Assert.assertThrows(CloudRuntimeException.class,
+                () -> nsxElement.acquireVpnGatewayIp(vpcVO, requestedIp));
+
+        verify(userIpAddressDetailsDao, never()).removeDetail(20L, "nsxVpnGatewayIp");
     }
 
     @Test(expected = InvalidParameterValueException.class)
@@ -549,8 +618,37 @@ public class NsxElementTest {
         IPAddressVO ipAddressVO = Mockito.mock(IPAddressVO.class);
         when(ipAddressDao.findById(20L)).thenReturn(ipAddressVO);
         when(ipAddressVO.getVpcId()).thenReturn(9L);
+        when(ipAddressVO.readyToUse()).thenReturn(true);
+        when(ipAddressVO.getRemoved()).thenReturn(null);
         when(ipAddressVO.isSourceNat()).thenReturn(true);
         when(ipAddressVO.getAddress()).thenReturn(new Ip("10.1.13.20"));
+
+        nsxElement.acquireVpnGatewayIp(vpcVO, requestedIp);
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void testAcquireVpnGatewayIpRejectsIpWithPortForwardingRule() {
+        VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+        IpAddress requestedIp = Mockito.mock(IpAddress.class);
+        when(requestedIp.getId()).thenReturn(20L);
+        IPAddressVO ipAddressVO = mockIpAddressVO(20L, "10.1.13.20");
+        when(ipAddressVO.getId()).thenReturn(20L);
+        when(ipAddressVO.getVpcId()).thenReturn(9L);
+        when(portForwardingRulesDao.listByIpAndNotRevoked(20L))
+                .thenReturn(List.of(Mockito.mock(PortForwardingRuleVO.class)));
+
+        nsxElement.acquireVpnGatewayIp(vpcVO, requestedIp);
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void testAcquireVpnGatewayIpRejectsAnUnallocatedIp() {
+        VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+        IpAddress requestedIp = Mockito.mock(IpAddress.class);
+        when(requestedIp.getId()).thenReturn(21L);
+        IPAddressVO ipAddressVO = Mockito.mock(IPAddressVO.class);
+        when(ipAddressDao.findById(21L)).thenReturn(ipAddressVO);
+        when(ipAddressVO.getVpcId()).thenReturn(9L);
+        when(ipAddressVO.readyToUse()).thenReturn(false);
 
         nsxElement.acquireVpnGatewayIp(vpcVO, requestedIp);
     }
@@ -574,13 +672,57 @@ public class NsxElementTest {
             when(allocatedIp.getId()).thenReturn(30L);
             when(ipAddressManager.allocateIp(any(), anyBoolean(), any(), any(), any(), any(), any())).thenReturn(allocatedIp);
             IPAddressVO ipAddressVO = mockIpAddressVO(30L, "10.1.13.30");
-            when(nsxService.createVpnGateway(vpcVO, "10.1.13.30")).thenReturn(true);
+            when(nsxService.createVpnGateway(vpcVO, "10.1.13.30")).thenReturn(new NsxVpnGatewayResult(true, true));
 
             IpAddress result = nsxElement.acquireVpnGatewayIp(vpcVO, null);
             assertEquals(ipAddressVO, result);
             verify(vpcService).associateIPToVpc(30L, 9L);
             verify(userIpAddressDetailsDao).addDetail(30L, "nsxVpnGatewayIp", "true", false);
         } finally {
+            CallContext.unregister();
+        }
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void testAcquireVpnGatewayIpReleasesAutoAcquiredIpWhenNsxRejectsGateway() throws Exception {
+        CallContext.register(Mockito.mock(User.class), Mockito.mock(Account.class));
+        try {
+            VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+            when(vpcVO.getAccountId()).thenReturn(2L);
+            when(vpcVO.getZoneId()).thenReturn(1L);
+            IpAddress allocatedIp = Mockito.mock(IpAddress.class);
+            when(allocatedIp.getId()).thenReturn(31L);
+            when(ipAddressManager.allocateIp(any(), anyBoolean(), any(), any(), any(), any(), any())).thenReturn(allocatedIp);
+            IPAddressVO ipAddressVO = mockIpAddressVO(31L, "10.1.13.31");
+            when(ipAddressVO.getId()).thenReturn(31L);
+            when(nsxService.createVpnGateway(vpcVO, "10.1.13.31")).thenReturn(new NsxVpnGatewayResult(false, false));
+            when(ipAddressManager.disassociatePublicIpAddress(any(IPAddressVO.class), anyLong(), any())).thenReturn(true);
+
+            nsxElement.acquireVpnGatewayIp(vpcVO, null);
+        } finally {
+            verify(userIpAddressDetailsDao).removeDetail(31L, "nsxVpnGatewayIp");
+            verify(ipAddressManager).disassociatePublicIpAddress(any(IPAddressVO.class), anyLong(), any());
+            CallContext.unregister();
+        }
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void testAcquireVpnGatewayIpRetainsAutoAcquiredIpWhenEndpointMayBeInUse() throws Exception {
+        CallContext.register(Mockito.mock(User.class), Mockito.mock(Account.class));
+        try {
+            VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+            when(vpcVO.getAccountId()).thenReturn(2L);
+            when(vpcVO.getZoneId()).thenReturn(1L);
+            IpAddress allocatedIp = Mockito.mock(IpAddress.class);
+            when(allocatedIp.getId()).thenReturn(32L);
+            when(ipAddressManager.allocateIp(any(), anyBoolean(), any(), any(), any(), any(), any())).thenReturn(allocatedIp);
+            mockIpAddressVO(32L, "10.1.13.32");
+            when(nsxService.createVpnGateway(vpcVO, "10.1.13.32")).thenReturn(new NsxVpnGatewayResult(false, true));
+
+            nsxElement.acquireVpnGatewayIp(vpcVO, null);
+        } finally {
+            verify(userIpAddressDetailsDao, never()).removeDetail(32L, "nsxVpnGatewayIp");
+            verify(ipAddressManager, never()).disassociatePublicIpAddress(any(IPAddressVO.class), anyLong(), any());
             CallContext.unregister();
         }
     }
@@ -623,6 +765,97 @@ public class NsxElementTest {
 
         nsxElement.releaseVpnGatewayIp(vpnGateway);
         verify(ipAddressManager, Mockito.never()).disassociatePublicIpAddress(any(), anyLong(), any());
+    }
+
+    @Test
+    public void testNsxVpnGatewayOwnershipIsRecordedForOperatorSpecifiedIp() {
+        Site2SiteVpnGateway vpnGateway = Mockito.mock(Site2SiteVpnGateway.class);
+        when(vpnGateway.getAddrId()).thenReturn(30L);
+        when(userIpAddressDetailsDao.findDetail(30L, "nsxVpnGatewayIp"))
+                .thenReturn(Mockito.mock(UserIpAddressDetailVO.class));
+
+        assertTrue(nsxElement.ownsVpnGateway(vpnGateway));
+    }
+
+    @Test
+    public void testReleaseVpnGatewayIpUsesPersistedOwnershipWhenOfferingMappingIsGone() {
+        VpcVO vpcVO = Mockito.mock(VpcVO.class);
+        when(vpcDao.findById(9L)).thenReturn(vpcVO);
+        Site2SiteVpnGateway vpnGateway = Mockito.mock(Site2SiteVpnGateway.class);
+        when(vpnGateway.getVpcId()).thenReturn(9L);
+        when(vpnGateway.getAddrId()).thenReturn(30L);
+        when(nsxService.deleteVpnGateway(vpcVO)).thenReturn(true);
+        IPAddressVO ipAddressVO = mockIpAddressVO(30L, "10.1.13.30");
+        when(ipAddressVO.getId()).thenReturn(30L);
+        UserIpAddressDetailVO detail = Mockito.mock(UserIpAddressDetailVO.class);
+        when(detail.getValue()).thenReturn("false");
+        when(userIpAddressDetailsDao.findDetail(30L, "nsxVpnGatewayIp")).thenReturn(detail);
+
+        nsxElement.releaseVpnGatewayIp(vpnGateway);
+
+        verify(nsxService).deleteVpnGateway(vpcVO);
+        verify(userIpAddressDetailsDao).removeDetail(30L, "nsxVpnGatewayIp");
+        verify(ipAddressManager, Mockito.never()).disassociatePublicIpAddress(any(), anyLong(), any());
+    }
+
+    @Test
+    public void testReleaseVpnGatewayIpRemovesOperatorMarkerWhenVpcRowIsGone() {
+        when(vpcDao.findById(9L)).thenReturn(null);
+        Site2SiteVpnGateway vpnGateway = Mockito.mock(Site2SiteVpnGateway.class);
+        when(vpnGateway.getVpcId()).thenReturn(9L);
+        when(vpnGateway.getAddrId()).thenReturn(30L);
+        IPAddressVO ipAddressVO = mockIpAddressVO(30L, "10.1.13.30");
+        when(ipAddressVO.getId()).thenReturn(30L);
+        UserIpAddressDetailVO detail = Mockito.mock(UserIpAddressDetailVO.class);
+        when(detail.getValue()).thenReturn("false");
+        when(userIpAddressDetailsDao.findDetail(30L, "nsxVpnGatewayIp")).thenReturn(detail);
+
+        nsxElement.releaseVpnGatewayIp(vpnGateway);
+
+        verify(nsxService, Mockito.never()).deleteVpnGateway(any(Vpc.class));
+        verify(userIpAddressDetailsDao).removeDetail(30L, "nsxVpnGatewayIp");
+        verify(ipAddressManager, Mockito.never()).disassociatePublicIpAddress(any(), anyLong(), any());
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void testReleaseVpnGatewayIpDoesNotReleaseIpWhenNsxRejectsDeletion() {
+        CallContext.register(Mockito.mock(User.class), Mockito.mock(Account.class));
+        try {
+            VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+            when(vpcDao.findById(9L)).thenReturn(vpcVO);
+            Site2SiteVpnGateway vpnGateway = Mockito.mock(Site2SiteVpnGateway.class);
+            when(vpnGateway.getVpcId()).thenReturn(9L);
+            when(nsxService.deleteVpnGateway(vpcVO)).thenReturn(false);
+
+            nsxElement.releaseVpnGatewayIp(vpnGateway);
+        } finally {
+            verify(ipAddressManager, Mockito.never()).disassociatePublicIpAddress(any(), anyLong(), any());
+            CallContext.unregister();
+        }
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void testReleaseVpnGatewayIpKeepsTheMarkerWhenIpDisassociationFails() {
+        CallContext.register(Mockito.mock(User.class), Mockito.mock(Account.class));
+        try {
+            VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+            when(vpcDao.findById(9L)).thenReturn(vpcVO);
+            Site2SiteVpnGateway vpnGateway = Mockito.mock(Site2SiteVpnGateway.class);
+            when(vpnGateway.getVpcId()).thenReturn(9L);
+            when(vpnGateway.getAddrId()).thenReturn(30L);
+            when(nsxService.deleteVpnGateway(vpcVO)).thenReturn(true);
+            IPAddressVO ipAddressVO = mockIpAddressVO(30L, "10.1.13.30");
+            when(ipAddressVO.getId()).thenReturn(30L);
+            UserIpAddressDetailVO detail = Mockito.mock(UserIpAddressDetailVO.class);
+            when(detail.getValue()).thenReturn("true");
+            when(userIpAddressDetailsDao.findDetail(30L, "nsxVpnGatewayIp")).thenReturn(detail);
+            when(ipAddressManager.disassociatePublicIpAddress(any(), anyLong(), any())).thenReturn(false);
+
+            nsxElement.releaseVpnGatewayIp(vpnGateway);
+        } finally {
+            verify(userIpAddressDetailsDao, Mockito.never()).removeDetail(30L, "nsxVpnGatewayIp");
+            CallContext.unregister();
+        }
     }
 
     private Site2SiteCustomerGatewayVO mockCustomerGateway(String ikePolicy, String espPolicy) {
@@ -675,6 +908,17 @@ public class NsxElementTest {
         nsxElement.startSite2SiteVpn(connection);
     }
 
+    @Test(expected = InvalidParameterValueException.class)
+    public void testStartSite2SiteVpnRejectsDnsPeerAddress() throws ResourceUnavailableException {
+        VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+        Site2SiteVpnConnection connection = mockVpnConnection(vpcVO);
+        Site2SiteCustomerGatewayVO customerGateway = mockCustomerGateway("aes256-sha256;modp2048", "aes128-sha1");
+        when(customerGateway.getName()).thenReturn("remote-site");
+        when(customerGateway.getGatewayIp()).thenReturn("vpn.example.test");
+
+        nsxElement.startSite2SiteVpn(connection);
+    }
+
     @Test
     public void testStartSite2SiteVpnIsNoOpWhenVpnIsNotProvidedByNsx() throws ResourceUnavailableException {
         VpcVO vpcVO = Mockito.mock(VpcVO.class);
@@ -687,14 +931,38 @@ public class NsxElementTest {
                 anyString(), anyString(), anyInt(), anyString());
     }
 
+    @Test(expected = CloudRuntimeException.class)
+    public void testStartSite2SiteVpnThrowsWhenVpcIsMissing() throws ResourceUnavailableException {
+        Site2SiteVpnConnection connection = mockVpnConnection(null);
+
+        nsxElement.startSite2SiteVpn(connection);
+    }
+
     @Test
     public void testStopSite2SiteVpn() throws ResourceUnavailableException {
         VpcVO vpcVO = mockVpcWithNsxVpnSupport();
         Site2SiteVpnConnection connection = mockVpnConnection(vpcVO);
         when(connection.getUuid()).thenReturn("conn-uuid");
-        when(nsxService.deleteVpnConnection(vpcVO, "conn-uuid")).thenReturn(true);
+        when(nsxService.updateVpnConnectionState(vpcVO, "conn-uuid", false)).thenReturn(true);
 
         assertTrue(nsxElement.stopSite2SiteVpn(connection));
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void testStopSite2SiteVpnThrowsWhenVpcIsMissing() throws ResourceUnavailableException {
+        Site2SiteVpnConnection connection = mockVpnConnection(null);
+
+        nsxElement.stopSite2SiteVpn(connection);
+    }
+
+    @Test
+    public void testDeleteSite2SiteVpnRemovesTheProviderConnection() throws ResourceUnavailableException {
+        VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+        Site2SiteVpnConnection connection = mockVpnConnection(vpcVO);
+        when(connection.getUuid()).thenReturn("conn-uuid");
+        when(nsxService.deleteVpnConnection(vpcVO, "conn-uuid")).thenReturn(true);
+
+        assertTrue(nsxElement.deleteSite2SiteVpn(connection));
     }
 
     @Test(expected = CloudRuntimeException.class)

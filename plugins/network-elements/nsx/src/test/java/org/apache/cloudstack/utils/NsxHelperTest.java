@@ -16,13 +16,9 @@
 // under the License.
 package org.apache.cloudstack.utils;
 
-import java.util.HashSet;
-import java.util.Set;
-
 import org.junit.Test;
 
 import com.cloud.utils.Pair;
-import com.cloud.utils.exception.CloudRuntimeException;
 
 import static org.junit.Assert.assertEquals;
 
@@ -54,35 +50,4 @@ public class NsxHelperTest {
         assertEquals(NsxHelper.getVpnVtiAddressPair(1L), NsxHelper.getVpnVtiAddressPair(4097L));
     }
 
-    @Test
-    public void testFindFreeVpnVtiAddressPairReturnsPreferredSlotWhenFree() {
-        Pair<String, String> vtiAddresses = NsxHelper.findFreeVpnVtiAddressPair("169.254.64.21", Set.of());
-        assertEquals("169.254.64.21", vtiAddresses.first());
-        assertEquals("169.254.64.22", vtiAddresses.second());
-    }
-
-    @Test
-    public void testFindFreeVpnVtiAddressPairProbesPastInUseSlots() {
-        Pair<String, String> vtiAddresses = NsxHelper.findFreeVpnVtiAddressPair("169.254.64.21",
-                Set.of("169.254.64.21", "169.254.64.25"));
-        assertEquals("169.254.64.29", vtiAddresses.first());
-        assertEquals("169.254.64.30", vtiAddresses.second());
-    }
-
-    @Test
-    public void testFindFreeVpnVtiAddressPairWrapsAroundTheSubnet() {
-        Pair<String, String> vtiAddresses = NsxHelper.findFreeVpnVtiAddressPair("169.254.127.253",
-                Set.of("169.254.127.253"));
-        assertEquals("169.254.64.1", vtiAddresses.first());
-        assertEquals("169.254.64.2", vtiAddresses.second());
-    }
-
-    @Test(expected = CloudRuntimeException.class)
-    public void testFindFreeVpnVtiAddressPairThrowsWhenAllSlotsAreInUse() {
-        Set<String> inUseVtiLocalIps = new HashSet<>();
-        for (long slot = 0; slot < 4096; slot++) {
-            inUseVtiLocalIps.add(NsxHelper.getVpnVtiAddressPair(slot).first());
-        }
-        NsxHelper.findFreeVpnVtiAddressPair("169.254.64.1", inUseVtiLocalIps);
-    }
 }

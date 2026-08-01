@@ -23,14 +23,12 @@ import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.user.Account;
 import com.cloud.utils.Pair;
-import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.net.NetUtils;
 import org.apache.cloudstack.agent.api.CreateNsxDhcpRelayConfigCommand;
 import org.apache.cloudstack.agent.api.CreateNsxSegmentCommand;
 import org.apache.cloudstack.agent.api.CreateOrUpdateNsxTier1NatRuleCommand;
 
 import java.util.List;
-import java.util.Set;
 
 public class NsxHelper {
 
@@ -46,29 +44,13 @@ public class NsxHelper {
     /**
      * Derives the preferred VTI /30 for a Site-to-Site VPN connection from its database id:
      * 169.254.64.0/18 base + 4 x (id mod 4096), local = .1 and peer = .2 within the /30.
-     * Collisions between connections whose ids are congruent mod 4096 are resolved by
-     * {@link #findFreeVpnVtiAddressPair(String, Set)} against the tier-1's in-use VTI addresses.
+     * A collision is rejected rather than silently selecting another subnet: the peer must be
+     * configured with this deterministic pair, and CloudStack has no API field in which to persist
+     * an alternative allocation.
      */
     public static Pair<String, String> getVpnVtiAddressPair(long connectionId) {
         long slotBase = VPN_VTI_SUBNET_BASE + (connectionId % VPN_VTI_SUBNET_SLOTS) * 4;
         return new Pair<>(NetUtils.long2Ip(slotBase + 1), NetUtils.long2Ip(slotBase + 2));
-    }
-
-    /**
-     * Returns the preferred VTI /30 when its local address is not in use on the tier-1 gateway,
-     * otherwise linear-probes the following slots (wrapping within 169.254.64.0/18) for the first
-     * free one; throws once all 4096 slots are taken.
-     */
-    public static Pair<String, String> findFreeVpnVtiAddressPair(String preferredVtiLocalIp, Set<String> inUseVtiLocalIps) {
-        long startSlot = (NetUtils.ip2Long(preferredVtiLocalIp) - 1 - VPN_VTI_SUBNET_BASE) / 4;
-        for (long probe = 0; probe < VPN_VTI_SUBNET_SLOTS; probe++) {
-            long slotBase = VPN_VTI_SUBNET_BASE + ((startSlot + probe) % VPN_VTI_SUBNET_SLOTS) * 4;
-            String vtiLocalIp = NetUtils.long2Ip(slotBase + 1);
-            if (!inUseVtiLocalIps.contains(vtiLocalIp)) {
-                return new Pair<>(vtiLocalIp, NetUtils.long2Ip(slotBase + 2));
-            }
-        }
-        throw new CloudRuntimeException("No free VTI slots are left in 169.254.64.0/18 for the Site-to-Site VPN connection");
     }
 
     public static CreateNsxDhcpRelayConfigCommand createNsxDhcpRelayConfigCommand(DomainVO domain, Account account, DataCenter zone, VpcVO vpc, Network network, List<String> addresses) {
