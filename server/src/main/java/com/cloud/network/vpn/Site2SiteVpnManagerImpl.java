@@ -24,6 +24,7 @@ import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import javax.inject.Inject;
 import javax.naming.ConfigurationException;
@@ -62,6 +63,7 @@ import com.cloud.event.EventTypes;
 import com.cloud.exception.InvalidParameterValueException;
 import com.cloud.exception.PermissionDeniedException;
 import com.cloud.exception.ResourceUnavailableException;
+import com.cloud.network.IpAddress;
 import com.cloud.network.IpAddressManager;
 import com.cloud.network.Network;
 import com.cloud.network.Site2SiteCustomerGateway;
@@ -76,6 +78,7 @@ import com.cloud.network.dao.Site2SiteVpnConnectionDao;
 import com.cloud.network.dao.Site2SiteVpnConnectionVO;
 import com.cloud.network.dao.Site2SiteVpnGatewayDao;
 import com.cloud.network.dao.Site2SiteVpnGatewayVO;
+import com.cloud.network.element.NetworkElement;
 import com.cloud.network.element.Site2SiteVpnServiceProvider;
 import com.cloud.network.vpc.Vpc;
 import com.cloud.network.vpc.VpcManager;
@@ -214,6 +217,10 @@ public class Site2SiteVpnManagerImpl extends ManagerBase implements Site2SiteVpn
             throw new InvalidParameterValueException(String.format("The VPN gateway of VPC %s already exists!", vpc));
         }
 
+        if (getVpnServiceProvidersForVpc(vpcId).isEmpty()) {
+            throw new InvalidParameterValueException(String.format("Site-to-Site VPN is not supported by %s: the VPC offering does not provide the Vpn service through any available VPN provider", vpc));
+        }
+
         IPAddressVO requestedIp = _ipAddressDao.findById(cmd.getIpAddressId());
         IPAddressVO ipAddress = getIpAddressIdForVpn(vpcId, vpc.getVpcOfferingId(), requestedIp);
         Site2SiteVpnGatewayVO gw = new Site2SiteVpnGatewayVO(owner.getAccountId(), owner.getDomainId(), ipAddress.getId(), vpcId);
@@ -222,11 +229,46 @@ public class Site2SiteVpnManagerImpl extends ManagerBase implements Site2SiteVpn
             gw.setDisplay(cmd.getDisplay());
         }
 
-        _vpnGatewayDao.persist(gw);
+        try {
+            _vpnGatewayDao.persist(gw);
+        } catch (RuntimeException e) {
+            // give back the IP and provider-side VPN resources a provider may have prepared for this gateway
+            for (Site2SiteVpnServiceProvider provider : getVpnServiceProvidersForVpc(vpcId)) {
+                try {
+                    provider.releaseVpnGatewayIp(gw);
+                } catch (Exception releaseException) {
+                    logger.warn("Failed to release the VPN gateway IP of VPC {} after the VPN gateway could not be persisted: {}",
+                            vpc, releaseException.getMessage());
+                }
+            }
+            throw e;
+        }
         return gw;
     }
 
+    private List<Site2SiteVpnServiceProvider> getVpnServiceProvidersForVpc(long vpcId) {
+        List<Site2SiteVpnServiceProvider> providers = new ArrayList<>();
+        for (Site2SiteVpnServiceProvider provider : _s2sProviders) {
+            if (provider instanceof NetworkElement
+                    && vpcManager.isProviderSupportServiceInVpc(vpcId, Network.Service.Vpn, ((NetworkElement) provider).getProvider())) {
+                providers.add(provider);
+            }
+        }
+        return providers;
+    }
+
     private IPAddressVO getIpAddressIdForVpn(Long vpcId, Long vpcOferingId, IPAddressVO requestedIp) {
+        // 1) A Site-to-Site VPN provider (e.g. an external provider terminating VPN on its own
+        // gateway) may supply a dedicated gateway IP instead of the VPC source NAT IP
+        Vpc vpcForProvider = _vpcDao.findById(vpcId);
+        for (Site2SiteVpnServiceProvider provider : getVpnServiceProvidersForVpc(vpcId)) {
+            IpAddress providerIp = provider.acquireVpnGatewayIp(vpcForProvider, requestedIp);
+            if (providerIp != null) {
+                logger.debug("Using VPN gateway IP {} supplied by provider {} for VPC {}", providerIp.getAddress(), provider.getName(), vpcForProvider);
+                return _ipAddressDao.findById(providerIp.getId());
+            }
+        }
+
         VpcOfferingServiceMapVO mapForSourceNat = vpcOfferingServiceMapDao.findByServiceProviderAndOfferingId(Network.Service.SourceNat.getName(), Network.Provider.VPCVirtualRouter.getName(), vpcOferingId);
         VpcOfferingServiceMapVO mapForVpn = vpcOfferingServiceMapDao.findByServiceProviderAndOfferingId(Network.Service.Vpn.getName(), Network.Provider.VPCVirtualRouter.getName(), vpcOferingId);
         if (mapForSourceNat == null && mapForVpn != null) {
@@ -240,10 +282,17 @@ public class Site2SiteVpnManagerImpl extends ManagerBase implements Site2SiteVpn
             }
             return ipAddressForVpcVR;
         } else {
-            //Use source NAT ip for VPC
-            List<IPAddressVO> ips = _ipAddressDao.listByAssociatedVpc(vpcId, true);
-            if (ips.size() != 1) {
-                throw new CloudRuntimeException("Cannot found source nat ip of vpc " + vpcId);
+            // Use the VPC source NAT IP, excluding system-vm helper IPs: on NSX-backed VPCs the
+            // VR's public IP is also flagged source_nat (with forsystemvms=1) for redeploy idempotency
+            List<IPAddressVO> ips = _ipAddressDao.listByAssociatedVpc(vpcId, true).stream()
+                    .filter(ip -> !ip.isForSystemVms())
+                    .collect(Collectors.toList());
+            if (ips.isEmpty()) {
+                throw new CloudRuntimeException(String.format("No source NAT IP found for VPC %s; Site-to-Site VPN requires the VPC source NAT IP", vpcId));
+            }
+            if (ips.size() > 1) {
+                String addresses = ips.stream().map(ip -> ip.getAddress().addr()).collect(Collectors.joining(", "));
+                throw new CloudRuntimeException(String.format("Multiple source NAT IPs (%s) found for VPC %s while exactly one was expected", addresses, vpcId));
             }
             if (requestedIp != null && requestedIp.getId() != ips.get(0).getId()) {
                 throw new CloudRuntimeException(String.format("Cannot use requested IP %s as it is not the Source NAT IP", requestedIp.getAddress().addr()));
@@ -584,7 +633,7 @@ public class Site2SiteVpnManagerImpl extends ManagerBase implements Site2SiteVpn
             }
 
             boolean result = true;
-            for (Site2SiteVpnServiceProvider element : _s2sProviders) {
+            for (Site2SiteVpnServiceProvider element : getVpnServiceProvidersForVpc(vpnGateway.getVpcId())) {
                 result = result & element.startSite2SiteVpn(conn);
             }
 
@@ -642,6 +691,9 @@ public class Site2SiteVpnManagerImpl extends ManagerBase implements Site2SiteVpn
         List<Site2SiteVpnConnectionVO> conns = _vpnConnectionDao.listByVpnGatewayId(gw.getId());
         if (!CollectionUtils.isEmpty(conns)) {
             throw new InvalidParameterValueException(String.format("Unable to delete VPN gateway %s because there is still related VPN connections!", gw));
+        }
+        for (Site2SiteVpnServiceProvider provider : getVpnServiceProvidersForVpc(gw.getVpcId())) {
+            provider.releaseVpnGatewayIp(gw);
         }
         _vpnGatewayDao.remove(gw.getId());
     }
@@ -834,8 +886,9 @@ public class Site2SiteVpnManagerImpl extends ManagerBase implements Site2SiteVpn
             conn.setState(State.Disconnected);
             _vpnConnectionDao.persist(conn);
 
+            Site2SiteVpnGateway vpnGateway = _vpnGatewayDao.findById(conn.getVpnGatewayId());
             boolean result = true;
-            for (Site2SiteVpnServiceProvider element : _s2sProviders) {
+            for (Site2SiteVpnServiceProvider element : getVpnServiceProvidersForVpc(vpnGateway.getVpcId())) {
                 result = result & element.stopSite2SiteVpn(conn);
             }
 
@@ -1065,6 +1118,12 @@ public class Site2SiteVpnManagerImpl extends ManagerBase implements Site2SiteVpn
         // One router for one VPC
         Long vpcId = router.getVpcId();
         if (router.getVpcId() == null) {
+            return conns;
+        }
+        // Only the connections the VPC VR actually terminates: when VPN is provided by an external
+        // provider the router knows nothing about them, and reporting on them would overwrite the
+        // state that provider reports
+        if (!vpcManager.isProviderSupportServiceInVpc(vpcId, Network.Service.Vpn, Network.Provider.VPCVirtualRouter)) {
             return conns;
         }
         conns.addAll(_vpnConnectionDao.listByVpcId(vpcId));

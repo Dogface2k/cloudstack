@@ -17,11 +17,33 @@
 package com.cloud.network.element;
 
 import com.cloud.exception.ResourceUnavailableException;
+import com.cloud.network.IpAddress;
 import com.cloud.network.Site2SiteVpnConnection;
+import com.cloud.network.Site2SiteVpnGateway;
+import com.cloud.network.vpc.Vpc;
 import com.cloud.utils.component.Adapter;
 
 public interface Site2SiteVpnServiceProvider extends Adapter {
     boolean startSite2SiteVpn(Site2SiteVpnConnection conn) throws ResourceUnavailableException;
 
     boolean stopSite2SiteVpn(Site2SiteVpnConnection conn) throws ResourceUnavailableException;
+
+    /**
+     * Lets the provider supply the public IP the VPN gateway should terminate on, instead of the
+     * VPC source NAT IP. Providers that terminate VPN on an external gateway (e.g. NSX Tier-1)
+     * acquire and return a dedicated IP here; requestedIp, when not null, is the IP the caller
+     * asked for and must be validated by the provider. Returning null means the provider has no
+     * preference and the manager falls back to the default IP selection.
+     */
+    default IpAddress acquireVpnGatewayIp(Vpc vpc, IpAddress requestedIp) {
+        return null;
+    }
+
+    /**
+     * Counterpart of {@link #acquireVpnGatewayIp(Vpc, IpAddress)}: invoked when a VPN gateway is
+     * deleted so the provider can tear down external VPN resources and release the gateway IP if
+     * it was acquired by the provider.
+     */
+    default void releaseVpnGatewayIp(Site2SiteVpnGateway gateway) {
+    }
 }

@@ -20,7 +20,11 @@ import com.cloud.network.nsx.NsxProvider;
 import com.cloud.utils.component.PluggableService;
 import org.apache.cloudstack.api.BaseResponse;
 import org.apache.cloudstack.api.command.AddNsxControllerCmd;
+import org.apache.cloudstack.api.command.AddNsxVrfGatewayCmd;
+import org.apache.cloudstack.api.command.AssignNsxVrfGatewayCmd;
+import org.apache.cloudstack.api.command.ListNsxVrfGatewaysCmd;
 import org.apache.cloudstack.api.response.NsxControllerResponse;
+import org.apache.cloudstack.api.response.NsxVrfGatewayResponse;
 
 import java.util.List;
 
@@ -32,4 +36,18 @@ public interface NsxProviderService extends PluggableService {
     List<BaseResponse> listNsxProviders(Long zoneId);
 
     boolean deleteNsxController(Long nsxControllerId);
+
+    /** Registers a tier-0 gateway the operator has already staged in NSX. */
+    NsxVrfGatewayResponse addNsxVrfGateway(AddNsxVrfGatewayCmd cmd);
+
+    /** Claims a registered gateway for an account or a domain. */
+    NsxVrfGatewayResponse assignNsxVrfGateway(AssignNsxVrfGatewayCmd cmd);
+
+    /** Returns a gateway to the unassigned pool. */
+    NsxVrfGatewayResponse releaseNsxVrfGateway(Long id);
+
+    List<NsxVrfGatewayResponse> listNsxVrfGateways(ListNsxVrfGatewaysCmd cmd);
+
+    /** Removes CloudStack's registration; the gateway stays in NSX. */
+    boolean deleteNsxVrfGateway(Long id);
 }

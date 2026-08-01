@@ -232,6 +232,7 @@ public class NetworkMigrationManagerImpl implements NetworkMigrationManager {
         copiedNetwork.setDisplayNetwork(false);
         copiedNetwork.setBroadcastUri(network.getBroadcastUri());
         copiedNetwork.setState(network.getState());
+        copiedNetwork.setNetworkACLId(network.getNetworkACLId());
         _networksDao.update(networkCopyId, copiedNetwork);
 
         copyNetworkDetails(originalNetworkId, networkCopyId);

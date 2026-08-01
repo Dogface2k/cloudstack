@@ -57,6 +57,16 @@ public interface VpcManager {
             true,
             ConfigKey.Scope.Global,
             null);
+    ConfigKey<String> VpcTierDefaultNetworkACL = new ConfigKey<>(String.class,
+            "vpc.tier.default.network.acl",
+            ConfigKey.CATEGORY_NETWORK,
+            "default_allow",
+            "Network ACL assigned to a VPC tier created without an ACL, either default_allow or default_deny. "
+                    + "Tiers created on a network offering used by the Kubernetes service always get default_allow, "
+                    + "as Kubernetes clusters cannot be deployed on a tier using the default deny ACL",
+            true,
+            ConfigKey.Scope.Zone,
+            null);
 
     /**
      * Returns all the Guest networks that are part of VPC

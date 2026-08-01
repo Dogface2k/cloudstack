@@ -33,7 +33,17 @@ import com.cloud.resource.ResourceManager;
 import com.cloud.resource.ServerResource;
 import com.cloud.utils.exception.CloudRuntimeException;
 import org.apache.cloudstack.api.BaseResponse;
+import com.cloud.domain.dao.DomainDao;
+import com.cloud.exception.InvalidParameterValueException;
+import com.cloud.network.dao.NsxVrfGatewayDao;
+import com.cloud.network.element.NsxVrfGatewayVO;
+import com.cloud.user.AccountVO;
+import com.cloud.user.dao.AccountDao;
 import org.apache.cloudstack.api.command.AddNsxControllerCmd;
+import org.apache.cloudstack.api.command.AddNsxVrfGatewayCmd;
+import org.apache.cloudstack.api.command.AssignNsxVrfGatewayCmd;
+import org.apache.cloudstack.api.command.ListNsxVrfGatewaysCmd;
+import org.apache.cloudstack.api.response.NsxVrfGatewayResponse;
 import org.apache.cloudstack.api.response.NsxControllerResponse;
 import org.junit.Assert;
 import org.junit.Before;
@@ -53,8 +63,10 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -71,6 +83,12 @@ public class NsxProviderServiceImplTest {
     ResourceManager resourceManager;
     @Mock
     HostDetailsDao hostDetailsDao;
+    @Mock
+    NsxVrfGatewayDao nsxVrfGatewayDao;
+    @Mock
+    AccountDao accountDao;
+    @Mock
+    DomainDao domainDao;
 
     NsxProviderServiceImpl nsxProviderService;
 
@@ -83,6 +101,9 @@ public class NsxProviderServiceImplTest {
         nsxProviderService.dataCenterDao = dataCenterDao;
         nsxProviderService.networkDao = networkDao;
         nsxProviderService.physicalNetworkDao = physicalNetworkDao;
+        nsxProviderService.nsxVrfGatewayDao = nsxVrfGatewayDao;
+        nsxProviderService.accountDao = accountDao;
+        nsxProviderService.domainDao = domainDao;
     }
 
     @Test
@@ -170,5 +191,190 @@ public class NsxProviderServiceImplTest {
         NsxProviderServiceImpl nsxProviderService = new NsxProviderServiceImpl();
 
         assertThrows(CloudRuntimeException.class, () -> nsxProviderService.validateNetworkState(networkVOList));
+    }
+
+    private static final long VRF_ZONE_ID = 1L;
+
+    private NsxVrfGatewayVO stagedGateway() {
+        return new NsxVrfGatewayVO(VRF_ZONE_ID, "CS-VRF-001", "v5-EdgeCluster-HOSTED", "v5-T0");
+    }
+
+    private AddNsxVrfGatewayCmd addCmd() {
+        AddNsxVrfGatewayCmd cmd = mock(AddNsxVrfGatewayCmd.class);
+        when(cmd.getZoneId()).thenReturn(VRF_ZONE_ID);
+        when(cmd.getTier0Gateway()).thenReturn("CS-VRF-001");
+        return cmd;
+    }
+
+    @Test
+    public void testAddNsxVrfGatewayPersistsTheRegistration() {
+        DataCenterVO zone = mock(DataCenterVO.class);
+        when(zone.getId()).thenReturn(VRF_ZONE_ID);
+        when(dataCenterDao.findById(VRF_ZONE_ID)).thenReturn(zone);
+        when(nsxProviderDao.findByZoneId(VRF_ZONE_ID)).thenReturn(mock(NsxProviderVO.class));
+        when(nsxVrfGatewayDao.findByZoneAndTier0Name(VRF_ZONE_ID, "CS-VRF-001")).thenReturn(null);
+        when(nsxVrfGatewayDao.persist(any(NsxVrfGatewayVO.class))).thenAnswer(i -> i.getArgument(0));
+
+        AddNsxVrfGatewayCmd cmd = addCmd();
+        when(cmd.getEdgeCluster()).thenReturn("v5-EdgeCluster-HOSTED");
+        when(cmd.getParentTier0Gateway()).thenReturn("v5-T0");
+
+        NsxVrfGatewayResponse response = nsxProviderService.addNsxVrfGateway(cmd);
+
+        assertEquals("CS-VRF-001", response.getTier0Gateway());
+        assertEquals("v5-EdgeCluster-HOSTED", response.getEdgeCluster());
+        Assert.assertFalse(response.isAllocated());
+    }
+
+    @Test
+    public void testAddNsxVrfGatewayRejectsDuplicateTier0InTheSameZone() {
+        DataCenterVO zone = mock(DataCenterVO.class);
+        when(zone.getId()).thenReturn(VRF_ZONE_ID);
+        when(dataCenterDao.findById(VRF_ZONE_ID)).thenReturn(zone);
+        when(nsxProviderDao.findByZoneId(VRF_ZONE_ID)).thenReturn(mock(NsxProviderVO.class));
+        when(nsxVrfGatewayDao.findByZoneAndTier0Name(VRF_ZONE_ID, "CS-VRF-001")).thenReturn(stagedGateway());
+
+        assertThrows(InvalidParameterValueException.class, () -> nsxProviderService.addNsxVrfGateway(addCmd()));
+    }
+
+    @Test
+    public void testAddNsxVrfGatewayRejectsZoneWithoutNsxController() {
+        DataCenterVO zone = mock(DataCenterVO.class);
+        when(zone.getId()).thenReturn(VRF_ZONE_ID);
+        when(dataCenterDao.findById(VRF_ZONE_ID)).thenReturn(zone);
+        when(nsxProviderDao.findByZoneId(VRF_ZONE_ID)).thenReturn(null);
+
+        assertThrows(InvalidParameterValueException.class, () -> nsxProviderService.addNsxVrfGateway(addCmd()));
+    }
+
+    @Test
+    public void testAssignNsxVrfGatewayToAccount() {
+        NsxVrfGatewayVO gateway = stagedGateway();
+        when(nsxVrfGatewayDao.findById(5L)).thenReturn(gateway);
+        AccountVO account = mock(AccountVO.class);
+        when(account.getDomainId()).thenReturn(2L);
+        when(accountDao.findById(9L)).thenReturn(account);
+        when(nsxVrfGatewayDao.findByAccount(VRF_ZONE_ID, 9L)).thenReturn(null);
+        when(nsxVrfGatewayDao.update(anyLong(), any(NsxVrfGatewayVO.class))).thenReturn(true);
+
+        AssignNsxVrfGatewayCmd cmd = mock(AssignNsxVrfGatewayCmd.class);
+        when(cmd.getId()).thenReturn(5L);
+        when(cmd.getAccountId()).thenReturn(9L);
+        when(cmd.getDomainId()).thenReturn(null);
+
+        NsxVrfGatewayResponse response = nsxProviderService.assignNsxVrfGateway(cmd);
+
+        assertEquals(NsxVrfGatewayVO.Scope.ACCOUNT.name(), gateway.getScope());
+        assertEquals(Long.valueOf(9L), gateway.getAccountId());
+        assertTrue(response.isAllocated());
+    }
+
+    @Test
+    public void testAssignNsxVrfGatewayRequiresExactlyOneOfAccountOrDomain() {
+        when(nsxVrfGatewayDao.findById(5L)).thenReturn(stagedGateway());
+        AssignNsxVrfGatewayCmd cmd = mock(AssignNsxVrfGatewayCmd.class);
+        when(cmd.getId()).thenReturn(5L);
+        when(cmd.getAccountId()).thenReturn(9L);
+        when(cmd.getDomainId()).thenReturn(2L);
+
+        assertThrows(InvalidParameterValueException.class, () -> nsxProviderService.assignNsxVrfGateway(cmd));
+    }
+
+    @Test
+    public void testAssignNsxVrfGatewayRejectsAlreadyAssignedGateway() {
+        NsxVrfGatewayVO gateway = stagedGateway();
+        gateway.setScope(NsxVrfGatewayVO.Scope.ACCOUNT.name());
+        gateway.setAccountId(3L);
+        when(nsxVrfGatewayDao.findById(5L)).thenReturn(gateway);
+
+        AssignNsxVrfGatewayCmd cmd = mock(AssignNsxVrfGatewayCmd.class);
+        when(cmd.getId()).thenReturn(5L);
+        when(cmd.getAccountId()).thenReturn(9L);
+        when(cmd.getDomainId()).thenReturn(null);
+
+        assertThrows(InvalidParameterValueException.class, () -> nsxProviderService.assignNsxVrfGateway(cmd));
+    }
+
+    @Test
+    public void testReleaseNsxVrfGatewayRefusesWhileNetworksAreAttached() {
+        NsxVrfGatewayVO gateway = stagedGateway();
+        gateway.setScope(NsxVrfGatewayVO.Scope.ACCOUNT.name());
+        gateway.setAccountId(9L);
+        when(nsxVrfGatewayDao.findById(5L)).thenReturn(gateway);
+
+        NetworkVO network = mock(NetworkVO.class);
+        when(network.getBroadcastDomainType()).thenReturn(Networks.BroadcastDomainType.NSX);
+        when(network.getRemoved()).thenReturn(null);
+        when(network.getAccountId()).thenReturn(9L);
+        when(networkDao.listByZone(VRF_ZONE_ID)).thenReturn(List.of(network));
+
+        assertThrows(InvalidParameterValueException.class, () -> nsxProviderService.releaseNsxVrfGateway(5L));
+    }
+
+    @Test
+    public void testReleaseNsxVrfGatewayReturnsItToThePool() {
+        NsxVrfGatewayVO gateway = stagedGateway();
+        gateway.setScope(NsxVrfGatewayVO.Scope.ACCOUNT.name());
+        gateway.setAccountId(9L);
+        when(nsxVrfGatewayDao.findById(5L)).thenReturn(gateway);
+        when(networkDao.listByZone(VRF_ZONE_ID)).thenReturn(List.of());
+        when(nsxVrfGatewayDao.update(anyLong(), any(NsxVrfGatewayVO.class))).thenReturn(true);
+
+        NsxVrfGatewayResponse response = nsxProviderService.releaseNsxVrfGateway(5L);
+
+        assertTrue(gateway.isUnclaimed());
+        Assert.assertFalse(response.isAllocated());
+        verify(nsxVrfGatewayDao).update(eq(gateway.getId()), eq(gateway));
+    }
+
+    /**
+     * Regression test for a release that reported success while persisting nothing.
+     *
+     * Entities are CGLIB-enhanced and GenericDaoBase builds its UPDATE from setter calls
+     * intercepted by UpdateBuilder. Clearing the fields directly on the VO left the row
+     * untouched in the database, so the gateway stayed assigned and could never be
+     * deregistered. Asserting on the returned object alone did not catch it, because that
+     * object is the in-memory VO; the DAO contract is what matters.
+     */
+    @Test
+    public void testReleaseNsxVrfGatewayFailsLoudlyWhenTheUpdateDoesNotPersist() {
+        NsxVrfGatewayVO gateway = stagedGateway();
+        gateway.setScope(NsxVrfGatewayVO.Scope.ACCOUNT.name());
+        gateway.setAccountId(9L);
+        when(nsxVrfGatewayDao.findById(5L)).thenReturn(gateway);
+        when(networkDao.listByZone(VRF_ZONE_ID)).thenReturn(List.of());
+        when(nsxVrfGatewayDao.update(anyLong(), any(NsxVrfGatewayVO.class))).thenReturn(false);
+
+        assertThrows(CloudRuntimeException.class, () -> nsxProviderService.releaseNsxVrfGateway(5L));
+    }
+
+    @Test
+    public void testDeleteNsxVrfGatewayRefusesWhileAssigned() {
+        NsxVrfGatewayVO gateway = stagedGateway();
+        gateway.setScope(NsxVrfGatewayVO.Scope.ACCOUNT.name());
+        gateway.setAccountId(9L);
+        when(nsxVrfGatewayDao.findById(5L)).thenReturn(gateway);
+
+        assertThrows(InvalidParameterValueException.class, () -> nsxProviderService.deleteNsxVrfGateway(5L));
+    }
+
+    @Test
+    public void testListNsxVrfGatewaysFiltersByAllocation() {
+        NsxVrfGatewayVO unclaimed = stagedGateway();
+        NsxVrfGatewayVO claimed = new NsxVrfGatewayVO(VRF_ZONE_ID, "CS-VRF-002", "v5-EdgeCluster-HOSTED", "v5-T0");
+        claimed.setScope(NsxVrfGatewayVO.Scope.ACCOUNT.name());
+        claimed.setAccountId(9L);
+        when(nsxVrfGatewayDao.listByZone(VRF_ZONE_ID)).thenReturn(List.of(unclaimed, claimed));
+
+        ListNsxVrfGatewaysCmd cmd = mock(ListNsxVrfGatewaysCmd.class);
+        when(cmd.getZoneId()).thenReturn(VRF_ZONE_ID);
+        when(cmd.getAccountId()).thenReturn(null);
+        when(cmd.getDomainId()).thenReturn(null);
+        when(cmd.getAllocatedOnly()).thenReturn(Boolean.TRUE);
+
+        List<NsxVrfGatewayResponse> responses = nsxProviderService.listNsxVrfGateways(cmd);
+
+        assertEquals(1, responses.size());
+        assertEquals("CS-VRF-002", responses.get(0).getTier0Gateway());
     }
 }

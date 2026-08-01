@@ -646,3 +646,27 @@ CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`('cloud.backup_schedule', 'isolated', 'TINYI
 
 UPDATE `cloud`.`configuration` SET `value`=CONCAT(`value`, ', backupValidationCommandTimeout, backupValidationScreenshotWait, backupValidationBootTimeout')
 WHERE `name`='user.vm.readonly.details' AND `value` IS NOT NULL;
+
+-- NSX per-tenant VRF gateways.
+-- One row per operator-staged VRF (or dedicated) Tier-0. A row with no account_id and
+-- no domain_id is an unclaimed member of the pool; assigning it to a tenant fills them.
+-- CloudStack never creates or deletes the gateway in NSX, it only records and claims.
+CREATE TABLE IF NOT EXISTS `cloud`.`nsx_vrf_gateways` (
+    `id` bigint unsigned NOT NULL auto_increment COMMENT 'id',
+    `uuid` varchar(40),
+    `zone_id` bigint unsigned NOT NULL COMMENT 'Zone ID',
+    `nsx_tier0_name` varchar(255) NOT NULL COMMENT 'VRF Tier-0, or a dedicated Tier-0, as named in NSX',
+    `edge_cluster` varchar(255) NOT NULL COMMENT 'Edge cluster this Tier-0 lives on; may differ from the zone default',
+    `parent_tier0` varchar(255) COMMENT 'Parent Tier-0 for a VRF gateway; NULL for a dedicated Tier-0',
+    `scope` varchar(16) COMMENT 'ACCOUNT or DOMAIN; NULL while unclaimed',
+    `domain_id` bigint unsigned COMMENT 'Owning domain when scope = DOMAIN',
+    `account_id` bigint unsigned COMMENT 'Owning account when scope = ACCOUNT',
+    `public_vlan_db_id` bigint unsigned COMMENT 'Dedicated public IP range this Tier-0 advertises',
+    `created` datetime NOT NULL COMMENT 'date created',
+    `removed` datetime COMMENT 'date removed if not null',
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_nsx_vrf_gateways__zone_id` FOREIGN KEY (`zone_id`) REFERENCES `data_center`(`id`) ON DELETE CASCADE,
+    INDEX `i_nsx_vrf_gateways__zone_id`(`zone_id`),
+    INDEX `i_nsx_vrf_gateways__account_id`(`account_id`),
+    INDEX `i_nsx_vrf_gateways__domain_id`(`domain_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;

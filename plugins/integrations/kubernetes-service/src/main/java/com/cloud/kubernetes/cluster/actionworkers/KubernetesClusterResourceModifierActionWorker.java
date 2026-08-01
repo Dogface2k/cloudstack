@@ -752,7 +752,11 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
     }
 
     protected void createVpcTierAclRules(Network network) throws ManagementServerException {
-        if (network.getNetworkACLId() == NetworkACL.DEFAULT_ALLOW) {
+        Long networkAclId = network.getNetworkACLId();
+        if (networkAclId == null) {
+            throw new ManagementServerException(String.format("Failed to provision ACL rules for the Kubernetes cluster : %s as VPC tier %s does not have a network ACL attached", kubernetesCluster.getName(), network.getName()));
+        }
+        if (networkAclId == NetworkACL.DEFAULT_ALLOW) {
             return;
         }
         // ACL rule for API access for control node VMs
@@ -781,7 +785,9 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
     }
 
     protected void removeVpcTierAclRules(Network network) throws ManagementServerException {
-        if (network.getNetworkACLId() == NetworkACL.DEFAULT_ALLOW) {
+        Long networkAclId = network.getNetworkACLId();
+        if (networkAclId == null || networkAclId == NetworkACL.DEFAULT_ALLOW) {
+            // no ACL attached or default allow: no CKS-provisioned ACL rules can exist, nothing to remove
             return;
         }
         // ACL rule for API access for control node VMs

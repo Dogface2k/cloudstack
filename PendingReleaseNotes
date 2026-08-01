@@ -39,3 +39,32 @@ example.ver.1 > example.ver.2:
     which can now be attached to Instances. This is to prevent the Secondary
     Storage to grow to enormous sizes as Linux Distributions keep growing in
     size while a stripped down Linux should fit on a 2.88MB floppy.
+
+4.22.1.0 > 4.23.0.0:
+  * VPC tiers created without an explicit network ACL now default to the
+    default_deny ACL (matching private gateway behavior) instead of being
+    persisted without any ACL, when the network offering supports the
+    NetworkACL service. Automation that created tiers without the aclid
+    parameter and relied on the previous implicit egress-allow behavior of
+    VR-based tiers should pass an explicit aclid.
+
+  * Kubernetes clusters can no longer be created on VPC tiers that have no
+    network ACL attached or that use the immutable default_deny ACL; the API
+    now fails fast at validation instead of failing partway through cluster
+    provisioning. Attach an ACL that allows the required traffic (for example
+    default_allow or a custom ACL) to the tier before creating the cluster.
+
+  * createVpnGateway now validates up front that the VPC's offering provides
+    the Vpn service through an available Site-to-Site VPN provider, returning
+    a clear error instead of "Cannot found source nat ip".
+
+  * NSX: Site-to-Site VPN is now implemented natively for NSX NAT-mode VPCs.
+    The Vpn service of the seeded "VPC offering with NSX - NAT Mode" is backed
+    by route-based IPsec sessions terminating on the VPC's Tier-1 gateway. A
+    dedicated public IP is acquired for the VPN local endpoint when the VPN
+    gateway is created (or the IP passed via the ipaddressid parameter is
+    used) and released when the gateway is deleted. Remote peers must use
+    routed (VTI-style) IPsec configuration; policy-based peers requiring
+    strict subnet selectors are not supported. Some cryptographic options
+    permitted by CloudStack are rejected by NSX (3des, md5, aes192,
+    modp6144 and above, IKE lifetime below 21600 seconds) with a clear error.

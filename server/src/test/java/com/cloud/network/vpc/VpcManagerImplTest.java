@@ -42,6 +42,7 @@ import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.element.NetworkElement;
 import com.cloud.network.element.VpcProvider;
 import com.cloud.network.router.CommandSetupHelper;
@@ -76,6 +77,7 @@ import org.apache.cloudstack.engine.orchestration.service.NetworkOrchestrationSe
 import org.apache.cloudstack.extension.Extension;
 import org.apache.cloudstack.extension.ExtensionHelper;
 import org.apache.cloudstack.framework.config.ConfigKey;
+import org.apache.cloudstack.framework.config.dao.ConfigurationDao;
 import org.apache.cloudstack.network.Ipv4GuestSubnetNetworkMap;
 import org.apache.cloudstack.network.RoutedIpv4Manager;
 import org.junit.After;
@@ -171,6 +173,8 @@ public class VpcManagerImplTest {
     NetworkACLVO networkACLVOMock;
     @Mock
     RoutedIpv4Manager routedIpv4Manager;
+    @Mock
+    ConfigurationDao configDao;
 
     public static final long ACCOUNT_ID = 1;
     private AccountVO account;
@@ -231,6 +235,7 @@ public class VpcManagerImplTest {
         manager._firewallDao = firewallDao;
         manager._networkAclDao = networkACLDaoMock;
         manager.routedIpv4Manager = routedIpv4Manager;
+        manager._configDao = configDao;
         CallContext.register(Mockito.mock(User.class), Mockito.mock(Account.class));
         registerCallContext();
         overrideDefaultConfigValue(NetworkService.AllowUsersToSpecifyVRMtu, "_defaultValue", "false");
@@ -398,6 +403,153 @@ public class VpcManagerImplTest {
                 physicalNetwork, zoneId, null, null, 1L, null, null,
                 true, null, null, null, null,
                 null, null, null, null, null, new Pair<>(1000, 1000), null);
+    }
+
+    private NetworkVO prepareVpcGuestNetworkCreationMocks(Account accountMock, PhysicalNetwork physicalNetwork)
+            throws InsufficientCapacityException, ResourceAllocationException {
+        final long VPC_ID = 201L;
+        manager._maxNetworks = 3;
+        VpcVO vpcMockVO = Mockito.mock(VpcVO.class);
+        Vpc vpcMock = Mockito.mock(Vpc.class);
+        NetworkOffering offering = Mockito.mock(NetworkOffering.class);
+        List<Network.Service> services = new ArrayList<>();
+        services.add(Service.SourceNat);
+
+        Mockito.lenient().when(vpcDao.getActiveVpcById(anyLong())).thenReturn(vpcMock);
+        Mockito.lenient().doNothing().when(accountManager).checkAccess(any(Account.class), nullable(SecurityChecker.AccessType.class), anyBoolean(), any(Vpc.class));
+        Mockito.lenient().when(vpcMock.isRegionLevelVpc()).thenReturn(true);
+        Mockito.lenient().when(entityMgr.findById(NetworkOffering.class, 1L)).thenReturn(offering);
+        Mockito.lenient().when(vpcMock.getId()).thenReturn(VPC_ID);
+        Mockito.lenient().when(vpcDao.acquireInLockTable(VPC_ID)).thenReturn(vpcMockVO);
+        Mockito.lenient().when(networkDao.countVpcNetworks(anyLong())).thenReturn(1L);
+        Mockito.lenient().when(offering.getGuestType()).thenReturn(Network.GuestType.Isolated);
+        Mockito.lenient().when(networkModel.listNetworkOfferingServices(anyLong())).thenReturn(services);
+        Mockito.lenient().when(networkOfferingServiceMapDao.listByNetworkOfferingId(anyLong())).thenReturn(new ArrayList<>());
+        Mockito.lenient().when(vpcMock.getCidr()).thenReturn("10.0.0.0/8");
+        Mockito.lenient().when(vpcMock.getNetworkDomain()).thenReturn("cs1cloud.internal");
+
+        NetworkVO createdNetwork = Mockito.mock(NetworkVO.class);
+        Mockito.when(networkMgr.createGuestNetwork(1L, "vpcNet1", "vpc tier 1", null,
+                "10.10.10.0/24", null, false, "cs1cloud.internal", accountMock, null,
+                physicalNetwork, zoneId, null, null, 1L, null, null,
+                true, null, null, null, null,
+                null, null, null, null, null, new Pair<>(1000, 1000), null)).thenReturn(createdNetwork);
+        return createdNetwork;
+    }
+
+    @Test
+    public void testCreateVpcNetworkDefaultsToAllowAclWhenOfferingSupportsNetworkAcl() throws InsufficientCapacityException, ResourceAllocationException {
+        Account accountMock = Mockito.mock(Account.class);
+        PhysicalNetwork physicalNetwork = Mockito.mock(PhysicalNetwork.class);
+        NetworkVO createdNetwork = prepareVpcGuestNetworkCreationMocks(accountMock, physicalNetwork);
+        Mockito.when(networkModel.areServicesSupportedByNetworkOffering(anyLong(), Mockito.eq(Service.NetworkACL))).thenReturn(true);
+
+        manager.createVpcGuestNetwork(1L, "vpcNet1", "vpc tier 1", null,
+                "10.10.10.0/24", null, null, accountMock, null, physicalNetwork,
+                1L, null, null, 1L, null, accountMock,
+                true, null, null, null, null, null, null, null, new Pair<>(1000, 1000), null);
+
+        Mockito.verify(createdNetwork, times(1)).setNetworkACLId(NetworkACL.DEFAULT_ALLOW);
+        Mockito.verify(networkDao, times(1)).update(anyLong(), any(NetworkVO.class));
+    }
+
+    @Test
+    public void testGetDefaultAclIdForNewTierHonoursDenySetting() {
+        NetworkOffering offering = Mockito.mock(NetworkOffering.class);
+        Mockito.when(offering.getName()).thenReturn("Regular VPC tier offering");
+        Mockito.when(entityMgr.findById(NetworkOffering.class, 1L)).thenReturn(offering);
+        overrideConfigKeyValue(VpcManager.VpcTierDefaultNetworkACL, "default_deny");
+        try {
+            Assert.assertEquals(Long.valueOf(NetworkACL.DEFAULT_DENY), manager.getDefaultAclIdForNewTier(1L, zoneId));
+        } finally {
+            resetConfigKeyValue(VpcManager.VpcTierDefaultNetworkACL);
+        }
+    }
+
+    @Test
+    public void testGetDefaultAclIdForNewTierAlwaysAllowsForKubernetesOfferings() {
+        NetworkOffering offering = Mockito.mock(NetworkOffering.class);
+        Mockito.when(offering.getName()).thenReturn("DefaultNSXVPCNetworkOfferingforKubernetesService");
+        Mockito.when(entityMgr.findById(NetworkOffering.class, 1L)).thenReturn(offering);
+        overrideConfigKeyValue(VpcManager.VpcTierDefaultNetworkACL, "default_deny");
+        try {
+            Assert.assertEquals(Long.valueOf(NetworkACL.DEFAULT_ALLOW), manager.getDefaultAclIdForNewTier(1L, zoneId));
+        } finally {
+            resetConfigKeyValue(VpcManager.VpcTierDefaultNetworkACL);
+        }
+    }
+
+    @Test
+    public void testGetDefaultAclIdForNewTierAllowsForConfiguredKubernetesOffering() {
+        NetworkOffering offering = Mockito.mock(NetworkOffering.class);
+        Mockito.when(offering.getName()).thenReturn("MyCustomK8sTierOffering");
+        Mockito.when(entityMgr.findById(NetworkOffering.class, 1L)).thenReturn(offering);
+        Mockito.when(configDao.getValue(VpcManagerImpl.KUBERNETES_CLUSTER_NETWORK_OFFERING_CONFIG_KEY)).thenReturn("MyCustomK8sTierOffering");
+        overrideConfigKeyValue(VpcManager.VpcTierDefaultNetworkACL, "default_deny");
+        try {
+            Assert.assertEquals(Long.valueOf(NetworkACL.DEFAULT_ALLOW), manager.getDefaultAclIdForNewTier(1L, zoneId));
+        } finally {
+            resetConfigKeyValue(VpcManager.VpcTierDefaultNetworkACL);
+        }
+    }
+
+    private void overrideConfigKeyValue(ConfigKey<String> configKey, String value) {
+        try {
+            Field valueField = ConfigKey.class.getDeclaredField("_value");
+            valueField.setAccessible(true);
+            valueField.set(configKey, value);
+
+            Field dynamicField = ConfigKey.class.getDeclaredField("_isDynamic");
+            dynamicField.setAccessible(true);
+            dynamicField.setBoolean(configKey, false);
+        } catch (IllegalAccessException | NoSuchFieldException e) {
+            throw new RuntimeException("Failed to set ConfigKey value", e);
+        }
+    }
+
+    private void resetConfigKeyValue(ConfigKey<String> configKey) {
+        try {
+            Field valueField = ConfigKey.class.getDeclaredField("_value");
+            valueField.setAccessible(true);
+            valueField.set(configKey, null);
+
+            Field dynamicField = ConfigKey.class.getDeclaredField("_isDynamic");
+            dynamicField.setAccessible(true);
+            dynamicField.setBoolean(configKey, true);
+        } catch (IllegalAccessException | NoSuchFieldException e) {
+            throw new RuntimeException("Failed to reset ConfigKey value", e);
+        }
+    }
+
+    @Test
+    public void testCreateVpcNetworkKeepsNullAclWhenOfferingLacksNetworkAclService() throws InsufficientCapacityException, ResourceAllocationException {
+        Account accountMock = Mockito.mock(Account.class);
+        PhysicalNetwork physicalNetwork = Mockito.mock(PhysicalNetwork.class);
+        NetworkVO createdNetwork = prepareVpcGuestNetworkCreationMocks(accountMock, physicalNetwork);
+        Mockito.when(networkModel.areServicesSupportedByNetworkOffering(anyLong(), Mockito.eq(Service.NetworkACL))).thenReturn(false);
+
+        manager.createVpcGuestNetwork(1L, "vpcNet1", "vpc tier 1", null,
+                "10.10.10.0/24", null, null, accountMock, null, physicalNetwork,
+                1L, null, null, 1L, null, accountMock,
+                true, null, null, null, null, null, null, null, new Pair<>(1000, 1000), null);
+
+        Mockito.verify(createdNetwork, times(1)).setNetworkACLId((Long) null);
+    }
+
+    @Test
+    public void testCreateVpcNetworkKeepsExplicitlyProvidedAcl() throws InsufficientCapacityException, ResourceAllocationException {
+        final Long explicitAclId = 5L;
+        Account accountMock = Mockito.mock(Account.class);
+        PhysicalNetwork physicalNetwork = Mockito.mock(PhysicalNetwork.class);
+        NetworkVO createdNetwork = prepareVpcGuestNetworkCreationMocks(accountMock, physicalNetwork);
+        Mockito.when(networkModel.areServicesSupportedByNetworkOffering(anyLong(), Mockito.eq(Service.NetworkACL))).thenReturn(true);
+
+        manager.createVpcGuestNetwork(1L, "vpcNet1", "vpc tier 1", null,
+                "10.10.10.0/24", null, null, accountMock, null, physicalNetwork,
+                1L, null, null, 1L, explicitAclId, accountMock,
+                true, null, null, null, null, null, null, null, new Pair<>(1000, 1000), null);
+
+        Mockito.verify(createdNetwork, times(1)).setNetworkACLId(explicitAclId);
     }
 
     @Test

@@ -681,6 +681,10 @@ public class KubernetesClusterActionWorker {
 
     protected boolean stateTransitTo(long kubernetesClusterId, KubernetesCluster.Event e) {
         KubernetesClusterVO kubernetesCluster = kubernetesClusterDao.findById(kubernetesClusterId);
+        if (kubernetesCluster == null) {
+            logger.warn("Cannot transit state on event {} for the Kubernetes cluster with ID: {} as it no longer exists", e, kubernetesClusterId);
+            return false;
+        }
         try {
             return _stateMachine.transitTo(kubernetesCluster, e, null, kubernetesClusterDao);
         } catch (NoTransitionException nte) {

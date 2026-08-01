@@ -26,6 +26,9 @@ import com.vmware.nsx.model.ControllerClusterStatus;
 import com.vmware.nsx.model.TransportZone;
 import com.vmware.nsx.model.TransportZoneListResult;
 import com.vmware.nsx_policy.infra.DhcpRelayConfigs;
+import com.vmware.nsx_policy.infra.IpsecVpnDpdProfiles;
+import com.vmware.nsx_policy.infra.IpsecVpnIkeProfiles;
+import com.vmware.nsx_policy.infra.IpsecVpnTunnelProfiles;
 import com.vmware.nsx_policy.infra.LbAppProfiles;
 import com.vmware.nsx_policy.infra.LbMonitorProfiles;
 import com.vmware.nsx_policy.infra.LbPools;
@@ -41,7 +44,12 @@ import com.vmware.nsx_policy.infra.domains.groups.members.SegmentPorts;
 import com.vmware.nsx_policy.infra.domains.security_policies.Rules;
 import com.vmware.nsx_policy.infra.sites.EnforcementPoints;
 import com.vmware.nsx_policy.infra.tier_0s.LocaleServices;
+import com.vmware.nsx_policy.infra.tier_1s.IpsecVpnServices;
+import com.vmware.nsx_policy.infra.tier_1s.ipsec_vpn_services.LocalEndpoints;
+import com.vmware.nsx_policy.infra.tier_1s.ipsec_vpn_services.Sessions;
+import com.vmware.nsx_policy.infra.tier_1s.ipsec_vpn_services.sessions.DetailedStatus;
 import com.vmware.nsx_policy.infra.tier_1s.nat.NatRules;
+import com.vmware.nsx_policy.model.AggregateIPSecVpnSessionStatus;
 import com.vmware.nsx_policy.model.ApiError;
 import com.vmware.nsx_policy.model.DhcpRelayConfig;
 import com.vmware.nsx_policy.model.EnforcementPoint;
@@ -49,6 +57,16 @@ import com.vmware.nsx_policy.model.EnforcementPointListResult;
 import com.vmware.nsx_policy.model.Group;
 import com.vmware.nsx_policy.model.GroupListResult;
 import com.vmware.nsx_policy.model.ICMPTypeServiceEntry;
+import com.vmware.nsx_policy.model.IPSecVpnDpdProfile;
+import com.vmware.nsx_policy.model.IPSecVpnIkeProfile;
+import com.vmware.nsx_policy.model.IPSecVpnLocalEndpoint;
+import com.vmware.nsx_policy.model.IPSecVpnLocalEndpointListResult;
+import com.vmware.nsx_policy.model.IPSecVpnService;
+import com.vmware.nsx_policy.model.IPSecVpnSession;
+import com.vmware.nsx_policy.model.IPSecVpnSessionListResult;
+import com.vmware.nsx_policy.model.IPSecVpnSessionStatusNsxt;
+import com.vmware.nsx_policy.model.IPSecVpnTunnelInterface;
+import com.vmware.nsx_policy.model.IPSecVpnTunnelProfile;
 import com.vmware.nsx_policy.model.L4PortSetServiceEntry;
 import com.vmware.nsx_policy.model.LBAppProfileListResult;
 import com.vmware.nsx_policy.model.LBIcmpMonitorProfile;
@@ -66,13 +84,17 @@ import com.vmware.nsx_policy.model.PolicyGroupMembersListResult;
 import com.vmware.nsx_policy.model.PolicyNatRule;
 import com.vmware.nsx_policy.model.PolicyNatRuleListResult;
 import com.vmware.nsx_policy.model.PolicyGroupMemberDetails;
+import com.vmware.nsx_policy.model.RouteBasedIPSecVpnSession;
+import com.vmware.nsx_policy.model.RouterNexthop;
 import com.vmware.nsx_policy.model.Rule;
 import com.vmware.nsx_policy.model.SecurityPolicy;
 import com.vmware.nsx_policy.model.Segment;
 import com.vmware.nsx_policy.model.SegmentSubnet;
 import com.vmware.nsx_policy.model.ServiceListResult;
 import com.vmware.nsx_policy.model.Site;
+import com.vmware.nsx_policy.model.StaticRoutesListResult;
 import com.vmware.nsx_policy.model.Tier1;
+import com.vmware.nsx_policy.model.TunnelInterfaceIPSubnet;
 import com.vmware.vapi.bindings.Service;
 import com.vmware.vapi.bindings.Structure;
 import com.vmware.vapi.bindings.StubConfiguration;
@@ -89,12 +111,14 @@ import com.vmware.vapi.std.errors.NotFound;
 import org.apache.cloudstack.resource.NsxLoadBalancerMember;
 import org.apache.cloudstack.resource.NsxNetworkRule;
 import org.apache.cloudstack.utils.NsxControllerUtils;
+import org.apache.cloudstack.utils.NsxVpnCryptoUtils;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.commons.lang3.BooleanUtils;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -114,6 +138,17 @@ import static org.apache.cloudstack.utils.NsxControllerUtils.getLoadBalancerName
 import static org.apache.cloudstack.utils.NsxControllerUtils.getLoadBalancerAlgorithm;
 import static org.apache.cloudstack.utils.NsxControllerUtils.getActiveMonitorProfileName;
 import static org.apache.cloudstack.utils.NsxControllerUtils.getTier1GatewayName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnDpdProfileName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnEspProfileName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnIkeProfileName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnLocalEndpointName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnLocalEndpointNoSnatRuleName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnNoSnatRuleName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnNoSnatRuleNamePrefix;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnServiceName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnSessionName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnStaticRouteName;
+import static org.apache.cloudstack.utils.NsxControllerUtils.getVpnStaticRouteNamePrefix;
 
 public class NsxApiClient {
 
@@ -138,6 +173,25 @@ public class NsxApiClient {
     protected static final String TCP_MONITOR_PROFILE = "LBTcpMonitorProfile";
     protected static final String ICMP_MONITOR_PROFILE = "LBIcmpMonitorProfile";
     protected static final String NAT_ID = "USER";
+    protected static final String IPSEC_VPN_IKE_PROFILES_PATH_PREFIX = "/infra/ipsec-vpn-ike-profiles/";
+    protected static final String IPSEC_VPN_TUNNEL_PROFILES_PATH_PREFIX = "/infra/ipsec-vpn-tunnel-profiles/";
+    protected static final String IPSEC_VPN_DPD_PROFILES_PATH_PREFIX = "/infra/ipsec-vpn-dpd-profiles/";
+    // NSX resolves NAT rules scoped to a VTI only for a tunnel interface with this exact name (KB 435087)
+    protected static final String VPN_DEFAULT_TUNNEL_INTERFACE_NAME = "default-tunnel-interface";
+    // NSX purges objects marked for deletion in a cycle that it documents as taking up to 5 minutes,
+    // and rejects recreating an object under the same path until then
+    protected static final int VPN_MARKED_FOR_DELETION_RETRIES = 24;
+    protected static final int VPN_MARKED_FOR_DELETION_RETRY_INTERVAL_SECS = 15;
+    // In on demand mode the probe interval is the idle time before a probe is sent, which NSX limits
+    // to 1-10 seconds (the 3-360 second range only applies to periodic probing)
+    protected static final long VPN_DPD_PROBE_INTERVAL_SECS = 10L;
+    protected static final long VPN_DPD_RETRY_COUNT = 10L;
+    // NSX evaluates NAT rules by ascending sequence number, so the traffic the VPN exempts from source
+    // NAT has to be matched before the catch all source NAT rule of the VPC
+    protected static final long VPN_NO_SNAT_SEQUENCE_NUMBER = 100L;
+    protected static final long CATCH_ALL_NAT_SEQUENCE_NUMBER = 1000L;
+    protected static final String VPN_SESSION_STATUS_UNKNOWN = "UNKNOWN";
+    protected static final String VPN_SESSION_STATUS_NOT_FOUND = "NOT_FOUND";
 
     private enum PoolAllocation { ROUTING, LB_SMALL, LB_MEDIUM, LB_LARGE, LB_XLARGE }
 
@@ -151,7 +205,7 @@ public class NsxApiClient {
 
     private enum NatId { USER, INTERNAL, DEFAULT }
 
-    private enum NatAction {SNAT, DNAT, REFLEXIVE}
+    private enum NatAction {SNAT, DNAT, REFLEXIVE, NO_SNAT}
 
     private enum FirewallMatch {
         MATCH_INTERNAL_ADDRESS,
@@ -235,11 +289,82 @@ public class NsxApiClient {
     public void createTier1NatRule(String tier1GatewayName, String natId, String natRuleId,
                                    String action, String translatedIp) {
         NatRules natRulesService = (NatRules) nsxService.apply(NatRules.class);
-        PolicyNatRule natPolicy = new PolicyNatRule.Builder()
+        PolicyNatRule.Builder natPolicyBuilder = new PolicyNatRule.Builder()
                 .setAction(action)
-                .setTranslatedNetwork(translatedIp)
+                .setTranslatedNetwork(translatedIp);
+        if (NatAction.SNAT.name().equals(action)) {
+            // The source NAT rule matches any source, so it has to be evaluated after the rules that
+            // exempt specific traffic from it, such as the ones site-to-site VPN adds
+            natPolicyBuilder.setSequenceNumber(CATCH_ALL_NAT_SEQUENCE_NUMBER);
+        }
+        natRulesService.patch(tier1GatewayName, natId, natRuleId, natPolicyBuilder.build());
+    }
+
+    /**
+     * The IKE traffic the gateway originates from the local endpoint must keep that address as its
+     * source: the catch all source NAT rule would otherwise rewrite it to the VPC source NAT IP and the
+     * peer, which only knows the local endpoint address, would ignore the packets. Applied whenever a
+     * VPN service or connection is created so that gateways predating this also get the exemption.
+     */
+    public void ensureVpnNatExemptions(String tier1GatewayName, String localEndpointIp) {
+        demoteCatchAllSourceNatRule(tier1GatewayName);
+        String localEndpointNoSnatRuleName = getVpnLocalEndpointNoSnatRuleName(getVpnServiceName(tier1GatewayName));
+        NatRules natService = (NatRules) nsxService.apply(NatRules.class);
+        PolicyNatRule localEndpointNoSnatRule = new PolicyNatRule.Builder()
+                .setId(localEndpointNoSnatRuleName)
+                .setDisplayName(localEndpointNoSnatRuleName)
+                .setAction(NatAction.NO_SNAT.name())
+                .setSourceNetwork(localEndpointIp)
+                .setSequenceNumber(VPN_NO_SNAT_SEQUENCE_NUMBER)
+                .setEnabled(true)
                 .build();
-        natRulesService.patch(tier1GatewayName, natId, natRuleId, natPolicy);
+        natService.patch(tier1GatewayName, NatId.USER.name(), localEndpointNoSnatRuleName, localEndpointNoSnatRule);
+    }
+
+    /**
+     * Existing tier-1 gateways carry a source NAT rule created without a sequence number, which leaves
+     * its precedence against the no-SNAT rules undefined. Push it behind them so traffic the VPN
+     * exempts, including the IKE traffic the gateway itself originates, is never translated.
+     */
+    private void demoteCatchAllSourceNatRule(String tier1GatewayName) {
+        NatRules natRulesService = (NatRules) nsxService.apply(NatRules.class);
+        try {
+            List<PolicyNatRule> natRules = PagedFetcher.<PolicyNatRuleListResult, PolicyNatRule>withPageFetcher(
+                            cursor -> natRulesService.list(tier1GatewayName, NatId.USER.name(), cursor, false, null, 50L, false, null))
+                    .cursorExtractor(PolicyNatRuleListResult::getCursor)
+                    .itemsExtractor(PolicyNatRuleListResult::getResults)
+                    .itemsSetter((page, allItems) -> {
+                        page.setResults(allItems);
+                        page.setResultCount((long) allItems.size());
+                    })
+                    .fetchAll().getResults();
+            for (PolicyNatRule natRule : natRules) {
+                if (!NatAction.SNAT.name().equals(natRule.getAction())
+                        || (natRule.getSequenceNumber() != null && natRule.getSequenceNumber() >= CATCH_ALL_NAT_SEQUENCE_NUMBER)) {
+                    continue;
+                }
+                logger.debug("Moving the source NAT rule {} on tier-1 gateway {} behind the VPN no-SNAT rules",
+                        natRule.getId(), tier1GatewayName);
+                // NSX validates the whole rule on a patch, so the existing definition has to be sent
+                // back with it rather than the sequence number on its own
+                PolicyNatRule.Builder demotedRule = new PolicyNatRule.Builder()
+                        .setId(natRule.getId())
+                        .setDisplayName(natRule.getDisplayName())
+                        .setAction(natRule.getAction())
+                        .setTranslatedNetwork(natRule.getTranslatedNetwork())
+                        .setSourceNetwork(natRule.getSourceNetwork())
+                        .setDestinationNetwork(natRule.getDestinationNetwork())
+                        .setService(natRule.getService())
+                        .setFirewallMatch(natRule.getFirewallMatch())
+                        .setEnabled(natRule.getEnabled())
+                        .setSequenceNumber(CATCH_ALL_NAT_SEQUENCE_NUMBER);
+                natRulesService.patch(tier1GatewayName, NatId.USER.name(), natRule.getId(), demotedRule.build());
+            }
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            logger.warn("Could not reorder the source NAT rules of tier-1 gateway {}, VPN traffic may be translated: {}",
+                    tier1GatewayName, ae.getErrorMessage());
+        }
     }
 
     public void createDhcpRelayConfig(String dhcpRelayConfigName, List<String> addresses) {
@@ -373,6 +498,7 @@ public class NsxApiClient {
             logger.warn("The Tier 1 Gateway {} does not exist, cannot be removed", tier1Id);
             return;
         }
+        removeTier1VpnResources(tier1Id);
         removeTier1GatewayNatRules(tier1Id);
         localeService.delete(tier1Id, TIER_1_LOCALE_SERVICE_ID);
         Tier1s tier1service = (Tier1s) nsxService.apply(Tier1s.class);
@@ -1235,5 +1361,544 @@ public class NsxApiClient {
         Optional<Group> matchingGroup = groups.stream().filter(group -> group.getDisplayName().equals(segmentName)).findFirst();
         return matchingGroup.map(Group::getPath).orElse(null);
 
+    }
+
+    public void createVpnService(String tier1GatewayName, String localEndpointIp) {
+        String vpnServiceName = getVpnServiceName(tier1GatewayName);
+        String localEndpointName = getVpnLocalEndpointName(vpnServiceName);
+        try {
+            ensureTier1IpsecLocalEndpointAdvertisement(tier1GatewayName);
+            IpsecVpnServices vpnServices = (IpsecVpnServices) nsxService.apply(IpsecVpnServices.class);
+            IPSecVpnService vpnService = new IPSecVpnService.Builder()
+                    .setId(vpnServiceName)
+                    .setDisplayName(vpnServiceName)
+                    .setEnabled(true)
+                    .build();
+            vpnServices.patch(tier1GatewayName, vpnServiceName, vpnService);
+
+            LocalEndpoints localEndpoints = (LocalEndpoints) nsxService.apply(LocalEndpoints.class);
+            IPSecVpnLocalEndpoint localEndpoint = new IPSecVpnLocalEndpoint.Builder()
+                    .setId(localEndpointName)
+                    .setDisplayName(localEndpointName)
+                    .setLocalAddress(localEndpointIp)
+                    .setLocalId(localEndpointIp)
+                    .build();
+            localEndpoints.patch(tier1GatewayName, vpnServiceName, localEndpointName, localEndpoint);
+
+            ensureVpnNatExemptions(tier1GatewayName, localEndpointIp);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to create NSX IPSec VPN service %s on tier-1 gateway %s, due to: %s",
+                    vpnServiceName, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    /**
+     * The local endpoint IP realizes as a Tier-1 loopback and is routable only when the Tier-1
+     * advertises TIER1_IPSEC_LOCAL_ENDPOINT; gateways created by this plugin always do, but
+     * gateways created before that behavior are patched here
+     */
+    private void ensureTier1IpsecLocalEndpointAdvertisement(String tier1GatewayName) {
+        Tier1 tier1 = getTier1Gateway(tier1GatewayName);
+        if (tier1 == null) {
+            throw new CloudRuntimeException(String.format("The Tier 1 Gateway %s does not exist", tier1GatewayName));
+        }
+        List<String> advertisementTypes = tier1.getRouteAdvertisementTypes();
+        if (CollectionUtils.isNotEmpty(advertisementTypes)
+                && advertisementTypes.contains(RouteAdvertisementType.TIER1_IPSEC_LOCAL_ENDPOINT.name())) {
+            return;
+        }
+        List<String> updatedTypes = new ArrayList<>();
+        if (CollectionUtils.isNotEmpty(advertisementTypes)) {
+            updatedTypes.addAll(advertisementTypes);
+        }
+        updatedTypes.add(RouteAdvertisementType.TIER1_IPSEC_LOCAL_ENDPOINT.name());
+        Tier1s tier1service = (Tier1s) nsxService.apply(Tier1s.class);
+        Tier1 tier1Update = new Tier1.Builder()
+                .setRouteAdvertisementTypes(updatedTypes)
+                .build();
+        tier1service.patch(tier1GatewayName, tier1Update);
+    }
+
+    public void deleteVpnService(String tier1GatewayName) {
+        String vpnServiceName = getVpnServiceName(tier1GatewayName);
+        String localEndpointName = getVpnLocalEndpointName(vpnServiceName);
+        if (getTier1Gateway(tier1GatewayName) == null) {
+            // On VPC teardown the tier-1 gateway is removed (along with its VPN objects) before the
+            // VPN gateway cleanup runs
+            logger.debug("The Tier 1 Gateway {} does not exist, skipping the removal of its VPN service", tier1GatewayName);
+            return;
+        }
+        String localEndpointNoSnatRuleName = getVpnLocalEndpointNoSnatRuleName(vpnServiceName);
+        try {
+            NatRules natService = (NatRules) nsxService.apply(NatRules.class);
+            natService.delete(tier1GatewayName, NatId.USER.name(), localEndpointNoSnatRuleName);
+        } catch (NotFound e) {
+            logger.debug("The no-SNAT rule {} on tier-1 gateway {} no longer exists, skipping deletion",
+                    localEndpointNoSnatRuleName, tier1GatewayName);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete the no-SNAT rule %s of the NSX IPSec VPN service on tier-1 gateway %s, due to: %s",
+                    localEndpointNoSnatRuleName, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+        try {
+            LocalEndpoints localEndpoints = (LocalEndpoints) nsxService.apply(LocalEndpoints.class);
+            localEndpoints.delete(tier1GatewayName, vpnServiceName, localEndpointName);
+        } catch (NotFound e) {
+            logger.debug("The local endpoint {} of the VPN service {} on tier-1 gateway {} no longer exists, skipping deletion",
+                    localEndpointName, vpnServiceName, tier1GatewayName);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete the local endpoint %s of the NSX IPSec VPN service %s on tier-1 gateway %s, due to: %s",
+                    localEndpointName, vpnServiceName, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+        try {
+            IpsecVpnServices vpnServices = (IpsecVpnServices) nsxService.apply(IpsecVpnServices.class);
+            vpnServices.delete(tier1GatewayName, vpnServiceName);
+        } catch (NotFound e) {
+            logger.debug("The VPN service {} on tier-1 gateway {} no longer exists, skipping deletion",
+                    vpnServiceName, tier1GatewayName);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete NSX IPSec VPN service %s on tier-1 gateway %s, due to: %s",
+                    vpnServiceName, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    public void createRouteBasedVpnSession(String tier1GatewayName, String connectionUuid, String peerAddress,
+                                           String psk, String ikePolicy, String espPolicy, Long ikeLifetime,
+                                           Long espLifetime, boolean dpdEnabled, String ikeVersion, boolean passive,
+                                           String vtiLocalIp, int vtiPrefixLength) {
+        // NSX reaps deleted objects asynchronously and rejects a create under a path that is still
+        // marked for deletion, which happens when a connection is recreated shortly after teardown
+        for (int attempt = 1; attempt <= VPN_MARKED_FOR_DELETION_RETRIES; attempt++) {
+            try {
+                doCreateRouteBasedVpnSession(tier1GatewayName, connectionUuid, peerAddress, psk, ikePolicy, espPolicy,
+                        ikeLifetime, espLifetime, dpdEnabled, ikeVersion, passive, vtiLocalIp, vtiPrefixLength);
+                return;
+            } catch (CloudRuntimeException e) {
+                if (attempt == VPN_MARKED_FOR_DELETION_RETRIES || !isMarkedForDeletionError(e)) {
+                    throw e;
+                }
+                logger.info("A VPN object for connection {} is still being purged by NSX, retrying in {}s (attempt {}/{})",
+                        connectionUuid, VPN_MARKED_FOR_DELETION_RETRY_INTERVAL_SECS, attempt, VPN_MARKED_FOR_DELETION_RETRIES);
+                try {
+                    Thread.sleep(VPN_MARKED_FOR_DELETION_RETRY_INTERVAL_SECS * 1000L);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+    }
+
+    private boolean isMarkedForDeletionError(CloudRuntimeException e) {
+        return e.getMessage() != null && e.getMessage().contains("marked for deletion");
+    }
+
+    private void doCreateRouteBasedVpnSession(String tier1GatewayName, String connectionUuid, String peerAddress,
+                                              String psk, String ikePolicy, String espPolicy, Long ikeLifetime,
+                                              Long espLifetime, boolean dpdEnabled, String ikeVersion, boolean passive,
+                                              String vtiLocalIp, int vtiPrefixLength) {
+        String vpnServiceName = getVpnServiceName(tier1GatewayName);
+        String localEndpointName = getVpnLocalEndpointName(vpnServiceName);
+        String sessionName = getVpnSessionName(connectionUuid);
+        String ikeProfileName = getVpnIkeProfileName(connectionUuid);
+        String espProfileName = getVpnEspProfileName(connectionUuid);
+        String dpdProfileName = getVpnDpdProfileName(connectionUuid);
+        try {
+            IpsecVpnIkeProfiles ikeProfiles = (IpsecVpnIkeProfiles) nsxService.apply(IpsecVpnIkeProfiles.class);
+            IPSecVpnIkeProfile ikeProfile = new IPSecVpnIkeProfile.Builder()
+                    .setId(ikeProfileName)
+                    .setDisplayName(ikeProfileName)
+                    .setEncryptionAlgorithms(NsxVpnCryptoUtils.getEncryptionAlgorithms(ikePolicy))
+                    .setDigestAlgorithms(NsxVpnCryptoUtils.getDigestAlgorithms(ikePolicy))
+                    .setDhGroups(NsxVpnCryptoUtils.getDhGroups(ikePolicy))
+                    .setIkeVersion(NsxVpnCryptoUtils.getIkeVersion(ikeVersion))
+                    .setSaLifeTime(ikeLifetime)
+                    .build();
+            ikeProfiles.patch(ikeProfileName, ikeProfile);
+
+            List<String> espDhGroups = NsxVpnCryptoUtils.getDhGroups(espPolicy);
+            IPSecVpnTunnelProfile.Builder espProfileBuilder = new IPSecVpnTunnelProfile.Builder()
+                    .setId(espProfileName)
+                    .setDisplayName(espProfileName)
+                    .setEncryptionAlgorithms(NsxVpnCryptoUtils.getEncryptionAlgorithms(espPolicy))
+                    .setDigestAlgorithms(NsxVpnCryptoUtils.getDigestAlgorithms(espPolicy))
+                    .setEnablePerfectForwardSecrecy(!espDhGroups.isEmpty())
+                    .setSaLifeTime(espLifetime);
+            if (!espDhGroups.isEmpty()) {
+                espProfileBuilder.setDhGroups(espDhGroups);
+            }
+            IpsecVpnTunnelProfiles espProfiles = (IpsecVpnTunnelProfiles) nsxService.apply(IpsecVpnTunnelProfiles.class);
+            espProfiles.patch(espProfileName, espProfileBuilder.build());
+
+            IpsecVpnDpdProfiles dpdProfiles = (IpsecVpnDpdProfiles) nsxService.apply(IpsecVpnDpdProfiles.class);
+            // On demand probing only checks the peer when there is traffic to send and nothing has been
+            // heard back, so an idle tunnel is not torn down for want of a probe response the way the
+            // periodic default does; CloudStack only exposes DPD as a flag, hence the fixed timers
+            IPSecVpnDpdProfile dpdProfile = new IPSecVpnDpdProfile.Builder()
+                    .setId(dpdProfileName)
+                    .setDisplayName(dpdProfileName)
+                    .setEnabled(dpdEnabled)
+                    .setDpdProbeMode(IPSecVpnDpdProfile.DPD_PROBE_MODE_ON_DEMAND)
+                    .setDpdProbeInterval(VPN_DPD_PROBE_INTERVAL_SECS)
+                    .setRetryCount(VPN_DPD_RETRY_COUNT)
+                    .build();
+            dpdProfiles.patch(dpdProfileName, dpdProfile);
+
+            IPSecVpnTunnelInterface tunnelInterface = new IPSecVpnTunnelInterface.Builder()
+                    .setId(VPN_DEFAULT_TUNNEL_INTERFACE_NAME)
+                    .setDisplayName(VPN_DEFAULT_TUNNEL_INTERFACE_NAME)
+                    .setIpSubnets(List.of(new TunnelInterfaceIPSubnet.Builder()
+                            .setIpAddresses(List.of(vtiLocalIp))
+                            .setPrefixLength((long) vtiPrefixLength)
+                            .build()))
+                    .build();
+            RouteBasedIPSecVpnSession session = new RouteBasedIPSecVpnSession.Builder()
+                    .setId(sessionName)
+                    .setDisplayName(sessionName)
+                    .setEnabled(true)
+                    .setAuthenticationMode(IPSecVpnSession.AUTHENTICATION_MODE_PSK)
+                    .setPsk(psk)
+                    .setPeerAddress(peerAddress)
+                    .setPeerId(peerAddress)
+                    .setConnectionInitiationMode(passive ? IPSecVpnSession.CONNECTION_INITIATION_MODE_RESPOND_ONLY
+                            : IPSecVpnSession.CONNECTION_INITIATION_MODE_INITIATOR)
+                    .setIkeProfilePath(IPSEC_VPN_IKE_PROFILES_PATH_PREFIX + ikeProfileName)
+                    .setTunnelProfilePath(IPSEC_VPN_TUNNEL_PROFILES_PATH_PREFIX + espProfileName)
+                    .setDpdProfilePath(IPSEC_VPN_DPD_PROFILES_PATH_PREFIX + dpdProfileName)
+                    .setLocalEndpointPath(getVpnLocalEndpointPath(tier1GatewayName, vpnServiceName, localEndpointName))
+                    .setTunnelInterfaces(List.of(tunnelInterface))
+                    .build();
+            Sessions sessions = (Sessions) nsxService.apply(Sessions.class);
+            sessions.patch(tier1GatewayName, vpnServiceName, sessionName, session);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to create NSX IPSec VPN session %s on tier-1 gateway %s, due to: %s",
+                    sessionName, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    public void addVpnConnectionRoutes(String tier1GatewayName, String connectionUuid, List<String> peerCidrs,
+                                       String vtiPeerIp, String vpcCidr) {
+        try {
+            com.vmware.nsx_policy.infra.tier_1s.StaticRoutes staticRoutesService =
+                    (com.vmware.nsx_policy.infra.tier_1s.StaticRoutes) nsxService.apply(com.vmware.nsx_policy.infra.tier_1s.StaticRoutes.class);
+            NatRules natService = (NatRules) nsxService.apply(NatRules.class);
+            for (int i = 0; i < peerCidrs.size(); i++) {
+                String peerCidr = peerCidrs.get(i);
+                String routeName = getVpnStaticRouteName(connectionUuid, i);
+                com.vmware.nsx_policy.model.StaticRoutes staticRoute = new com.vmware.nsx_policy.model.StaticRoutes.Builder()
+                        .setId(routeName)
+                        .setDisplayName(routeName)
+                        .setNetwork(peerCidr)
+                        .setNextHops(List.of(new RouterNexthop.Builder().setIpAddress(vtiPeerIp).build()))
+                        .build();
+                staticRoutesService.patch(tier1GatewayName, routeName, staticRoute);
+
+                // Route-based VPN does not bypass NAT: without a NO_SNAT rule the tier-1 match-any
+                // SNAT would rewrite VPC-to-remote traffic before it enters the tunnel
+                String noSnatRuleName = getVpnNoSnatRuleName(connectionUuid, i);
+                PolicyNatRule noSnatRule = new PolicyNatRule.Builder()
+                        .setId(noSnatRuleName)
+                        .setDisplayName(noSnatRuleName)
+                        .setAction(NatAction.NO_SNAT.name())
+                        .setSourceNetwork(vpcCidr)
+                        .setDestinationNetwork(peerCidr)
+                        .setSequenceNumber(VPN_NO_SNAT_SEQUENCE_NUMBER)
+                        .setEnabled(true)
+                        .build();
+                natService.patch(tier1GatewayName, NatId.USER.name(), noSnatRuleName, noSnatRule);
+            }
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to add the routes for NSX IPSec VPN connection %s on tier-1 gateway %s, due to: %s",
+                    connectionUuid, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    public void deleteVpnConnection(String tier1GatewayName, String connectionUuid) {
+        String vpnServiceName = getVpnServiceName(tier1GatewayName);
+        String sessionName = getVpnSessionName(connectionUuid);
+        // Delete by prefix instead of recomputing names from the current peer CIDR list: the
+        // customer gateway's CIDRs may have changed since the routes and NO_SNAT rules were created
+        deleteVpnStaticRoutesByPrefix(tier1GatewayName, getVpnStaticRouteNamePrefix(connectionUuid));
+        deleteVpnNoSnatRulesByPrefix(tier1GatewayName, getVpnNoSnatRuleNamePrefix(connectionUuid));
+        try {
+            Sessions sessions = (Sessions) nsxService.apply(Sessions.class);
+            sessions.delete(tier1GatewayName, vpnServiceName, sessionName);
+        } catch (NotFound e) {
+            logger.debug("The VPN session {} on tier-1 gateway {} no longer exists, skipping deletion",
+                    sessionName, tier1GatewayName);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete the NSX IPSec VPN session %s on tier-1 gateway %s, due to: %s",
+                    sessionName, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+        // The IKE/tunnel/DPD profiles are deliberately left in place: NSX marks deleted objects for
+        // deletion asynchronously, so recreating them under the same path on a connection restart
+        // fails until the reaper has run. They are reused (patched) when the session is recreated
+        // and swept with the rest of the VPN objects when the tier-1 gateway is removed.
+    }
+
+    private void deleteVpnStaticRoutesByPrefix(String tier1GatewayName, String routeNamePrefix) {
+        com.vmware.nsx_policy.infra.tier_1s.StaticRoutes staticRoutesService =
+                (com.vmware.nsx_policy.infra.tier_1s.StaticRoutes) nsxService.apply(com.vmware.nsx_policy.infra.tier_1s.StaticRoutes.class);
+        try {
+            List<com.vmware.nsx_policy.model.StaticRoutes> staticRoutes =
+                    PagedFetcher.<StaticRoutesListResult, com.vmware.nsx_policy.model.StaticRoutes>withPageFetcher(
+                            cursor -> staticRoutesService.list(tier1GatewayName, cursor, false, null, null, null, null)
+                    ).cursorExtractor(StaticRoutesListResult::getCursor)
+                    .itemsExtractor(StaticRoutesListResult::getResults)
+                    .itemsSetter((page, allItems) -> {
+                        page.setResults(allItems);
+                        page.setResultCount((long) allItems.size());
+                    })
+                    .fetchAll()
+                    .getResults();
+            if (CollectionUtils.isEmpty(staticRoutes)) {
+                return;
+            }
+            for (com.vmware.nsx_policy.model.StaticRoutes staticRoute : staticRoutes) {
+                if (staticRoute.getId() != null && staticRoute.getId().startsWith(routeNamePrefix)) {
+                    logger.debug("Removing the VPN static route {} from tier-1 gateway {}", staticRoute.getId(), tier1GatewayName);
+                    staticRoutesService.delete(tier1GatewayName, staticRoute.getId());
+                }
+            }
+        } catch (NotFound e) {
+            logger.debug("No static routes matching the prefix {} are left on tier-1 gateway {}, skipping deletion",
+                    routeNamePrefix, tier1GatewayName);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete the VPN static routes matching the prefix %s on tier-1 gateway %s, due to: %s",
+                    routeNamePrefix, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    private void deleteVpnNoSnatRulesByPrefix(String tier1GatewayName, String ruleNamePrefix) {
+        NatRules natService = (NatRules) nsxService.apply(NatRules.class);
+        try {
+            List<PolicyNatRule> natRules = PagedFetcher.<PolicyNatRuleListResult, PolicyNatRule>withPageFetcher(
+                    cursor -> natService.list(tier1GatewayName, NatId.USER.name(), cursor, false, null, null, null, null)
+                    ).cursorExtractor(PolicyNatRuleListResult::getCursor)
+                    .itemsExtractor(PolicyNatRuleListResult::getResults)
+                    .itemsSetter((page, allItems) -> {
+                        page.setResults(allItems);
+                        page.setResultCount((long) allItems.size());
+                    })
+                    .fetchAll()
+                    .getResults();
+            if (CollectionUtils.isEmpty(natRules)) {
+                return;
+            }
+            for (PolicyNatRule natRule : natRules) {
+                if (natRule.getId() != null && natRule.getId().startsWith(ruleNamePrefix)) {
+                    logger.debug("Removing the VPN NO_SNAT rule {} from tier-1 gateway {}", natRule.getId(), tier1GatewayName);
+                    natService.delete(tier1GatewayName, NatId.USER.name(), natRule.getId());
+                }
+            }
+        } catch (NotFound e) {
+            logger.debug("No NO_SNAT rules matching the prefix {} are left on tier-1 gateway {}, skipping deletion",
+                    ruleNamePrefix, tier1GatewayName);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete the VPN NO_SNAT rules matching the prefix %s on tier-1 gateway %s, due to: %s",
+                    ruleNamePrefix, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    private void deleteVpnSessionProfiles(String connectionUuid) {
+        try {
+            IpsecVpnIkeProfiles ikeProfiles = (IpsecVpnIkeProfiles) nsxService.apply(IpsecVpnIkeProfiles.class);
+            ikeProfiles.delete(getVpnIkeProfileName(connectionUuid));
+        } catch (NotFound e) {
+            logger.debug("The IKE profile of VPN connection {} no longer exists, skipping deletion", connectionUuid);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete the IKE profile of VPN connection %s, due to: %s",
+                    connectionUuid, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+        try {
+            IpsecVpnTunnelProfiles espProfiles = (IpsecVpnTunnelProfiles) nsxService.apply(IpsecVpnTunnelProfiles.class);
+            espProfiles.delete(getVpnEspProfileName(connectionUuid));
+        } catch (NotFound e) {
+            logger.debug("The tunnel profile of VPN connection {} no longer exists, skipping deletion", connectionUuid);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete the tunnel profile of VPN connection %s, due to: %s",
+                    connectionUuid, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+        try {
+            IpsecVpnDpdProfiles dpdProfiles = (IpsecVpnDpdProfiles) nsxService.apply(IpsecVpnDpdProfiles.class);
+            dpdProfiles.delete(getVpnDpdProfileName(connectionUuid));
+        } catch (NotFound e) {
+            logger.debug("The DPD profile of VPN connection {} no longer exists, skipping deletion", connectionUuid);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to delete the DPD profile of VPN connection %s, due to: %s",
+                    connectionUuid, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    public String getVpnSessionStatus(String tier1GatewayName, String connectionUuid) {
+        String vpnServiceName = getVpnServiceName(tier1GatewayName);
+        String sessionName = getVpnSessionName(connectionUuid);
+        try {
+            DetailedStatus detailedStatusService = (DetailedStatus) nsxService.apply(DetailedStatus.class);
+            AggregateIPSecVpnSessionStatus aggregateStatus = detailedStatusService.get(tier1GatewayName, vpnServiceName, sessionName, null, null);
+            List<Structure> results = aggregateStatus == null ? null : aggregateStatus.getResults();
+            if (CollectionUtils.isEmpty(results)) {
+                return VPN_SESSION_STATUS_UNKNOWN;
+            }
+            List<String> statuses = results.stream()
+                    .map(result -> result._convertTo(IPSecVpnSessionStatusNsxt.class).getRuntimeStatus())
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
+            if (statuses.isEmpty()) {
+                return VPN_SESSION_STATUS_UNKNOWN;
+            }
+            if (statuses.contains(IPSecVpnSessionStatusNsxt.RUNTIME_STATUS_DOWN)) {
+                return IPSecVpnSessionStatusNsxt.RUNTIME_STATUS_DOWN;
+            }
+            if (statuses.stream().allMatch(IPSecVpnSessionStatusNsxt.RUNTIME_STATUS_UP::equals)) {
+                return IPSecVpnSessionStatusNsxt.RUNTIME_STATUS_UP;
+            }
+            return statuses.get(0);
+        } catch (NotFound e) {
+            logger.debug("The VPN session {} no longer exists on tier-1 gateway {}", sessionName, tier1GatewayName);
+            return VPN_SESSION_STATUS_NOT_FOUND;
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to get the status of NSX IPSec VPN session %s on tier-1 gateway %s, due to: %s",
+                    sessionName, tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    /**
+     * VPN sessions, local endpoints, services and static routes must be removed before the tier-1
+     * locale-services deletion during gateway teardown
+     */
+    private void removeTier1VpnResources(String tier1Id) {
+        deleteVpnStaticRoutesByPrefix(tier1Id, getVpnSessionName(""));
+        try {
+            IpsecVpnServices vpnServices = (IpsecVpnServices) nsxService.apply(IpsecVpnServices.class);
+            List<IPSecVpnService> services = vpnServices.list(tier1Id, null, false, null, null, false, null).getResults();
+            if (CollectionUtils.isEmpty(services)) {
+                return;
+            }
+            Sessions sessions = (Sessions) nsxService.apply(Sessions.class);
+            LocalEndpoints localEndpoints = (LocalEndpoints) nsxService.apply(LocalEndpoints.class);
+            for (IPSecVpnService service : services) {
+                IPSecVpnSessionListResult sessionList = sessions.list(tier1Id, service.getId(), null, false, null, null, false, null);
+                if (CollectionUtils.isNotEmpty(sessionList.getResults())) {
+                    String sessionNamePrefix = getVpnSessionName("");
+                    for (Structure result : sessionList.getResults()) {
+                        IPSecVpnSession session = result._convertTo(IPSecVpnSession.class);
+                        logger.debug("Removing VPN session {} from the VPN service {} of Tier 1 Gateway {}", session.getId(), service.getId(), tier1Id);
+                        sessions.delete(tier1Id, service.getId(), session.getId());
+                        if (session.getId().startsWith(sessionNamePrefix)) {
+                            deleteVpnSessionProfiles(session.getId().substring(sessionNamePrefix.length()));
+                        }
+                    }
+                }
+                IPSecVpnLocalEndpointListResult localEndpointList = localEndpoints.list(tier1Id, service.getId(), null, false, null, null, false, null);
+                if (CollectionUtils.isNotEmpty(localEndpointList.getResults())) {
+                    for (IPSecVpnLocalEndpoint localEndpoint : localEndpointList.getResults()) {
+                        logger.debug("Removing VPN local endpoint {} from the VPN service {} of Tier 1 Gateway {}", localEndpoint.getId(), service.getId(), tier1Id);
+                        localEndpoints.delete(tier1Id, service.getId(), localEndpoint.getId());
+                    }
+                }
+                logger.debug("Removing VPN service {} from Tier 1 Gateway {}", service.getId(), tier1Id);
+                vpnServices.delete(tier1Id, service.getId());
+            }
+        } catch (NotFound e) {
+            logger.debug("The VPN resources of the Tier 1 Gateway {} no longer exist, skipping deletion", tier1Id);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to remove the VPN resources of the Tier 1 Gateway %s, due to: %s",
+                    tier1Id, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+    }
+
+    /**
+     * Lists the local VTI addresses of the route-based VPN sessions on a tier-1 gateway, excluding
+     * the session of the given connection; used to probe for a collision-free VTI /30
+     */
+    public Set<String> getRouteBasedVpnSessionLocalVtiIps(String tier1GatewayName, String excludedConnectionUuid) {
+        String vpnServiceName = getVpnServiceName(tier1GatewayName);
+        String excludedSessionName = getVpnSessionName(excludedConnectionUuid);
+        Set<String> vtiIps = new HashSet<>();
+        try {
+            Sessions sessions = (Sessions) nsxService.apply(Sessions.class);
+            IPSecVpnSessionListResult sessionList = sessions.list(tier1GatewayName, vpnServiceName, null, false, null, null, false, null);
+            if (CollectionUtils.isEmpty(sessionList.getResults())) {
+                return vtiIps;
+            }
+            for (Structure result : sessionList.getResults()) {
+                IPSecVpnSession session = result._convertTo(IPSecVpnSession.class);
+                if (excludedSessionName.equals(session.getId())
+                        || !RouteBasedIPSecVpnSession.class.getSimpleName().equals(session.getResourceType())) {
+                    continue;
+                }
+                RouteBasedIPSecVpnSession routeBasedSession = result._convertTo(RouteBasedIPSecVpnSession.class);
+                if (CollectionUtils.isEmpty(routeBasedSession.getTunnelInterfaces())) {
+                    continue;
+                }
+                for (IPSecVpnTunnelInterface tunnelInterface : routeBasedSession.getTunnelInterfaces()) {
+                    if (CollectionUtils.isEmpty(tunnelInterface.getIpSubnets())) {
+                        continue;
+                    }
+                    for (TunnelInterfaceIPSubnet ipSubnet : tunnelInterface.getIpSubnets()) {
+                        if (CollectionUtils.isNotEmpty(ipSubnet.getIpAddresses())) {
+                            vtiIps.addAll(ipSubnet.getIpAddresses());
+                        }
+                    }
+                }
+            }
+        } catch (NotFound e) {
+            logger.debug("The VPN service {} does not exist yet on tier-1 gateway {}, no VTI addresses are in use",
+                    vpnServiceName, tier1GatewayName);
+        } catch (Error error) {
+            ApiError ae = error.getData()._convertTo(ApiError.class);
+            String msg = String.format("Failed to list the VPN sessions on tier-1 gateway %s, due to: %s",
+                    tier1GatewayName, ae.getErrorMessage());
+            logger.error(msg);
+            throw new CloudRuntimeException(msg);
+        }
+        return vtiIps;
+    }
+
+    private String getVpnLocalEndpointPath(String tier1GatewayName, String vpnServiceName, String localEndpointName) {
+        return TIER_1_GATEWAY_PATH_PREFIX + tier1GatewayName + "/ipsec-vpn-services/" + vpnServiceName
+                + "/local-endpoints/" + localEndpointName;
     }
 }

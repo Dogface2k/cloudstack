@@ -646,6 +646,8 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
             try {
                 if (Objects.isNull(network.getVpcId())) {
                     provisionFirewallRules(publicIp, owner, etcdStartPort, etcdStartPort);
+                } else if (network.getNetworkACLId() == null) {
+                    throw new ManagementServerException(String.format("Failed to provision ACL rules for etcd access for the Kubernetes cluster : %s as VPC tier %s does not have a network ACL attached", kubernetesCluster.getName(), network.getName()));
                 } else if (network.getNetworkACLId() != NetworkACL.DEFAULT_ALLOW) {
                     try {
                         provisionVpcTierAllowPortACLRule(network, ETCD_NODE_CLIENT_REQUEST_PORT, ETCD_NODE_CLIENT_REQUEST_PORT);
@@ -733,8 +735,11 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         return false;
     }
 
-    private void updateKubernetesClusterEntryEndpoint() {
+    protected void updateKubernetesClusterEntryEndpoint() {
         KubernetesClusterVO kubernetesClusterVO = kubernetesClusterDao.findById(kubernetesCluster.getId());
+        if (kubernetesClusterVO == null) {
+            throw new CloudRuntimeException(String.format("Failed to update endpoint of the Kubernetes cluster : %s as the cluster no longer exists, it may have been removed while the operation was in progress", kubernetesCluster.getName()));
+        }
         kubernetesClusterVO.setEndpoint(String.format("https://%s:%d/", publicIpAddress, CLUSTER_API_PORT));
         kubernetesClusterDao.update(kubernetesCluster.getId(), kubernetesClusterVO);
     }

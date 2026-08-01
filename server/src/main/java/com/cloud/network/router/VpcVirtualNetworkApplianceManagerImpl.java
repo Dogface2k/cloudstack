@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 
 import javax.inject.Inject;
 import javax.naming.ConfigurationException;
@@ -370,7 +371,9 @@ public class VpcVirtualNetworkApplianceManagerImpl extends VirtualNetworkApplian
         final StringBuilder buf = profile.getBootArgsBuilder();
         final DomainRouterVO router = _routerDao.findById(profile.getVirtualMachine().getId());
         if (router != null && router.getVpcId() != null) {
-            List<IPAddressVO> vpcIps = _ipAddressDao.listByAssociatedVpc(router.getVpcId(), true);
+            List<IPAddressVO> vpcIps = _ipAddressDao.listByAssociatedVpc(router.getVpcId(), true).stream()
+                    .filter(ip -> !ip.isForSystemVms())
+                    .collect(Collectors.toList());
             if (CollectionUtils.isNotEmpty(vpcIps)) {
                 buf.append(String.format(" source_nat_ip=%s", vpcIps.get(0).getAddress().toString()));
                 logger.debug("The final Boot Args for " + profile + ": " + buf);

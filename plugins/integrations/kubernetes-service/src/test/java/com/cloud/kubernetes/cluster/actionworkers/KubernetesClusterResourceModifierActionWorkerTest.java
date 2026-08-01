@@ -17,12 +17,15 @@
 
 package com.cloud.kubernetes.cluster.actionworkers;
 
+import com.cloud.exception.ManagementServerException;
 import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDetailsDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterVmMapDao;
 import com.cloud.kubernetes.version.dao.KubernetesSupportedVersionDao;
+import com.cloud.network.Network;
+import com.cloud.network.vpc.NetworkACL;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -134,5 +137,33 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
 
         Mockito.when(kubernetesClusterMock.getName()).thenReturn(originalPrefix);
         Assert.assertEquals(expectedPrefix, kubernetesClusterResourceModifierActionWorker.getKubernetesClusterNodeNamePrefix());
+    }
+
+    @Test(expected = ManagementServerException.class)
+    public void createVpcTierAclRulesTestThrowsWhenTierHasNoAclAttached() throws ManagementServerException {
+        Network network = Mockito.mock(Network.class);
+        Mockito.when(network.getNetworkACLId()).thenReturn(null);
+        kubernetesClusterResourceModifierActionWorker.createVpcTierAclRules(network);
+    }
+
+    @Test
+    public void createVpcTierAclRulesTestSkipsProvisioningForDefaultAllowAcl() throws ManagementServerException {
+        Network network = Mockito.mock(Network.class);
+        Mockito.when(network.getNetworkACLId()).thenReturn(NetworkACL.DEFAULT_ALLOW);
+        kubernetesClusterResourceModifierActionWorker.createVpcTierAclRules(network);
+    }
+
+    @Test
+    public void removeVpcTierAclRulesTestSkipsQuietlyWhenTierHasNoAclAttached() throws ManagementServerException {
+        Network network = Mockito.mock(Network.class);
+        Mockito.when(network.getNetworkACLId()).thenReturn(null);
+        kubernetesClusterResourceModifierActionWorker.removeVpcTierAclRules(network);
+    }
+
+    @Test
+    public void removeVpcTierAclRulesTestSkipsForDefaultAllowAcl() throws ManagementServerException {
+        Network network = Mockito.mock(Network.class);
+        Mockito.when(network.getNetworkACLId()).thenReturn(NetworkACL.DEFAULT_ALLOW);
+        kubernetesClusterResourceModifierActionWorker.removeVpcTierAclRules(network);
     }
 }

@@ -122,17 +122,16 @@ public class KubernetesClusterManagerImplTest {
     @InjectMocks
     KubernetesClusterManagerImpl kubernetesClusterManager;
 
-    @Test
-    public void testValidateVpcTierAllocated() {
+    @Test(expected = InvalidParameterValueException.class)
+    public void testValidateVpcTierNoAclAttached() {
         Network network = Mockito.mock(Network.class);
-        Mockito.when(network.getState()).thenReturn(Network.State.Allocated);
+        Mockito.when(network.getNetworkACLId()).thenReturn(null);
         kubernetesClusterManager.validateVpcTier(network);
     }
 
     @Test(expected = InvalidParameterValueException.class)
     public void testValidateVpcTierDefaultDenyRule() {
         Network network = Mockito.mock(Network.class);
-        Mockito.when(network.getState()).thenReturn(Network.State.Implemented);
         Mockito.when(network.getNetworkACLId()).thenReturn(NetworkACL.DEFAULT_DENY);
         kubernetesClusterManager.validateVpcTier(network);
     }
@@ -140,7 +139,6 @@ public class KubernetesClusterManagerImplTest {
     @Test
     public void testValidateVpcTierValid() {
         Network network = Mockito.mock(Network.class);
-        Mockito.when(network.getState()).thenReturn(Network.State.Implemented);
         Mockito.when(network.getNetworkACLId()).thenReturn(NetworkACL.DEFAULT_ALLOW);
         kubernetesClusterManager.validateVpcTier(network);
     }

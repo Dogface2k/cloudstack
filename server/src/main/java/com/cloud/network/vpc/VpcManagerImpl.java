@@ -36,6 +36,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import com.cloud.event.UsageEventUtils;
 import javax.annotation.PostConstruct;
@@ -223,6 +224,10 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
     public static final String CAPABILITYVALUE = "capabilityvalue";
     public static final String TRUE_VALUE = "true";
     public static final String FALSE_VALUE = "false";
+    protected static final String DEFAULT_ALLOW_ACL_NAME = "default_allow";
+    protected static final String DEFAULT_DENY_ACL_NAME = "default_deny";
+    protected static final String KUBERNETES_SERVICE_NETWORK_OFFERING_NAME_TOKEN = "KubernetesService";
+    protected static final String KUBERNETES_CLUSTER_NETWORK_OFFERING_CONFIG_KEY = "cloud.kubernetes.cluster.network.offering";
 
     @Inject
     EntityManager _entityMgr;
@@ -2047,7 +2052,9 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
         IPAddressVO requestedIp = validateSourceNatip(vpc, sourceNatIp);
         if (requestedIp == null) return false; // ip not associated with this network
 
-        List<IPAddressVO> userIps = _ipAddressDao.listByAssociatedVpc(vpc.getId(), true);
+        List<IPAddressVO> userIps = _ipAddressDao.listByAssociatedVpc(vpc.getId(), true).stream()
+                .filter(ip -> !ip.isForSystemVms())
+                .collect(Collectors.toList());
         if (! userIps.isEmpty()) {
             try {
                 _ipAddrMgr.updateSourceNatIpAddress(requestedIp, userIps);
@@ -3721,7 +3728,8 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
     public ConfigKey<?>[] getConfigKeys() {
         return new ConfigKey<?>[]{
                 VpcTierNamePrepend,
-                VpcTierNamePrependDelimiter
+                VpcTierNamePrependDelimiter,
+                VpcTierDefaultNetworkACL
         };
     }
 
@@ -3852,6 +3860,24 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
         return ip != null && ip.getVpcId() != null && (ip.isOneToOneNat() || !_firewallDao.listByIp(ip.getId()).isEmpty());
     }
 
+    /**
+     * Resolves the ACL a new VPC tier gets when the caller does not specify one. Kubernetes clusters
+     * cannot be provisioned on a tier that uses the default deny ACL, and default ACLs cannot be given
+     * rules, so tiers on the offerings the Kubernetes service deploys into always default to the
+     * default allow ACL; every other tier follows the VpcTierDefaultNetworkACL setting.
+     */
+    protected Long getDefaultAclIdForNewTier(long ntwkOffId, long zoneId) {
+        NetworkOffering networkOffering = _entityMgr.findById(NetworkOffering.class, ntwkOffId);
+        String offeringName = networkOffering == null ? null : networkOffering.getName();
+        if (org.apache.commons.lang3.StringUtils.isNotBlank(offeringName)
+                && (offeringName.contains(KUBERNETES_SERVICE_NETWORK_OFFERING_NAME_TOKEN)
+                    || offeringName.equalsIgnoreCase(_configDao.getValue(KUBERNETES_CLUSTER_NETWORK_OFFERING_CONFIG_KEY)))) {
+            return NetworkACL.DEFAULT_ALLOW;
+        }
+        return DEFAULT_DENY_ACL_NAME.equalsIgnoreCase(VpcTierDefaultNetworkACL.valueIn(zoneId))
+                ? NetworkACL.DEFAULT_DENY : NetworkACL.DEFAULT_ALLOW;
+    }
+
     @DB
     @Override
     public Network createVpcGuestNetwork(final long ntwkOffId, final String name, final String displayText, final String gateway, final String cidr, final String vlanId,
@@ -3880,12 +3906,19 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
         // 1) Validate if network can be created for VPC
         validateNtwkOffForNtwkInVpc(null, ntwkOffId, cidr, networkDomain, vpc, gateway, owner, aclId);
 
+        Long effectiveAclId = aclId;
+        if (effectiveAclId == null && _ntwkModel.areServicesSupportedByNetworkOffering(ntwkOffId, Service.NetworkACL)) {
+            effectiveAclId = getDefaultAclIdForNewTier(ntwkOffId, zoneId);
+            logger.debug("No ACL provided for the new tier in VPC {}, defaulting to the {} ACL", vpc,
+                    NetworkACL.DEFAULT_ALLOW == effectiveAclId ? DEFAULT_ALLOW_ACL_NAME : DEFAULT_DENY_ACL_NAME);
+        }
+
         // 2) Create network
         final Network guestNetwork = _ntwkMgr.createGuestNetwork(ntwkOffId, name, displayText, gateway, cidr, vlanId, false, networkDomain, owner, domainId, pNtwk, zoneId, aclType,
                 subdomainAccess, vpcId, ip6Gateway, ip6Cidr, isDisplayNetworkEnabled, null, null, externalId, null, null, ip4Dns1, ip4Dns2, ip6Dns1, ip6Dns2, vrIfaceMTUs, networkCidrSize);
 
         if (guestNetwork != null) {
-            guestNetwork.setNetworkACLId(aclId);
+            guestNetwork.setNetworkACLId(effectiveAclId);
             _ntwkDao.update(guestNetwork.getId(), (NetworkVO) guestNetwork);
         }
         return guestNetwork;

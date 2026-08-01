@@ -40,13 +40,17 @@ import com.cloud.host.Host;
 import com.cloud.host.HostVO;
 import com.cloud.host.Status;
 import com.cloud.network.IpAddress;
+import com.cloud.network.IpAddressManager;
 import com.cloud.network.Network;
 import com.cloud.network.NetworkModel;
 import com.cloud.network.Networks;
 import com.cloud.network.PhysicalNetworkServiceProvider;
 import com.cloud.network.PublicIpAddress;
 import com.cloud.network.SDNProviderNetworkRule;
+import com.cloud.network.Site2SiteVpnConnection;
+import com.cloud.network.Site2SiteVpnGateway;
 import com.cloud.network.VirtualRouterProvider;
+import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.LoadBalancerVMMapDao;
@@ -56,6 +60,10 @@ import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.PhysicalNetworkDao;
 import com.cloud.network.dao.PhysicalNetworkServiceProviderDao;
 import com.cloud.network.dao.PhysicalNetworkVO;
+import com.cloud.network.dao.Site2SiteCustomerGatewayDao;
+import com.cloud.network.dao.Site2SiteCustomerGatewayVO;
+import com.cloud.network.dao.Site2SiteVpnGatewayDao;
+import com.cloud.network.dao.Site2SiteVpnGatewayVO;
 import com.cloud.network.dao.VirtualRouterProviderDao;
 import com.cloud.network.element.DhcpServiceProvider;
 import com.cloud.network.element.DnsServiceProvider;
@@ -64,6 +72,7 @@ import com.cloud.network.element.IpDeployer;
 import com.cloud.network.element.LoadBalancingServiceProvider;
 import com.cloud.network.element.NetworkACLServiceProvider;
 import com.cloud.network.element.PortForwardingServiceProvider;
+import com.cloud.network.element.Site2SiteVpnServiceProvider;
 import com.cloud.network.element.StaticNatServiceProvider;
 import com.cloud.network.element.VirtualRouterElement;
 import com.cloud.network.element.VirtualRouterProviderVO;
@@ -77,6 +86,7 @@ import com.cloud.network.vpc.NetworkACLItem;
 import com.cloud.network.vpc.PrivateGateway;
 import com.cloud.network.vpc.StaticRouteProfile;
 import com.cloud.network.vpc.Vpc;
+import com.cloud.network.vpc.VpcService;
 import com.cloud.network.vpc.dao.VpcOfferingServiceMapDao;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.VpcDao;
@@ -108,14 +118,20 @@ import org.apache.cloudstack.api.ApiConstants;
 import org.apache.cloudstack.api.command.admin.internallb.ConfigureInternalLoadBalancerElementCmd;
 import org.apache.cloudstack.api.command.admin.internallb.CreateInternalLoadBalancerElementCmd;
 import org.apache.cloudstack.api.command.admin.internallb.ListInternalLoadBalancerElementsCmd;
+import org.apache.cloudstack.context.CallContext;
 import org.apache.cloudstack.network.element.InternalLoadBalancerElementService;
 import org.apache.cloudstack.resource.NsxLoadBalancerMember;
 import org.apache.cloudstack.resource.NsxNetworkRule;
 import com.cloud.network.SDNProviderOpObject;
+import org.apache.cloudstack.utils.NsxHelper;
+import org.apache.cloudstack.utils.NsxVpnCryptoUtils;
+import org.apache.commons.lang3.BooleanUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.cloudstack.resourcedetail.FirewallRuleDetailVO;
+import org.apache.cloudstack.resourcedetail.UserIpAddressDetailVO;
 import org.apache.cloudstack.resourcedetail.dao.FirewallRuleDetailsDao;
+import org.apache.cloudstack.resourcedetail.dao.UserIpAddressDetailsDao;
 import org.springframework.stereotype.Component;
 
 import javax.inject.Inject;
@@ -135,8 +151,10 @@ import java.util.stream.Collectors;
 @Component
 public class NsxElement extends AdapterBase implements  DhcpServiceProvider, DnsServiceProvider, VpcProvider,
         StaticNatServiceProvider, IpDeployer, PortForwardingServiceProvider, NetworkACLServiceProvider,
-        LoadBalancingServiceProvider, FirewallServiceProvider, InternalLoadBalancerElementService, ResourceStateAdapter, Listener {
+        LoadBalancingServiceProvider, FirewallServiceProvider, Site2SiteVpnServiceProvider,
+        InternalLoadBalancerElementService, ResourceStateAdapter, Listener {
 
+    protected static final String NSX_VPN_GATEWAY_IP_DETAIL = "nsxVpnGatewayIp";
 
     @Inject
     AccountManager accountMgr;
@@ -172,6 +190,18 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
     PhysicalNetworkServiceProviderDao pNtwkSvcProviderDao;
     @Inject
     FirewallRuleDetailsDao firewallRuleDetailsDao;
+    @Inject
+    IpAddressManager ipAddressManager;
+    @Inject
+    VpcService vpcService;
+    @Inject
+    Site2SiteVpnGatewayDao vpnGatewayDao;
+    @Inject
+    Site2SiteCustomerGatewayDao customerGatewayDao;
+    @Inject
+    UserIpAddressDetailsDao userIpAddressDetailsDao;
+    @Inject
+    FirewallRulesDao firewallRulesDao;
 
     protected Logger logger = LogManager.getLogger(getClass());
 
@@ -214,6 +244,11 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
         sourceNatCapabilities.put(Network.Capability.RedundantRouter, "true");
         sourceNatCapabilities.put(Network.Capability.SupportedSourceNatTypes, "peraccount");
         capabilities.put(Network.Service.SourceNat, sourceNatCapabilities);
+
+        Map<Network.Capability, String> vpnCapabilities = new HashMap<>();
+        vpnCapabilities.put(Network.Capability.SupportedVpnProtocols, "ipsec");
+        vpnCapabilities.put(Network.Capability.VpnTypes, "s2svpn");
+        capabilities.put(Network.Service.Vpn, vpnCapabilities);
         return capabilities;
     }
     @Override
@@ -940,5 +975,164 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
     @Override
     public boolean updateVpcSourceNatIp(Vpc vpc, IpAddress address) {
         return nsxService.updateVpcSourceNatIp(vpc, address);
+    }
+
+    protected boolean isVpnProvidedByNsx(Vpc vpc) {
+        return Objects.nonNull(vpc) && Objects.nonNull(vpcOfferingServiceMapDao.findByServiceProviderAndOfferingId(
+                Network.Service.Vpn.getName(), Network.Provider.Nsx.getName(), vpc.getVpcOfferingId()));
+    }
+
+    @Override
+    public IpAddress acquireVpnGatewayIp(Vpc vpc, IpAddress requestedIp) {
+        if (!isVpnProvidedByNsx(vpc)) {
+            return null;
+        }
+        IPAddressVO ip;
+        boolean autoAcquired = false;
+        if (Objects.nonNull(requestedIp)) {
+            ip = validateRequestedVpnGatewayIp(vpc, requestedIp);
+        } else {
+            ip = allocateVpnGatewayIp(vpc);
+            autoAcquired = true;
+        }
+        try {
+            nsxService.createVpnGateway(vpc, ip.getAddress().addr());
+        } catch (Exception e) {
+            if (autoAcquired) {
+                releaseAutoAcquiredVpnGatewayIp(ip);
+            }
+            throw new CloudRuntimeException(String.format("Failed to create the NSX VPN gateway for VPC %s: %s",
+                    vpc.getName(), e.getMessage()), e);
+        }
+        return ip;
+    }
+
+    private IPAddressVO validateRequestedVpnGatewayIp(Vpc vpc, IpAddress requestedIp) {
+        IPAddressVO ip = ipAddressDao.findById(requestedIp.getId());
+        if (Objects.isNull(ip) || !Objects.equals(ip.getVpcId(), vpc.getId())) {
+            throw new InvalidParameterValueException(String.format(
+                    "The requested IP %s is not associated to the VPC %s", requestedIp.getAddress().addr(), vpc.getName()));
+        }
+        if (ip.isSourceNat() || ip.isForSystemVms()) {
+            throw new InvalidParameterValueException(String.format(
+                    "The requested IP %s cannot be used as the VPN gateway IP as it is a source NAT or system IP", ip.getAddress().addr()));
+        }
+        if (ip.isOneToOneNat() || firewallRulesDao.countRulesByIpId(ip.getId()) > 0) {
+            throw new InvalidParameterValueException(String.format(
+                    "The requested IP %s cannot be used as the VPN gateway IP as it is already in use by static NAT or network rules", ip.getAddress().addr()));
+        }
+        return ip;
+    }
+
+    private IPAddressVO allocateVpnGatewayIp(Vpc vpc) {
+        Account owner = accountMgr.getAccount(vpc.getAccountId());
+        DataCenterVO zone = dataCenterDao.findById(vpc.getZoneId());
+        IpAddress allocatedIp = null;
+        try {
+            allocatedIp = ipAddressManager.allocateIp(owner, false, CallContext.current().getCallingAccount(),
+                    CallContext.current().getCallingUser(), zone, null, null);
+            vpcService.associateIPToVpc(allocatedIp.getId(), vpc.getId());
+            userIpAddressDetailsDao.addDetail(allocatedIp.getId(), NSX_VPN_GATEWAY_IP_DETAIL, "true", false);
+            return ipAddressDao.findById(allocatedIp.getId());
+        } catch (Exception e) {
+            // do not leak the IP when associating or tagging it fails after allocation succeeded
+            if (Objects.nonNull(allocatedIp)) {
+                IPAddressVO ipToRelease = ipAddressDao.findById(allocatedIp.getId());
+                if (Objects.nonNull(ipToRelease)) {
+                    try {
+                        releaseAutoAcquiredVpnGatewayIp(ipToRelease);
+                    } catch (Exception releaseException) {
+                        logger.warn("Failed to release the IP {} allocated for the VPN gateway of VPC {}: {}",
+                                ipToRelease.getAddress().addr(), vpc.getName(), releaseException.getMessage());
+                    }
+                }
+            }
+            throw new CloudRuntimeException(String.format("Failed to acquire an IP for the VPN gateway of VPC %s: %s",
+                    vpc.getName(), e.getMessage()), e);
+        }
+    }
+
+    private void releaseAutoAcquiredVpnGatewayIp(IPAddressVO ip) {
+        userIpAddressDetailsDao.removeDetail(ip.getId(), NSX_VPN_GATEWAY_IP_DETAIL);
+        ipAddressManager.disassociatePublicIpAddress(ip, CallContext.current().getCallingUserId(), CallContext.current().getCallingAccount());
+    }
+
+    @Override
+    public void releaseVpnGatewayIp(Site2SiteVpnGateway gateway) {
+        VpcVO vpc = vpcDao.findById(gateway.getVpcId());
+        if (!isVpnProvidedByNsx(vpc)) {
+            return;
+        }
+        try {
+            nsxService.deleteVpnGateway(vpc);
+        } catch (Exception e) {
+            throw new CloudRuntimeException(String.format("Failed to delete the NSX VPN gateway of VPC %s: %s",
+                    vpc.getName(), e.getMessage()), e);
+        }
+        IPAddressVO ip = ipAddressDao.findById(gateway.getAddrId());
+        if (Objects.isNull(ip)) {
+            return;
+        }
+        UserIpAddressDetailVO autoAcquiredDetail = userIpAddressDetailsDao.findDetail(ip.getId(), NSX_VPN_GATEWAY_IP_DETAIL);
+        if (Objects.nonNull(autoAcquiredDetail) && Boolean.parseBoolean(autoAcquiredDetail.getValue())) {
+            logger.debug("Releasing the auto-acquired VPN gateway IP {} of VPC {}", ip.getAddress().addr(), vpc.getName());
+            releaseAutoAcquiredVpnGatewayIp(ip);
+        }
+    }
+
+    @Override
+    public boolean startSite2SiteVpn(Site2SiteVpnConnection conn) throws ResourceUnavailableException {
+        Site2SiteVpnGatewayVO vpnGateway = vpnGatewayDao.findById(conn.getVpnGatewayId());
+        if (Objects.isNull(vpnGateway)) {
+            throw new CloudRuntimeException(String.format(
+                    "Cannot find the VPN gateway %s of the Site-to-Site VPN connection %s", conn.getVpnGatewayId(), conn.getUuid()));
+        }
+        VpcVO vpc = vpcDao.findById(vpnGateway.getVpcId());
+        if (!isVpnProvidedByNsx(vpc)) {
+            return true;
+        }
+        Site2SiteCustomerGatewayVO customerGateway = customerGatewayDao.findById(conn.getCustomerGatewayId());
+        if (Objects.isNull(customerGateway)) {
+            throw new CloudRuntimeException(String.format(
+                    "Cannot find the customer gateway %s of the Site-to-Site VPN connection %s", conn.getCustomerGatewayId(), conn.getUuid()));
+        }
+        NsxVpnCryptoUtils.validate(customerGateway.getIkePolicy(), customerGateway.getEspPolicy(),
+                customerGateway.getIkeVersion(), customerGateway.getIkeLifetime(), customerGateway.getEspLifetime(),
+                customerGateway.getIpsecPsk());
+        if (BooleanUtils.isTrue(customerGateway.getEncap())) {
+            logger.debug("Ignoring forceencap for the NSX VPN connection {}: NSX negotiates NAT-T automatically", conn);
+        }
+        if (BooleanUtils.isTrue(customerGateway.getSplitConnections())) {
+            logger.debug("Ignoring splitconnections for the NSX VPN connection {}: a route-based session carries all subnets", conn);
+        }
+        IPAddressVO localEndpointIp = ipAddressDao.findById(vpnGateway.getAddrId());
+        if (Objects.isNull(localEndpointIp)) {
+            throw new CloudRuntimeException(String.format(
+                    "Cannot find the local endpoint IP %s of the VPN gateway of VPC %s", vpnGateway.getAddrId(), vpc.getName()));
+        }
+        Pair<String, String> vtiAddresses = NsxHelper.getVpnVtiAddressPair(conn.getId());
+        List<String> peerCidrs = Arrays.stream(customerGateway.getGuestCidrList().split(","))
+                .map(String::trim)
+                .collect(Collectors.toList());
+        return nsxService.createVpnConnection(vpc, conn.getUuid(), customerGateway.getGatewayIp(),
+                customerGateway.getIpsecPsk(), customerGateway.getIkePolicy(), customerGateway.getEspPolicy(),
+                customerGateway.getIkeLifetime(), customerGateway.getEspLifetime(),
+                BooleanUtils.isTrue(customerGateway.getDpd()), customerGateway.getIkeVersion(), conn.isPassive(),
+                peerCidrs, vtiAddresses.first(), vtiAddresses.second(), NsxHelper.VPN_VTI_PREFIX_LENGTH,
+                localEndpointIp.getAddress().addr());
+    }
+
+    @Override
+    public boolean stopSite2SiteVpn(Site2SiteVpnConnection conn) throws ResourceUnavailableException {
+        Site2SiteVpnGatewayVO vpnGateway = vpnGatewayDao.findById(conn.getVpnGatewayId());
+        if (Objects.isNull(vpnGateway)) {
+            throw new CloudRuntimeException(String.format(
+                    "Cannot find the VPN gateway %s of the Site-to-Site VPN connection %s", conn.getVpnGatewayId(), conn.getUuid()));
+        }
+        VpcVO vpc = vpcDao.findById(vpnGateway.getVpcId());
+        if (!isVpnProvidedByNsx(vpc)) {
+            return true;
+        }
+        return nsxService.deleteVpnConnection(vpc, conn.getUuid());
     }
 }

@@ -608,10 +608,11 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
     }
 
     protected void validateVpcTier(Network network) {
-        if (Network.State.Allocated.equals(network.getState())) { // Allocated networks won't have IP and rules
-            return;
+        Long networkAclId = network.getNetworkACLId();
+        if (networkAclId == null) {
+            throw new InvalidParameterValueException(String.format("Network ID: %s can not be used for Kubernetes cluster as it does not have a network ACL attached. Attach a network ACL allowing the required traffic to the VPC tier and retry", network.getUuid()));
         }
-        if (network.getNetworkACLId() == NetworkACL.DEFAULT_DENY) {
+        if (networkAclId == NetworkACL.DEFAULT_DENY) {
             throw new InvalidParameterValueException(String.format("Network ID: %s can not be used for Kubernetes cluster as it uses default deny ACL", network.getUuid()));
         }
     }

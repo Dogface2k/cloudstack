@@ -28,6 +28,7 @@ import com.cloud.agent.api.StartupCommand;
 import com.cloud.host.Host;
 import com.cloud.network.Network;
 import com.cloud.resource.ServerResource;
+import com.cloud.utils.Pair;
 import com.cloud.utils.exception.CloudRuntimeException;
 
 import com.vmware.nsx.model.TransportZone;
@@ -42,15 +43,22 @@ import org.apache.cloudstack.agent.api.CreateNsxPortForwardRuleCommand;
 import org.apache.cloudstack.agent.api.CreateNsxSegmentCommand;
 import org.apache.cloudstack.agent.api.CreateNsxStaticNatCommand;
 import org.apache.cloudstack.agent.api.CreateNsxTier1GatewayCommand;
+import org.apache.cloudstack.agent.api.CreateNsxVpnConnectionCommand;
+import org.apache.cloudstack.agent.api.CreateNsxVpnGatewayCommand;
 import org.apache.cloudstack.agent.api.CreateOrUpdateNsxTier1NatRuleCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxDistributedFirewallRulesCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxLoadBalancerRuleCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxSegmentCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxNatRuleCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxTier1GatewayCommand;
+import org.apache.cloudstack.agent.api.DeleteNsxVpnConnectionCommand;
+import org.apache.cloudstack.agent.api.DeleteNsxVpnGatewayCommand;
+import org.apache.cloudstack.agent.api.GetNsxVpnSessionStatusCommand;
 import org.apache.cloudstack.service.NsxApiClient;
 import org.apache.cloudstack.utils.NsxControllerUtils;
+import org.apache.cloudstack.utils.NsxHelper;
 import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -59,6 +67,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 public class NsxResource implements ServerResource {
@@ -132,6 +141,16 @@ public class NsxResource implements ServerResource {
             return executeRequest((DeleteNsxDistributedFirewallRulesCommand) cmd);
         } else if (cmd instanceof CreateNsxDistributedFirewallRulesCommand) {
             return executeRequest((CreateNsxDistributedFirewallRulesCommand) cmd);
+        } else if (cmd instanceof CreateNsxVpnGatewayCommand) {
+            return executeRequest((CreateNsxVpnGatewayCommand) cmd);
+        } else if (cmd instanceof DeleteNsxVpnGatewayCommand) {
+            return executeRequest((DeleteNsxVpnGatewayCommand) cmd);
+        } else if (cmd instanceof CreateNsxVpnConnectionCommand) {
+            return executeRequest((CreateNsxVpnConnectionCommand) cmd);
+        } else if (cmd instanceof DeleteNsxVpnConnectionCommand) {
+            return executeRequest((DeleteNsxVpnConnectionCommand) cmd);
+        } else if (cmd instanceof GetNsxVpnSessionStatusCommand) {
+            return executeRequest((GetNsxVpnSessionStatusCommand) cmd);
         } else {
             return Answer.createUnsupportedCommandAnswer(cmd);
         }
@@ -304,8 +323,17 @@ public class NsxResource implements ServerResource {
     private Answer executeRequest(CreateNsxTier1GatewayCommand cmd) {
         String tier1GatewayName = NsxControllerUtils.getTier1GatewayName(cmd.getDomainId(), cmd.getAccountId(), cmd.getZoneId(), cmd.getNetworkResourceId(), cmd.isResourceVpc());
         boolean sourceNatEnabled = cmd.isSourceNatEnabled();
+        // The command carries a Tier-0 and edge cluster only when the tenant has an NSX
+        // VRF gateway registered. Otherwise fall back to the zone-wide values this
+        // resource was configured with, so non-VRF zones behave exactly as before.
+        String targetTier0 = StringUtils.defaultIfBlank(cmd.getTier0Gateway(), tier0Gateway);
+        String targetEdgeCluster = StringUtils.defaultIfBlank(cmd.getEdgeCluster(), edgeCluster);
+        if (!targetTier0.equals(tier0Gateway) || !targetEdgeCluster.equals(edgeCluster)) {
+            logger.debug("Creating tier 1 gateway {} on tier 0 {} (edge cluster {}) instead of the zone default {} ({})",
+                    tier1GatewayName, targetTier0, targetEdgeCluster, tier0Gateway, edgeCluster);
+        }
         try {
-            nsxApiClient.createTier1Gateway(tier1GatewayName, tier0Gateway, edgeCluster, sourceNatEnabled);
+            nsxApiClient.createTier1Gateway(tier1GatewayName, targetTier0, targetEdgeCluster, sourceNatEnabled);
             return new NsxAnswer(cmd, true, "");
         } catch (CloudRuntimeException e) {
             String msg = String.format("Cannot create tier 1 gateway %s (%s: %s): %s", tier1GatewayName,
@@ -486,6 +514,83 @@ public class NsxResource implements ServerResource {
             return new NsxAnswer(cmd, new CloudRuntimeException(e.getMessage()));
         }
         return new NsxAnswer(cmd, true, null);
+    }
+
+    private NsxAnswer executeRequest(CreateNsxVpnGatewayCommand cmd) {
+        String tier1GatewayName = NsxControllerUtils.getTier1GatewayName(cmd.getDomainId(), cmd.getAccountId(),
+                cmd.getZoneId(), cmd.getVpcId(), true);
+        try {
+            nsxApiClient.createVpnService(tier1GatewayName, cmd.getLocalEndpointIp());
+        } catch (Exception e) {
+            logger.error(String.format("Failed to create the NSX VPN service on tier-1 gateway %s for VPC %s: %s",
+                    tier1GatewayName, cmd.getVpcName(), e.getMessage()));
+            return new NsxAnswer(cmd, new CloudRuntimeException(e.getMessage()));
+        }
+        return new NsxAnswer(cmd, true, null);
+    }
+
+    private NsxAnswer executeRequest(DeleteNsxVpnGatewayCommand cmd) {
+        String tier1GatewayName = NsxControllerUtils.getTier1GatewayName(cmd.getDomainId(), cmd.getAccountId(),
+                cmd.getZoneId(), cmd.getVpcId(), true);
+        try {
+            nsxApiClient.deleteVpnService(tier1GatewayName);
+        } catch (Exception e) {
+            logger.error(String.format("Failed to delete the NSX VPN service on tier-1 gateway %s for VPC %s: %s",
+                    tier1GatewayName, cmd.getVpcName(), e.getMessage()));
+            return new NsxAnswer(cmd, new CloudRuntimeException(e.getMessage()));
+        }
+        return new NsxAnswer(cmd, true, null);
+    }
+
+    private NsxAnswer executeRequest(CreateNsxVpnConnectionCommand cmd) {
+        String tier1GatewayName = NsxControllerUtils.getTier1GatewayName(cmd.getDomainId(), cmd.getAccountId(),
+                cmd.getZoneId(), cmd.getVpcId(), true);
+        try {
+            // The requested VTI /30 is derived from the connection id and may collide with another
+            // session on the same tier-1: probe from it to the first free slot
+            Set<String> inUseVtiIps = nsxApiClient.getRouteBasedVpnSessionLocalVtiIps(tier1GatewayName, cmd.getConnectionUuid());
+            Pair<String, String> vtiAddresses = NsxHelper.findFreeVpnVtiAddressPair(cmd.getVtiLocalIp(), inUseVtiIps);
+            nsxApiClient.createRouteBasedVpnSession(tier1GatewayName, cmd.getConnectionUuid(), cmd.getPeerAddress(),
+                    cmd.getPsk(), cmd.getIkePolicy(), cmd.getEspPolicy(), cmd.getIkeLifetime(), cmd.getEspLifetime(),
+                    cmd.isDpdEnabled(), cmd.getIkeVersion(), cmd.isPassive(), vtiAddresses.first(), cmd.getVtiPrefixLength());
+            nsxApiClient.addVpnConnectionRoutes(tier1GatewayName, cmd.getConnectionUuid(), cmd.getPeerCidrs(),
+                    vtiAddresses.second(), cmd.getVpcCidr());
+            // Applied here as well so that VPN gateways created before the exemptions existed, or whose
+            // tier-1 gained a source NAT rule afterwards, are corrected without recreating the gateway
+            nsxApiClient.ensureVpnNatExemptions(tier1GatewayName, cmd.getLocalEndpointIp());
+        } catch (Exception e) {
+            logger.error(String.format("Failed to create the NSX VPN connection %s on tier-1 gateway %s for VPC %s: %s",
+                    cmd.getConnectionUuid(), tier1GatewayName, cmd.getVpcName(), e.getMessage()));
+            return new NsxAnswer(cmd, new CloudRuntimeException(e.getMessage()));
+        }
+        return new NsxAnswer(cmd, true, null);
+    }
+
+    private NsxAnswer executeRequest(DeleteNsxVpnConnectionCommand cmd) {
+        String tier1GatewayName = NsxControllerUtils.getTier1GatewayName(cmd.getDomainId(), cmd.getAccountId(),
+                cmd.getZoneId(), cmd.getVpcId(), true);
+        try {
+            nsxApiClient.deleteVpnConnection(tier1GatewayName, cmd.getConnectionUuid());
+        } catch (Exception e) {
+            logger.error(String.format("Failed to delete the NSX VPN connection %s on tier-1 gateway %s for VPC %s: %s",
+                    cmd.getConnectionUuid(), tier1GatewayName, cmd.getVpcName(), e.getMessage()));
+            return new NsxAnswer(cmd, new CloudRuntimeException(e.getMessage()));
+        }
+        return new NsxAnswer(cmd, true, null);
+    }
+
+    private NsxAnswer executeRequest(GetNsxVpnSessionStatusCommand cmd) {
+        String tier1GatewayName = NsxControllerUtils.getTier1GatewayName(cmd.getDomainId(), cmd.getAccountId(),
+                cmd.getZoneId(), cmd.getVpcId(), true);
+        String status;
+        try {
+            status = nsxApiClient.getVpnSessionStatus(tier1GatewayName, cmd.getConnectionUuid());
+        } catch (Exception e) {
+            logger.error(String.format("Failed to get the status of the NSX VPN connection %s on tier-1 gateway %s for VPC %s: %s",
+                    cmd.getConnectionUuid(), tier1GatewayName, cmd.getVpcName(), e.getMessage()));
+            return new NsxAnswer(cmd, new CloudRuntimeException(e.getMessage()));
+        }
+        return new NsxAnswer(cmd, true, status);
     }
 
     @Override

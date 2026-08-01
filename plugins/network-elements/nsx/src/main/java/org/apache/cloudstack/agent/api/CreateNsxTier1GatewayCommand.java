@@ -24,6 +24,14 @@ public class CreateNsxTier1GatewayCommand extends NsxCommand {
     private String networkResourceName;
     private boolean isResourceVpc;
     private boolean sourceNatEnabled;
+    /**
+     * Tier-0 and edge cluster this gateway should be created under, resolved from the
+     * tenant's registered NSX VRF gateway. Both are null when the zone is not
+     * VRF-segregated, in which case the resource falls back to the zone-wide values it
+     * was configured with — which keeps every pre-VRF deployment byte-identical.
+     */
+    private String tier0Gateway;
+    private String edgeCluster;
 
     public CreateNsxTier1GatewayCommand(long domainId, long accountId, long zoneId,
                                         Long networkResourceId, String networkResourceName, boolean isResourceVpc,
@@ -49,6 +57,22 @@ public class CreateNsxTier1GatewayCommand extends NsxCommand {
 
     public boolean isSourceNatEnabled() {
         return sourceNatEnabled;
+    }
+
+    public String getTier0Gateway() {
+        return tier0Gateway;
+    }
+
+    public void setTier0Gateway(String tier0Gateway) {
+        this.tier0Gateway = tier0Gateway;
+    }
+
+    public String getEdgeCluster() {
+        return edgeCluster;
+    }
+
+    public void setEdgeCluster(String edgeCluster) {
+        this.edgeCluster = edgeCluster;
     }
 
     @Override

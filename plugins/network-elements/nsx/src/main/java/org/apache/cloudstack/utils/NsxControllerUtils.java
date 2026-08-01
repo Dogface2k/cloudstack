@@ -138,6 +138,50 @@ public class NsxControllerUtils {
         return tier1GatewayName + "-VM" + vmId;
     }
 
+    public static String getVpnServiceName(String tier1GatewayName) {
+        return tier1GatewayName + "-vpn";
+    }
+
+    public static String getVpnLocalEndpointName(String vpnServiceName) {
+        return vpnServiceName + "-le";
+    }
+
+    public static String getVpnLocalEndpointNoSnatRuleName(String vpnServiceName) {
+        return vpnServiceName + "-le-nosnat";
+    }
+
+    public static String getVpnSessionName(String connectionUuid) {
+        return "cs-conn-" + connectionUuid;
+    }
+
+    public static String getVpnIkeProfileName(String connectionUuid) {
+        return getVpnSessionName(connectionUuid) + "-ike";
+    }
+
+    public static String getVpnEspProfileName(String connectionUuid) {
+        return getVpnSessionName(connectionUuid) + "-esp";
+    }
+
+    public static String getVpnDpdProfileName(String connectionUuid) {
+        return getVpnSessionName(connectionUuid) + "-dpd";
+    }
+
+    public static String getVpnStaticRouteNamePrefix(String connectionUuid) {
+        return getVpnSessionName(connectionUuid) + "-route";
+    }
+
+    public static String getVpnStaticRouteName(String connectionUuid, int peerCidrIndex) {
+        return getVpnStaticRouteNamePrefix(connectionUuid) + peerCidrIndex;
+    }
+
+    public static String getVpnNoSnatRuleNamePrefix(String connectionUuid) {
+        return getVpnSessionName(connectionUuid) + "-nosnat";
+    }
+
+    public static String getVpnNoSnatRuleName(String connectionUuid, int peerCidrIndex) {
+        return getVpnNoSnatRuleNamePrefix(connectionUuid) + peerCidrIndex;
+    }
+
     public static String getLoadBalancerAlgorithm(String algorithm) {
         switch (algorithm) {
             case "leastconn":
