@@ -325,6 +325,7 @@ public class Site2SiteVpnManagerImplTest {
         CreateVpnGatewayCmd cmd = mock(CreateVpnGatewayCmd.class);
         when(cmd.getVpcId()).thenReturn(VPC_ID);
         when(cmd.getEntityOwnerId()).thenReturn(ACCOUNT_ID);
+        when(cmd.getIpAddressId()).thenReturn(null);
 
         when(_vpcDao.findById(VPC_ID)).thenReturn(vpc);
         when(_vpnGatewayDao.findByVpcId(VPC_ID)).thenReturn(null);
@@ -339,6 +340,7 @@ public class Site2SiteVpnManagerImplTest {
         CreateVpnGatewayCmd cmd = mock(CreateVpnGatewayCmd.class);
         when(cmd.getVpcId()).thenReturn(VPC_ID);
         when(cmd.getEntityOwnerId()).thenReturn(ACCOUNT_ID);
+        when(cmd.getIpAddressId()).thenReturn(null);
         when(cmd.isDisplay()).thenReturn(true);
         IPAddressVO systemVmIp = mock(IPAddressVO.class);
         when(systemVmIp.isForSystemVms()).thenReturn(true);
@@ -361,6 +363,7 @@ public class Site2SiteVpnManagerImplTest {
         CreateVpnGatewayCmd cmd = mock(CreateVpnGatewayCmd.class);
         when(cmd.getVpcId()).thenReturn(VPC_ID);
         when(cmd.getEntityOwnerId()).thenReturn(ACCOUNT_ID);
+        when(cmd.getIpAddressId()).thenReturn(null);
         IPAddressVO secondIp = mock(IPAddressVO.class);
         when(ipAddress.getAddress()).thenReturn(new Ip("203.0.113.34"));
         when(secondIp.getAddress()).thenReturn(new Ip("203.0.113.35"));
