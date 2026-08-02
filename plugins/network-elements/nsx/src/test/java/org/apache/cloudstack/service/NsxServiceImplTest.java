@@ -390,7 +390,7 @@ public class NsxServiceImplTest {
         Site2SiteVpnGatewayVO gateway = mockVpnGatewayForPoller(connection);
         VpcVO vpc = mock(VpcVO.class);
         when(vpcDao.findById(gateway.getVpcId())).thenReturn(vpc);
-        NsxServiceImpl service = Mockito.spy(nsxService);
+        NsxServiceImpl service = nsxService;
 
         service.new VpnStatusPollTask().runInContext();
 
@@ -405,7 +405,7 @@ public class NsxServiceImplTest {
         when(vpcDao.findById(gateway.getVpcId())).thenReturn(vpc);
         when(userIpAddressDetailsDao.findDetail(gateway.getAddrId(), NsxElement.NSX_VPN_GATEWAY_IP_DETAIL))
                 .thenReturn(mock(UserIpAddressDetailVO.class));
-        NsxServiceImpl service = Mockito.spy(nsxService);
+        NsxServiceImpl service = nsxService;
         doNothing().when(service).pollVpnConnectionStatus(connection, vpc);
 
         service.new VpnStatusPollTask().runInContext();
