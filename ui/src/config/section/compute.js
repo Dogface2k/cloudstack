@@ -825,6 +825,17 @@ export default {
           component: shallowRef(defineAsyncComponent(() => import('@/views/compute/ScaleKubernetesCluster.vue')))
         },
         {
+          api: 'reconcileKubernetesClusterNetworkRules',
+          icon: 'reload-outlined',
+          label: 'label.reset.to.default',
+          message: 'message.kubernetes.cluster.network.rules.reconcile',
+          dataView: true,
+          show: (record) => { return ['Running'].includes(record.state) && record.clustertype === 'CloudManaged' },
+          groupAction: true,
+          popup: true,
+          groupMap: (selection) => { return selection.map(x => { return { id: x } }) }
+        },
+        {
           api: 'updateKubernetesClusterAffinityGroups',
           icon: 'swap-outlined',
           label: 'label.change.affinity',
