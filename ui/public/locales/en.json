@@ -3828,6 +3828,7 @@
 "message.kubernetes.cluster.add.nodes": "Please confirm that you want to add the following nodes to the cluster",
 "message.kubernetes.cluster.delete": "Please confirm that you want to destroy the Cluster.",
 "message.kubeconfig.cluster.not.available": "Kubernetes Cluster kubeconfig not available currently.",
+"message.kubernetes.cluster.network.rules.reconcile": "Please confirm that you want to recreate any missing CloudStack-managed network rules for this Kubernetes cluster. User-managed rules will not be deleted or changed.",
 "message.kubernetes.cluster.remove.nodes": "Please confirm that you want to remove the following nodes from the cluster",
 "message.kubernetes.cluster.scale": "Please select desired Cluster configuration.",
 "message.kubernetes.cluster.start": "Please confirm that you want to start the Cluster.",

@@ -79,11 +79,14 @@ import com.cloud.host.dao.HostDao;
 import com.cloud.hypervisor.Hypervisor;
 import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
 import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.LoadBalancerDao;
+import com.cloud.network.dao.LoadBalancerVMMapDao;
+import com.cloud.network.dao.LoadBalancerVMMapVO;
 import com.cloud.network.dao.LoadBalancerVO;
 import com.cloud.network.lb.LoadBalancingRulesService;
 import com.cloud.network.rules.FirewallRule;
@@ -149,6 +152,8 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
     protected DedicatedResourceDao dedicatedResourceDao;
     @Inject
     protected LoadBalancerDao loadBalancerDao;
+    @Inject
+    protected LoadBalancerVMMapDao loadBalancerVMMapDao;
     @Inject
     protected UserVmManager userVmManager;
     @Inject
@@ -485,8 +490,18 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
 
     protected void provisionFirewallRules(final IpAddress publicIp, final Account account, int startPort, int endPort) throws NoSuchFieldException,
             IllegalAccessException, ResourceUnavailableException, NetworkRuleConflictException {
+        List<FirewallRuleVO> existingRules = firewallRulesDao.listByIpPurposePortsProtocolAndNotRevoked(publicIp.getId(), startPort, endPort,
+                NetUtils.TCP_PROTO, FirewallRule.Purpose.Firewall);
+        for (FirewallRuleVO existingRule : existingRules) {
+            firewallRulesDao.loadSourceCidrs(existingRule);
+            if (existingRule.getSourceCidrList() != null && existingRule.getSourceCidrList().contains(NetUtils.ALL_IP4_CIDRS)) {
+                firewallService.applyIngressFwRules(publicIp.getId(), account);
+                return;
+            }
+        }
+
         List<String> sourceCidrList = new ArrayList<String>();
-        sourceCidrList.add("0.0.0.0/0");
+        sourceCidrList.add(NetUtils.ALL_IP4_CIDRS);
 
         CreateFirewallRuleCmd firewallRule = new CreateFirewallRuleCmd();
         firewallRule = ComponentContext.inject(firewallRule);
@@ -513,6 +528,21 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
         final long domainId = account.getDomainId();
         Nic vmNic = networkModel.getNicInNetwork(vmId, networkId);
         final Ip vmIp = new Ip(vmNic.getIPv4Address());
+        for (PortForwardingRuleVO existingRule : portForwardingRulesDao.listByIpAndNotRevoked(publicIpId)) {
+            if (existingRule.getSourcePortStart() > sourcePort || existingRule.getSourcePortEnd() < sourcePort) {
+                continue;
+            }
+            boolean desiredRule = existingRule.getSourcePortStart() == sourcePort && existingRule.getSourcePortEnd() == sourcePort
+                    && existingRule.getDestinationPortStart() == destPort && existingRule.getDestinationPortEnd() == destPort
+                    && existingRule.getVirtualMachineId() == vmId && Objects.equals(existingRule.getNetworkId(), networkId)
+                    && existingRule.getAccountId() == accountId && NetUtils.TCP_PROTO.equalsIgnoreCase(existingRule.getProtocol())
+                    && Objects.equals(existingRule.getDestinationIpAddress(), vmIp);
+            if (desiredRule) {
+                rulesService.applyPortForwardingRules(publicIpId, account);
+                return;
+            }
+            throw new NetworkRuleConflictException(String.format("Public port %d is already used by another port forwarding rule", sourcePort));
+        }
         PortForwardingRuleVO pfRule = execute((TransactionCallbackWithException<PortForwardingRuleVO, NetworkRuleConflictException>) status -> {
             PortForwardingRuleVO newRule =
                     new PortForwardingRuleVO(null, publicIpId,
@@ -641,6 +671,19 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
             IllegalAccessException, ResourceUnavailableException {
         List<NetworkACLItemVO> aclItems = networkACLItemDao.listByACL(network.getNetworkACLId());
         aclItems = aclItems.stream().filter(networkACLItem -> !NetworkACLItem.State.Revoke.equals(networkACLItem.getState())).collect(Collectors.toList());
+        for (NetworkACLItemVO aclItem : aclItems) {
+            List<String> sourceCidrs = aclItem.getSourceCidrList();
+            if (NetUtils.TCP_PROTO.equalsIgnoreCase(aclItem.getProtocol())
+                    && Objects.equals(aclItem.getSourcePortStart(), startPort)
+                    && Objects.equals(aclItem.getSourcePortEnd(), endPorts)
+                    && NetworkACLItem.TrafficType.Ingress.equals(aclItem.getTrafficType())
+                    && NetworkACLItem.Action.Allow.equals(aclItem.getAction())
+                    && sourceCidrs != null && sourceCidrs.contains(NetUtils.ALL_IP4_CIDRS)
+                    && sourceCidrs.contains(NetUtils.ALL_IP6_CIDRS)) {
+                networkACLService.applyNetworkACL(aclItem.getAclId());
+                return;
+            }
+        }
         CreateNetworkACLCmd networkACLRule = new CreateNetworkACLCmd();
         networkACLRule = ComponentContext.inject(networkACLRule);
 
@@ -682,20 +725,59 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
 
     protected void provisionLoadBalancerRule(final IpAddress publicIp, final Network network,
             final Account account, final List<Long> clusterVMIds, final int port) throws NetworkRuleConflictException,
-            InsufficientAddressCapacityException {
-        LoadBalancer lb = lbService.createPublicLoadBalancerRule(null, "api-lb", "LB rule for API access",
-                port, port, port, port,
-                publicIp.getId(), NetUtils.TCP_PROTO, "roundrobin", network.getId(),
-                account.getId(), false, NetUtils.TCP_PROTO, true);
+            InsufficientAddressCapacityException, ResourceUnavailableException {
+        LoadBalancer lb = null;
+        for (LoadBalancerVO existingRule : loadBalancerDao.listByIpAddress(publicIp.getId())) {
+            if (FirewallRule.State.Revoke.equals(existingRule.getState())
+                    || existingRule.getSourcePortStart() > port || existingRule.getSourcePortEnd() < port) {
+                continue;
+            }
+            boolean desiredRule = existingRule.getSourcePortStart() == port && existingRule.getSourcePortEnd() == port
+                    && existingRule.getDefaultPortStart() == port && existingRule.getDefaultPortEnd() == port
+                    && Objects.equals(existingRule.getNetworkId(), network.getId()) && existingRule.getAccountId() == account.getId()
+                    && NetUtils.TCP_PROTO.equalsIgnoreCase(existingRule.getProtocol())
+                    && NetUtils.TCP_PROTO.equalsIgnoreCase(existingRule.getLbProtocol())
+                    && "api-lb".equals(existingRule.getName()) && "roundrobin".equalsIgnoreCase(existingRule.getAlgorithm());
+            if (!desiredRule) {
+                throw new NetworkRuleConflictException(String.format("Public port %d is already used by another load balancing rule", port));
+            }
+            lb = existingRule;
+            break;
+        }
+        if (lb == null) {
+            lb = lbService.createPublicLoadBalancerRule(null, "api-lb", "LB rule for API access",
+                    port, port, port, port,
+                    publicIp.getId(), NetUtils.TCP_PROTO, "roundrobin", network.getId(),
+                    account.getId(), false, NetUtils.TCP_PROTO, true);
+        }
 
         Map<Long, List<String>> vmIdIpMap = new HashMap<>();
-        for (int i = 0; i < kubernetesCluster.getControlNodeCount(); ++i) {
+        List<LoadBalancerVMMapVO> existingMappings = loadBalancerVMMapDao.listByLoadBalancerId(lb.getId(), false);
+        Map<Long, KubernetesClusterVmMapVO> clusterVmMappings = kubernetesClusterVmMapDao.listByClusterId(kubernetesCluster.getId()).stream()
+                .collect(Collectors.toMap(KubernetesClusterVmMapVO::getVmId, vmMap -> vmMap));
+        for (Long vmId : clusterVMIds) {
+            KubernetesClusterVmMapVO vmMap = clusterVmMappings.get(vmId);
+            if (vmMap == null || !vmMap.isControlNode()) {
+                continue;
+            }
             List<String> ips = new ArrayList<>();
-            Nic controlVmNic = networkModel.getNicInNetwork(clusterVMIds.get(i), kubernetesCluster.getNetworkId());
+            Nic controlVmNic = networkModel.getNicInNetwork(vmId, kubernetesCluster.getNetworkId());
             ips.add(controlVmNic.getIPv4Address());
-            vmIdIpMap.put(clusterVMIds.get(i), ips);
+            boolean alreadyMapped = existingMappings.stream().anyMatch(mapping -> Objects.equals(mapping.getInstanceId(), vmId)
+                    && Objects.equals(mapping.getInstanceIp(), controlVmNic.getIPv4Address()));
+            if (!alreadyMapped) {
+                vmIdIpMap.put(vmId, ips);
+            }
         }
-        lbService.assignToLoadBalancer(lb.getId(), null, vmIdIpMap, null, false);
+        if (vmIdIpMap.isEmpty()) {
+            if (!lbService.applyLoadBalancerConfig(lb.getId())) {
+                throw new ResourceUnavailableException("Failed to apply the Kubernetes API load balancing rule", Network.class, network.getId());
+            }
+            return;
+        }
+        if (!lbService.assignToLoadBalancer(lb.getId(), null, vmIdIpMap, null, false)) {
+            throw new ResourceUnavailableException("Failed to assign control nodes to the Kubernetes API load balancing rule", Network.class, network.getId());
+        }
     }
 
     protected Map<Long, Integer> createFirewallRules(IpAddress publicIp, List<Long> clusterVMIds, boolean apiRule) throws ManagementServerException {
@@ -746,7 +828,7 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
         // Load balancer rule for API access for control node VMs
         try {
             provisionLoadBalancerRule(publicIp, network, owner, clusterVMIds, CLUSTER_API_PORT);
-        } catch (NetworkRuleConflictException | InsufficientAddressCapacityException e) {
+        } catch (NetworkRuleConflictException | InsufficientAddressCapacityException | ResourceUnavailableException e) {
             throw new ManagementServerException(String.format("Failed to provision load balancer rule for API access for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
         }
     }
@@ -819,7 +901,7 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
             // Add load balancing for API access
             try {
                 provisionLoadBalancerRule(publicIp, network, owner, clusterVMIds, CLUSTER_API_PORT);
-            } catch (InsufficientAddressCapacityException e) {
+            } catch (InsufficientAddressCapacityException | ResourceUnavailableException e) {
                 throw new ManagementServerException(String.format("Failed to activate API load balancing rules for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
             }
         } else {

@@ -615,24 +615,24 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
             }
             return;
         }
+        setupKubernetesClusterNetworkRules(network, clusterVMs, getPublicIp(network));
+    }
+
+    protected void setupKubernetesClusterNetworkRules(Network network, List<UserVm> clusterVMs, IpAddress publicIp) throws ManagementServerException {
         List<Long> clusterVMIds = clusterVMs.stream().map(UserVm::getId).collect(Collectors.toList());
         if (network.getVpcId() != null) {
-            IpAddress publicIp = getVpcTierKubernetesPublicIp(network);
-            if (publicIp == null) {
-                throw new ManagementServerException(String.format("No public IP addresses found for VPC tier : %s, Kubernetes cluster : %s", network.getName(), kubernetesCluster.getName()));
-            }
             setupKubernetesClusterVpcTierRules(publicIp, network, clusterVMIds);
             return;
-        }
-        IpAddress publicIp = getNetworkSourceNatIp(network);
-        if (publicIp == null) {
-            throw new ManagementServerException(String.format("No source NAT IP addresses found for network : %s, Kubernetes cluster : %s",
-                    network.getName(), kubernetesCluster.getName()));
         }
         setupKubernetesClusterIsolatedNetworkRules(publicIp, network, clusterVMIds, true);
     }
 
     protected void setupKubernetesEtcdNetworkRules(List<UserVm> etcdVms, Network network) throws ManagementServerException, ResourceUnavailableException {
+        IpAddress publicIp = ipAddressDao.findByIpAndDcId(kubernetesCluster.getZoneId(), publicIpAddress);
+        setupKubernetesEtcdNetworkRules(etcdVms, network, publicIp);
+    }
+
+    protected void setupKubernetesEtcdNetworkRules(List<UserVm> etcdVms, Network network, IpAddress publicIp) throws ManagementServerException, ResourceUnavailableException {
         if (!Network.GuestType.Isolated.equals(network.getGuestType())) {
             if (logger.isDebugEnabled()) {
                 logger.debug(String.format("Network : %s for Kubernetes cluster : %s is not an isolated network, therefore, no need for network rules", network.getName(), kubernetesCluster.getName()));
@@ -640,7 +640,6 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         }
         List<Long> etcdVmIds = etcdVms.stream().map(UserVm::getId).collect(Collectors.toList());
         Integer startPort = KubernetesClusterService.KubernetesEtcdNodeStartPort.value();
-        IpAddress publicIp = ipAddressDao.findByIpAndDcId(kubernetesCluster.getZoneId(), publicIpAddress);
         for (int i = 0; i < etcdVmIds.size(); i++) {
             int etcdStartPort = startPort + i;
             try {
@@ -664,6 +663,63 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
                 throw new ManagementServerException(String.format("Failed to provision firewall rules for etcd nodes for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
             }
             provisionPublicIpPortForwardingRule(publicIp, network, owner, etcdVmIds.get(i), etcdStartPort, DEFAULT_SSH_PORT);
+        }
+    }
+
+    public boolean reconcileKubernetesClusterNetworkRules() {
+        owner = accountDao.findById(kubernetesCluster.getAccountId());
+        if (owner == null) {
+            throw new CloudRuntimeException(String.format("Account for Kubernetes cluster %s cannot be found", kubernetesCluster.getName()));
+        }
+        Network network = networkDao.findById(kubernetesCluster.getNetworkId());
+        if (network == null) {
+            throw new CloudRuntimeException(String.format("Network for Kubernetes cluster %s cannot be found", kubernetesCluster.getName()));
+        }
+        if (manager.isDirectAccess(network)) {
+            logger.debug("Network {} for Kubernetes cluster {} uses direct access and has no CloudStack-managed public network rules to reconcile", network, kubernetesCluster);
+            return true;
+        }
+        if (network.getVpcId() != null && network.getNetworkACLId() == null) {
+            throw new CloudRuntimeException(String.format("VPC tier %s for Kubernetes cluster %s has no network ACL", network.getName(), kubernetesCluster.getName()));
+        }
+
+        List<KubernetesClusterVmMapVO> vmMaps = getKubernetesClusterVMMaps();
+        if (CollectionUtils.isEmpty(vmMaps)) {
+            throw new CloudRuntimeException(String.format("Kubernetes cluster %s has no mapped virtual machines", kubernetesCluster.getName()));
+        }
+        List<UserVm> controlVms = new ArrayList<>();
+        List<UserVm> workerVms = new ArrayList<>();
+        List<UserVm> etcdVms = new ArrayList<>();
+        for (KubernetesClusterVmMapVO vmMap : vmMaps) {
+            UserVm vm = userVmDao.findById(vmMap.getVmId());
+            if (vm == null || VirtualMachine.State.Destroyed.equals(vm.getState()) || VirtualMachine.State.Expunging.equals(vm.getState())) {
+                throw new CloudRuntimeException(String.format("Mapped virtual machine %d for Kubernetes cluster %s is not available", vmMap.getVmId(), kubernetesCluster.getName()));
+            }
+            if (vmMap.isEtcdNode()) {
+                etcdVms.add(vm);
+            } else if (vmMap.isControlNode()) {
+                controlVms.add(vm);
+            } else {
+                workerVms.add(vm);
+            }
+        }
+        if (controlVms.isEmpty()) {
+            throw new CloudRuntimeException(String.format("Kubernetes cluster %s has no mapped control node", kubernetesCluster.getName()));
+        }
+        List<UserVm> clusterVms = new ArrayList<>(controlVms);
+        clusterVms.addAll(workerVms);
+
+        try {
+            IpAddress publicIp = getPublicIp(network);
+            publicIpAddress = publicIp.getAddress().addr();
+            setupKubernetesClusterNetworkRules(network, clusterVms, publicIp);
+            if (!etcdVms.isEmpty()) {
+                setupKubernetesEtcdNetworkRules(etcdVms, network, publicIp);
+            }
+            logger.info("Reconciled CloudStack-managed network rules for Kubernetes cluster {}", kubernetesCluster);
+            return true;
+        } catch (ManagementServerException | ResourceUnavailableException e) {
+            throw new CloudRuntimeException(String.format("Failed to reconcile network rules for Kubernetes cluster %s", kubernetesCluster.getName()), e);
         }
     }
 

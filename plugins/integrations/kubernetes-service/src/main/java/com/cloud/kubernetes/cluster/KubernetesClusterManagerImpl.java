@@ -86,6 +86,7 @@ import org.apache.cloudstack.api.command.user.kubernetes.cluster.GetKubernetesCl
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.ListKubernetesClustersCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.RemoveNodesFromKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.RemoveVirtualMachinesFromKubernetesClusterCmd;
+import org.apache.cloudstack.api.command.user.kubernetes.cluster.ReconcileKubernetesClusterNetworkRulesCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.ScaleKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.StartKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.StopKubernetesClusterCmd;
@@ -1063,7 +1064,8 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
                         BaseCmd.getCommandNameByClass(StopKubernetesClusterCmd.class),
                         BaseCmd.getCommandNameByClass(UpgradeKubernetesClusterCmd.class),
                         BaseCmd.getCommandNameByClass(AddNodesToKubernetesClusterCmd.class),
-                        BaseCmd.getCommandNameByClass(RemoveNodesFromKubernetesClusterCmd.class)
+                        BaseCmd.getCommandNameByClass(RemoveNodesFromKubernetesClusterCmd.class),
+                        BaseCmd.getCommandNameByClass(ReconcileKubernetesClusterNetworkRulesCmd.class)
                 ).contains(cmdName);
             case ExternalManaged:
                 return Arrays.asList(
@@ -2281,6 +2283,33 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         return scaleWorker.scaleCluster();
     }
 
+    @Override
+    @ActionEvent(eventType = KubernetesClusterEventTypes.EVENT_KUBERNETES_CLUSTER_NETWORK_RULES_RECONCILE,
+            eventDescription = "reconciling Kubernetes cluster network rules", async = true)
+    public boolean reconcileKubernetesClusterNetworkRules(ReconcileKubernetesClusterNetworkRulesCmd cmd) throws CloudRuntimeException {
+        if (!KubernetesServiceEnabled.value()) {
+            logAndThrow(Level.ERROR, "Kubernetes Service plugin is disabled");
+        }
+        KubernetesClusterVO cluster = kubernetesClusterDao.findById(cmd.getId());
+        if (cluster == null || cluster.getRemoved() != null) {
+            throw new InvalidParameterValueException("Invalid Kubernetes cluster ID specified");
+        }
+        accountManager.checkAccess(CallContext.current().getCallingAccount(), SecurityChecker.AccessType.OperateEntry, false, cluster);
+        if (!isCommandSupported(cluster, cmd.getActualCommandName())) {
+            throw new InvalidParameterValueException(String.format("Network rule reconciliation is not supported for an externally managed cluster (%s)", cluster.getName()));
+        }
+        if (!KubernetesCluster.State.Running.equals(cluster.getState())) {
+            throw new InvalidParameterValueException(String.format("Kubernetes cluster %s must be running to reconcile its network rules", cluster.getName()));
+        }
+
+        KubernetesClusterStartWorker worker = createKubernetesClusterStartWorker(cluster);
+        return worker.reconcileKubernetesClusterNetworkRules();
+    }
+
+    protected KubernetesClusterStartWorker createKubernetesClusterStartWorker(KubernetesCluster cluster) {
+        return ComponentContext.inject(new KubernetesClusterStartWorker(cluster, this));
+    }
+
     /**
      * Creates a map for the requested node type service offering
      * For the node type DEFAULT: Every node is scaled to the same offering
@@ -2760,6 +2789,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         cmdList.add(AddNodesToKubernetesClusterCmd.class);
         cmdList.add(RemoveNodesFromKubernetesClusterCmd.class);
         cmdList.add(UpdateKubernetesClusterAffinityGroupCmd.class);
+        cmdList.add(ReconcileKubernetesClusterNetworkRulesCmd.class);
         return cmdList;
     }
 
