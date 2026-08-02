@@ -552,4 +552,28 @@ public class ApiServletTest {
         boolean result = servlet.isStateChangingCommandNotUsingPOST(command, method, params);
         Assert.assertTrue(result);
     }
+
+    @Test
+    public void shouldNotLogPostRequestParametersForAddObjectStoragePool() {
+        boolean result = servlet.shouldLogPostRequestParameters("addObjectStoragePool", new HashMap<>());
+
+        Assert.assertFalse(result);
+    }
+
+    @Test
+    public void shouldLogPostRequestParametersForCommandWithoutSensitiveParameters() {
+        boolean result = servlet.shouldLogPostRequestParameters("listZones", new HashMap<>());
+
+        Assert.assertTrue(result);
+    }
+
+    @Test
+    public void shouldNotLogPostRequestParametersContainingUserData() {
+        Map<String, String[]> params = new HashMap<>();
+        params.put(ApiConstants.USER_DATA, new String[] {"sensitive-user-data"});
+
+        boolean result = servlet.shouldLogPostRequestParameters("deployVirtualMachine", params);
+
+        Assert.assertFalse(result);
+    }
 }
