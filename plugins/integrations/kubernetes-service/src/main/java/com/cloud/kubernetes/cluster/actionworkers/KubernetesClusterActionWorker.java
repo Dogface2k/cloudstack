@@ -20,7 +20,6 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -45,12 +44,14 @@ import org.apache.logging.log4j.LogManager;
 import com.cloud.kubernetes.cluster.KubernetesServiceHelper.KubernetesClusterNodeType;
 import com.cloud.kubernetes.cluster.KubernetesClusterService;
 import com.cloud.network.dao.NetworkVO;
+import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.offering.ServiceOffering;
 import com.cloud.exception.ManagementServerException;
 import com.cloud.exception.NetworkRuleConflictException;
 import com.cloud.kubernetes.cluster.utils.KubernetesClusterUtil;
 import com.cloud.network.firewall.FirewallService;
 import com.cloud.network.rules.FirewallRule;
+import com.cloud.network.rules.FirewallRuleVO;
 import com.cloud.network.rules.PortForwardingRuleVO;
 import com.cloud.network.rules.RulesService;
 import com.cloud.network.rules.dao.PortForwardingRulesDao;
@@ -127,6 +128,7 @@ import com.cloud.utils.db.TransactionStatus;
 import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.fsm.NoTransitionException;
 import com.cloud.utils.fsm.StateMachine2;
+import com.cloud.utils.net.NetUtils;
 import com.cloud.utils.ssh.SshHelper;
 import com.cloud.vm.VMInstanceDetailVO;
 import com.cloud.vm.VMInstanceVO;
@@ -151,6 +153,17 @@ public class KubernetesClusterActionWorker {
     public static final int ETCD_NODE_CLIENT_REQUEST_PORT = 2379;
     public static final int ETCD_NODE_PEER_COMM_PORT = 2380;
     public static final int CLUSTER_NODES_DEFAULT_SSH_PORT_SG = DEFAULT_SSH_PORT;
+
+    /**
+     * These details contain only CloudStack resource ids created by this cluster.
+     * They are deliberately hidden from the public cluster response.  Matching a
+     * rule by ports/name is not ownership: another tenant can legitimately have
+     * the same rule shape, so cleanup and reconciliation must use this manifest.
+     */
+    protected static final String MANAGED_FIREWALL_RULE_IDS = "networkRule.firewall.ids";
+    protected static final String MANAGED_PORT_FORWARDING_RULE_IDS = "networkRule.portForwarding.ids";
+    protected static final String MANAGED_LOAD_BALANCER_RULE_IDS = "networkRule.loadBalancer.ids";
+    protected static final String MANAGED_NETWORK_ACL_ITEM_IDS = "networkRule.networkAclItem.ids";
 
     public static final String CKS_CLUSTER_SECURITY_GROUP_NAME = "CKSSecurityGroup";
     public static final String CKS_SECURITY_GROUP_DESCRIPTION = "Security group for CKS nodes";
@@ -217,6 +230,8 @@ public class KubernetesClusterActionWorker {
     @Inject
     protected FirewallService firewallService;
     @Inject
+    protected FirewallRulesDao firewallRulesDao;
+    @Inject
     private NicDao nicDao;
     @Inject
     protected AffinityGroupDao affinityGroupDao;
@@ -238,6 +253,54 @@ public class KubernetesClusterActionWorker {
     protected VirtualMachineTemplate workerNodeTemplate;
     protected VirtualMachineTemplate etcdTemplate;
     protected File sshKeyFile;
+
+    protected Set<Long> getManagedNetworkRuleIds(String detailName) {
+        KubernetesClusterDetailsVO detail = kubernetesClusterDetailsDao.findDetail(kubernetesCluster.getId(), detailName);
+        if (detail == null || StringUtils.isBlank(detail.getValue())) {
+            return new HashSet<>();
+        }
+        Set<Long> ids = new HashSet<>();
+        for (String token : detail.getValue().split(",")) {
+            String trimmed = token.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            try {
+                long id = Long.parseLong(trimmed);
+                if (id <= 0) {
+                    throw new NumberFormatException("non-positive id");
+                }
+                ids.add(id);
+            } catch (NumberFormatException e) {
+                throw new CloudRuntimeException(String.format("Invalid managed network rule manifest for Kubernetes cluster %s", kubernetesCluster.getName()), e);
+            }
+        }
+        return ids;
+    }
+
+    protected void recordManagedNetworkRuleId(String detailName, long id) {
+        if (id <= 0) {
+            throw new CloudRuntimeException(String.format("Invalid network rule id %d for Kubernetes cluster %s", id, kubernetesCluster.getName()));
+        }
+        Set<Long> ids = getManagedNetworkRuleIds(detailName);
+        if (ids.add(id)) {
+            String value = ids.stream().sorted().map(String::valueOf).collect(Collectors.joining(","));
+            kubernetesClusterDetailsDao.addDetail(kubernetesCluster.getId(), detailName, value, false);
+        }
+    }
+
+    protected void forgetManagedNetworkRuleId(String detailName, long id) {
+        Set<Long> ids = getManagedNetworkRuleIds(detailName);
+        if (!ids.remove(id)) {
+            return;
+        }
+        if (ids.isEmpty()) {
+            kubernetesClusterDetailsDao.removeDetail(kubernetesCluster.getId(), detailName);
+            return;
+        }
+        String value = ids.stream().sorted().map(String::valueOf).collect(Collectors.joining(","));
+        kubernetesClusterDetailsDao.addDetail(kubernetesCluster.getId(), detailName, value, false);
+    }
     protected String publicIpAddress;
     protected int sshPort;
 
@@ -925,6 +988,42 @@ public class KubernetesClusterActionWorker {
         final long domainId = account.getDomainId();
         Nic vmNic = networkModel.getNicInNetwork(vmId, networkId);
         final Ip vmIp = new Ip(vmNic.getIPv4Address());
+        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_PORT_FORWARDING_RULE_IDS)) {
+            PortForwardingRuleVO ownedRule = portForwardingRulesDao.findById(ruleId);
+            if (ownedRule != null && !FirewallRule.State.Revoke.equals(ownedRule.getState())
+                    && Objects.equals(ownedRule.getSourceIpAddressId(), publicIpId)
+                    && Objects.equals(ownedRule.getSourcePortStart(), sourcePort)
+                    && Objects.equals(ownedRule.getSourcePortEnd(), sourcePort)
+                    && Objects.equals(ownedRule.getDestinationPortStart(), destPort)
+                    && Objects.equals(ownedRule.getDestinationPortEnd(), destPort)
+                    && Objects.equals(ownedRule.getVirtualMachineId(), vmId)
+                    && Objects.equals(ownedRule.getNetworkId(), networkId)
+                    && NetUtils.TCP_PROTO.equalsIgnoreCase(ownedRule.getProtocol())
+                    && Objects.equals(ownedRule.getDestinationIpAddress(), vmIp)) {
+                rulesService.applyPortForwardingRules(publicIpId, account);
+                return;
+            }
+        }
+        for (PortForwardingRuleVO existingRule : portForwardingRulesDao.listByIpAndNotRevoked(publicIpId)) {
+            if (existingRule.getSourcePortStart() > sourcePort || existingRule.getSourcePortEnd() < sourcePort) {
+                continue;
+            }
+            boolean desiredRule = Objects.equals(existingRule.getSourcePortStart(), sourcePort)
+                    && Objects.equals(existingRule.getSourcePortEnd(), sourcePort)
+                    && Objects.equals(existingRule.getDestinationPortStart(), destPort)
+                    && Objects.equals(existingRule.getDestinationPortEnd(), destPort)
+                    && Objects.equals(existingRule.getVirtualMachineId(), vmId)
+                    && Objects.equals(existingRule.getNetworkId(), networkId)
+                    && Objects.equals(existingRule.getAccountId(), accountId)
+                    && NetUtils.TCP_PROTO.equalsIgnoreCase(existingRule.getProtocol())
+                    && Objects.equals(existingRule.getDestinationIpAddress(), vmIp);
+            if (desiredRule) {
+                logger.warn("Leaving unowned matching port forwarding rule {} in place for legacy Kubernetes cluster {}; explicit ownership migration is required before cleanup",
+                        existingRule.getId(), kubernetesCluster.getName());
+                return;
+            }
+            throw new NetworkRuleConflictException(String.format("Public port %d is already used by another port forwarding rule", sourcePort));
+        }
         PortForwardingRuleVO pfRule = Transaction.execute((TransactionCallbackWithException<PortForwardingRuleVO, NetworkRuleConflictException>) status -> {
             PortForwardingRuleVO newRule =
                     new PortForwardingRuleVO(null, publicIpId,
@@ -937,6 +1036,7 @@ public class KubernetesClusterActionWorker {
             newRule = portForwardingRulesDao.persist(newRule);
             return newRule;
         });
+        recordManagedNetworkRuleId(MANAGED_PORT_FORWARDING_RULE_IDS, pfRule.getId());
         rulesService.applyPortForwardingRules(publicIp.getId(), account);
         if (logger.isInfoEnabled()) {
             logger.info(String.format("Provisioned SSH port forwarding rule: %s from port %d to %d on %s to the VM IP : %s in Kubernetes cluster : %s", pfRule.getUuid(), sourcePort, destPort, publicIp.getAddress().addr(), vmIp.toString(), kubernetesCluster.getName()));
@@ -1044,13 +1144,13 @@ public class KubernetesClusterActionWorker {
                     try {
                         provisionFirewallRules(publicIp, owner, port, port);
                         vmIdPortMap.put(externalNode.getVmId(), port);
-                    } catch (NoSuchFieldException | IllegalAccessException | ResourceUnavailableException | NetworkRuleConflictException e) {
+                    } catch (ResourceUnavailableException | NetworkRuleConflictException e) {
                         throw new CloudRuntimeException(String.format("Failed to provision firewall rules for SSH access for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
                     }
                     additionalNodes.addAndGet(1);
                 });
             }
-        } catch (NoSuchFieldException | IllegalAccessException | ResourceUnavailableException | NetworkRuleConflictException e) {
+        } catch (ResourceUnavailableException | NetworkRuleConflictException e) {
             throw new ManagementServerException(String.format("Failed to provision firewall rules for SSH access for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
         } finally {
             CallContext.unregister();
@@ -1058,35 +1158,41 @@ public class KubernetesClusterActionWorker {
         return vmIdPortMap;
     }
 
-    protected void provisionFirewallRules(final IpAddress publicIp, final Account account, int startPort, int endPort) throws NoSuchFieldException,
-            IllegalAccessException, ResourceUnavailableException, NetworkRuleConflictException {
-        List<String> sourceCidrList = new ArrayList<String>();
-        sourceCidrList.add("0.0.0.0/0");
+    protected void provisionFirewallRules(final IpAddress publicIp, final Account account, int startPort, int endPort)
+            throws ResourceUnavailableException, NetworkRuleConflictException {
+        List<FirewallRuleVO> existingRules = firewallRulesDao.listByIpPurposePortsProtocolAndNotRevoked(publicIp.getId(), startPort, endPort,
+                NetUtils.TCP_PROTO, FirewallRule.Purpose.Firewall);
+        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_FIREWALL_RULE_IDS)) {
+            FirewallRuleVO ownedRule = firewallRulesDao.findById(ruleId);
+            if (ownedRule != null && !FirewallRule.State.Revoke.equals(ownedRule.getState())
+                    && Objects.equals(ownedRule.getSourceIpAddressId(), publicIp.getId())
+                    && Objects.equals(ownedRule.getSourcePortStart(), startPort)
+                    && Objects.equals(ownedRule.getSourcePortEnd(), endPort)
+                    && FirewallRule.Purpose.Firewall.equals(ownedRule.getPurpose())
+                    && NetUtils.TCP_PROTO.equalsIgnoreCase(ownedRule.getProtocol())) {
+                firewallService.applyIngressFwRules(publicIp.getId(), account);
+                return;
+            }
+        }
+        for (FirewallRuleVO existingRule : existingRules) {
+            firewallRulesDao.loadSourceCidrs(existingRule);
+            if (existingRule.getSourceCidrList() != null && existingRule.getSourceCidrList().contains(NetUtils.ALL_IP4_CIDRS)) {
+                logger.warn("Leaving unowned matching firewall rule {} in place for legacy Kubernetes cluster {}; explicit ownership migration is required before cleanup",
+                        existingRule.getId(), kubernetesCluster.getName());
+                return;
+            }
+        }
 
-        CreateFirewallRuleCmd rule = new CreateFirewallRuleCmd();
-        rule = ComponentContext.inject(rule);
+        CreateFirewallRuleCmd firewallRule = new CreateFirewallRuleCmd();
+        firewallRule = ComponentContext.inject(firewallRule);
+        firewallRule.setIpAddressId(publicIp.getId());
+        firewallRule.setProtocol(NetUtils.TCP_PROTO);
+        firewallRule.setPublicStartPort(startPort);
+        firewallRule.setPublicEndPort(endPort);
+        firewallRule.setSourceCidrList(List.of(NetUtils.ALL_IP4_CIDRS));
 
-        Field addressField = rule.getClass().getDeclaredField("ipAddressId");
-        addressField.setAccessible(true);
-        addressField.set(rule, publicIp.getId());
-
-        Field protocolField = rule.getClass().getDeclaredField("protocol");
-        protocolField.setAccessible(true);
-        protocolField.set(rule, "TCP");
-
-        Field startPortField = rule.getClass().getDeclaredField("publicStartPort");
-        startPortField.setAccessible(true);
-        startPortField.set(rule, startPort);
-
-        Field endPortField = rule.getClass().getDeclaredField("publicEndPort");
-        endPortField.setAccessible(true);
-        endPortField.set(rule, endPort);
-
-        Field cidrField = rule.getClass().getDeclaredField("cidrlist");
-        cidrField.setAccessible(true);
-        cidrField.set(rule, sourceCidrList);
-
-        firewallService.createIngressFirewallRule(rule);
+        FirewallRule createdRule = firewallService.createIngressFirewallRule(firewallRule);
+        recordManagedNetworkRuleId(MANAGED_FIREWALL_RULE_IDS, createdRule.getId());
         firewallService.applyIngressFwRules(publicIp.getId(), account);
     }
 

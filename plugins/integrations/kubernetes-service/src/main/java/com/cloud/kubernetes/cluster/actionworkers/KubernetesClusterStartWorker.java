@@ -654,11 +654,11 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
                             logger.info(String.format("Provisioned ACL rule to open up port %d on %s for etcd nodes for Kubernetes cluster %s",
                                     ETCD_NODE_CLIENT_REQUEST_PORT, publicIpAddress, kubernetesCluster.getName()));
                         }
-                    } catch (NoSuchFieldException | IllegalAccessException | ResourceUnavailableException | InvalidParameterValueException | PermissionDeniedException e) {
+                    } catch (ResourceUnavailableException | InvalidParameterValueException | PermissionDeniedException e) {
                         throw new ManagementServerException(String.format("Failed to provision ACL rules for etcd client access for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
                     }
                 }
-            } catch (NoSuchFieldException | IllegalAccessException | ResourceUnavailableException |
+            } catch (ResourceUnavailableException |
                      NetworkRuleConflictException e) {
                 throw new ManagementServerException(String.format("Failed to provision firewall rules for etcd nodes for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
             }

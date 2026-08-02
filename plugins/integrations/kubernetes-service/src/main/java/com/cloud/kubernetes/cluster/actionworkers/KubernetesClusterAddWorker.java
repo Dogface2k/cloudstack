@@ -31,7 +31,7 @@ import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.utils.KubernetesClusterUtil;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
-import com.cloud.network.dao.FirewallRulesDao;
+import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.FirewallRuleVO;
 import com.cloud.network.rules.PortForwardingRuleVO;
 import com.cloud.service.ServiceOfferingVO;
@@ -40,6 +40,7 @@ import com.cloud.uservm.UserVm;
 import com.cloud.utils.Pair;
 import com.cloud.utils.Ternary;
 import com.cloud.utils.exception.CloudRuntimeException;
+import com.cloud.utils.net.NetUtils;
 import com.cloud.utils.ssh.SshHelper;
 import com.cloud.vm.UserVmVO;
 import org.apache.cloudstack.api.ApiCommandResourceType;
@@ -49,7 +50,6 @@ import org.apache.cloudstack.context.CallContext;
 import org.apache.commons.codec.binary.Base64;
 import org.apache.logging.log4j.Level;
 
-import javax.inject.Inject;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -60,8 +60,6 @@ import java.util.stream.Collectors;
 
 public class KubernetesClusterAddWorker extends KubernetesClusterActionWorker {
 
-    @Inject
-    private FirewallRulesDao firewallRulesDao;
     private long addNodeTimeoutTime;
 
     List<Long> finalNodeIds = new ArrayList<>();
@@ -312,15 +310,49 @@ public class KubernetesClusterAddWorker extends KubernetesClusterActionWorker {
 
     private void revertNetworkRules(Network network, long vmId, int port) {
         logger.debug(String.format("Reverting network rules for VM ID %s on network %s", vmId, network.getName()));
-        FirewallRuleVO ruleVO = firewallRulesDao.findByNetworkIdAndPorts(network.getId(), port, port);
-        if (Objects.isNull(network.getVpcId())) {
-            logger.debug(String.format("Removing firewall rule %s", ruleVO.getId()));
-            firewallService.revokeIngressFirewallRule(ruleVO.getId(), true);
+        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_PORT_FORWARDING_RULE_IDS)) {
+            PortForwardingRuleVO pfRule = portForwardingRulesDao.findById(ruleId);
+            if (pfRule == null || FirewallRule.State.Revoke.equals(pfRule.getState())
+                    || !Objects.equals(pfRule.getVirtualMachineId(), vmId)
+                    || !Objects.equals(pfRule.getNetworkId(), network.getId())
+                    || !Objects.equals(pfRule.getSourcePortStart(), port)
+                    || !Objects.equals(pfRule.getSourcePortEnd(), port)) {
+                continue;
+            }
+            logger.debug("Removing managed port forwarding rule {}", pfRule.getId());
+            if (rulesService.revokePortForwardingRule(pfRule.getId(), true)) {
+                forgetManagedNetworkRuleId(MANAGED_PORT_FORWARDING_RULE_IDS, pfRule.getId());
+            }
         }
-        List<PortForwardingRuleVO> pfRules = portForwardingRulesDao.listByVm(vmId);
-        for (PortForwardingRuleVO pfRule : pfRules) {
-            logger.debug(String.format("Removing port forwarding rule %s", pfRule.getId()));
-            rulesService.revokePortForwardingRule(pfRule.getId(), true);
+        if (Objects.isNull(network.getVpcId())) {
+            IpAddress publicIp;
+            try {
+                publicIp = getPublicIp(network);
+            } catch (ManagementServerException e) {
+                logger.warn("Cannot identify the public IP while reverting network rules for Kubernetes cluster {}", kubernetesCluster.getName(), e);
+                return;
+            }
+            for (Long ruleId : getManagedNetworkRuleIds(MANAGED_FIREWALL_RULE_IDS)) {
+                FirewallRuleVO ruleVO = firewallRulesDao.findById(ruleId);
+                if (ruleVO == null || FirewallRule.State.Revoke.equals(ruleVO.getState())
+                        || !Objects.equals(ruleVO.getSourceIpAddressId(), publicIp.getId())
+                        || !Objects.equals(ruleVO.getSourcePortStart(), port)
+                        || !Objects.equals(ruleVO.getSourcePortEnd(), port)
+                        || !NetUtils.TCP_PROTO.equalsIgnoreCase(ruleVO.getProtocol())
+                        || !FirewallRule.Purpose.Firewall.equals(ruleVO.getPurpose())) {
+                    continue;
+                }
+                boolean portForwardingStillUsesPort = portForwardingRulesDao.listByIpAndNotRevoked(publicIp.getId()).stream()
+                        .anyMatch(pfRule -> Objects.equals(pfRule.getNetworkId(), network.getId())
+                                && pfRule.getSourcePortStart() <= port && pfRule.getSourcePortEnd() >= port);
+                if (portForwardingStillUsesPort) {
+                    continue;
+                }
+                logger.debug("Removing managed firewall rule {}", ruleVO.getId());
+                if (firewallService.revokeIngressFirewallRule(ruleVO.getId(), true)) {
+                    forgetManagedNetworkRuleId(MANAGED_FIREWALL_RULE_IDS, ruleVO.getId());
+                }
+            }
         }
     }
 }
