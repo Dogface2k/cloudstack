@@ -80,5 +80,12 @@ example.ver.1 > example.ver.2:
     their generated firewall, port-forwarding, load-balancing, and VPC ACL
     rules. A reconcile API restores missing or drifted managed rules without
     adopting unrelated customer policy. Existing clusters remain
-    legacy-unmanaged until a root administrator validates and adopts an exact
-    rule topology through the dedicated adoption API.
+    legacy-unmanaged; a root administrator must validate and adopt their exact
+    rule topology before non-direct clusters can use managed start, topology,
+    or reconciliation workflows.
+
+  * NSX zones can register operator-staged Tier-0 or VRF gateways and assign
+    them to accounts or domains through dedicated administrative APIs. The
+    feature is disabled by default (`nsx.vrf.scope=NONE`). CloudStack claims
+    and releases registered gateway records but does not create or delete the
+    physical NSX gateways, uplinks, or BGP configuration.
