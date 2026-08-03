@@ -17,9 +17,14 @@
 package com.cloud.kubernetes.cluster.actionworkers;
 
 import com.cloud.kubernetes.cluster.KubernetesCluster;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleRole;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleOwnershipState;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterVO;
+import com.cloud.kubernetes.cluster.dao.KubernetesClusterDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterVmMapDao;
+import com.cloud.network.Network;
 import com.cloud.offering.ServiceOffering;
 import com.cloud.service.ServiceOfferingVO;
 import com.cloud.service.dao.ServiceOfferingDao;
@@ -37,6 +42,7 @@ import org.mockito.junit.MockitoJUnitRunner;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 
 import static com.cloud.kubernetes.cluster.KubernetesServiceHelper.KubernetesClusterNodeType.CONTROL;
 import static com.cloud.kubernetes.cluster.KubernetesServiceHelper.KubernetesClusterNodeType.DEFAULT;
@@ -53,6 +59,8 @@ public class KubernetesClusterScaleWorkerTest {
     @Mock
     private KubernetesClusterVmMapDao kubernetesClusterVmMapDao;
     @Mock
+    private KubernetesClusterDao kubernetesClusterDao;
+    @Mock
     private UserVmDao userVmDao;
 
     private KubernetesClusterScaleWorker worker;
@@ -61,6 +69,7 @@ public class KubernetesClusterScaleWorkerTest {
 
     @Before
     public void setUp() {
+        clusterManager.kubernetesClusterDao = kubernetesClusterDao;
         worker = new KubernetesClusterScaleWorker(kubernetesCluster, clusterManager);
         worker.serviceOfferingDao = serviceOfferingDao;
         worker.kubernetesClusterVmMapDao = kubernetesClusterVmMapDao;
@@ -186,5 +195,61 @@ public class KubernetesClusterScaleWorkerTest {
         List<KubernetesClusterVmMapVO> toRemove = spyWorker.getWorkerNodesToRemove();
 
         Assert.assertTrue(toRemove.isEmpty());
+    }
+
+    @Test
+    public void testScaleCleanupUsesCurrentOwnershipRoles() throws Exception {
+        KubernetesClusterScaleWorker spyWorker = Mockito.spy(worker);
+        Network network = Mockito.mock(Network.class);
+        KubernetesClusterVmMapVO controlNode = Mockito.mock(KubernetesClusterVmMapVO.class);
+        Mockito.when(controlNode.isControlNode()).thenReturn(true);
+        Mockito.when(controlNode.getVmId()).thenReturn(11L);
+        Mockito.when(clusterManager.isDirectAccess(network)).thenReturn(false);
+        Mockito.when(network.getVpcId()).thenReturn(null);
+        Mockito.doReturn(List.of(controlNode)).when(spyWorker).getKubernetesClusterVMMaps();
+        Mockito.doNothing().when(spyWorker).deleteManagedNetworkRulesNotIn(Mockito.anySet(), Mockito.eq(network));
+
+        spyWorker.deleteStaleManagedNetworkRulesForScale(network);
+
+        Set<String> expectedRoles = Set.of(
+                KubernetesClusterNetworkRuleRole.API_FIREWALL.name(),
+                KubernetesClusterNetworkRuleRole.SSH_FIREWALL.name(),
+                KubernetesClusterNetworkRuleRole.API_LOAD_BALANCER.name(),
+                KubernetesClusterNetworkRuleRole.SSH_PORT_FORWARD.toLogicalRole(11L));
+        Mockito.verify(spyWorker).deleteManagedNetworkRulesNotIn(expectedRoles, network);
+    }
+
+    @Test
+    public void testScaleCleanupRemovesManagedMappingsFromDirectNetwork() throws Exception {
+        KubernetesClusterScaleWorker spyWorker = Mockito.spy(worker);
+        Network network = Mockito.mock(Network.class);
+        KubernetesClusterVO persistedCluster = Mockito.mock(KubernetesClusterVO.class);
+        Mockito.when(kubernetesCluster.getId()).thenReturn(10L);
+        Mockito.when(clusterManager.isDirectAccess(network)).thenReturn(true);
+        Mockito.when(kubernetesClusterDao.findById(10L)).thenReturn(persistedCluster);
+        Mockito.when(persistedCluster.getNetworkRuleOwnershipState())
+                .thenReturn(KubernetesClusterNetworkRuleOwnershipState.MANAGED);
+        Mockito.doReturn(List.of()).when(spyWorker).getKubernetesClusterVMMaps();
+        Mockito.doNothing().when(spyWorker).deleteManagedNetworkRulesNotIn(Mockito.anySet(), Mockito.eq(network));
+
+        spyWorker.deleteStaleManagedNetworkRulesForScale(network);
+
+        Mockito.verify(spyWorker).deleteManagedNetworkRulesNotIn(Set.of(), network);
+    }
+
+    @Test
+    public void testScaleCleanupLeavesLegacyDirectNetworkUnownedRulesUntouched() throws Exception {
+        KubernetesClusterScaleWorker spyWorker = Mockito.spy(worker);
+        Network network = Mockito.mock(Network.class);
+        KubernetesClusterVO persistedCluster = Mockito.mock(KubernetesClusterVO.class);
+        Mockito.when(kubernetesCluster.getId()).thenReturn(10L);
+        Mockito.when(clusterManager.isDirectAccess(network)).thenReturn(true);
+        Mockito.when(kubernetesClusterDao.findById(10L)).thenReturn(persistedCluster);
+        Mockito.when(persistedCluster.getNetworkRuleOwnershipState())
+                .thenReturn(KubernetesClusterNetworkRuleOwnershipState.LEGACY_UNMANAGED);
+
+        spyWorker.deleteStaleManagedNetworkRulesForScale(network);
+
+        Mockito.verify(spyWorker, Mockito.never()).deleteManagedNetworkRulesNotIn(Mockito.anySet(), Mockito.any());
     }
 }

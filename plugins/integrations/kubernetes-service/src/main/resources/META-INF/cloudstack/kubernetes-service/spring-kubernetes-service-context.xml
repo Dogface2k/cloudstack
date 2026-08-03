@@ -32,6 +32,8 @@
     <bean id="kubernetesClusterDaoImpl" class="com.cloud.kubernetes.cluster.dao.KubernetesClusterDaoImpl" />
     <bean id="kubernetesClusterDetailsDaoImpl" class="com.cloud.kubernetes.cluster.dao.KubernetesClusterDetailsDaoImpl" />
     <bean id="kubernetesClusterVmMapDaoImpl" class="com.cloud.kubernetes.cluster.dao.KubernetesClusterVmMapDaoImpl" />
+    <bean id="kubernetesClusterFirewallRuleMapDaoImpl" class="com.cloud.kubernetes.cluster.dao.KubernetesClusterFirewallRuleMapDaoImpl" />
+    <bean id="kubernetesClusterNetworkACLItemMapDaoImpl" class="com.cloud.kubernetes.cluster.dao.KubernetesClusterNetworkACLItemMapDaoImpl" />
     <bean id="kubernetesClusterAffinityGroupMapDaoImpl" class="com.cloud.kubernetes.cluster.dao.KubernetesClusterAffinityGroupMapDaoImpl" />
     <bean id="kubernetesClusterManagerImpl" class="com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl" />
 

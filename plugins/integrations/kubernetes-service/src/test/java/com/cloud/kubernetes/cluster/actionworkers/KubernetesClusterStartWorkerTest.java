@@ -18,6 +18,7 @@
 package com.cloud.kubernetes.cluster.actionworkers;
 
 import java.util.List;
+import java.util.Set;
 
 import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
@@ -29,11 +30,12 @@ import com.cloud.kubernetes.version.dao.KubernetesSupportedVersionDao;
 import com.cloud.network.IpAddress;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
+import com.cloud.offerings.NetworkOfferingVO;
+import com.cloud.offerings.dao.NetworkOfferingDao;
 import com.cloud.user.AccountVO;
 import com.cloud.user.dao.AccountDao;
 import com.cloud.uservm.UserVm;
 import com.cloud.vm.UserVmVO;
-import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.net.Ip;
 import com.cloud.vm.dao.UserVmDao;
 
@@ -67,6 +69,8 @@ public class KubernetesClusterStartWorkerTest {
     private NetworkDao networkDao;
     @Mock
     private UserVmDao userVmDao;
+    @Mock
+    private NetworkOfferingDao networkOfferingDao;
 
     private KubernetesClusterStartWorker worker;
 
@@ -80,35 +84,54 @@ public class KubernetesClusterStartWorkerTest {
         worker.accountDao = accountDao;
         worker.networkDao = networkDao;
         worker.userVmDao = userVmDao;
+        worker.networkOfferingDao = networkOfferingDao;
         Mockito.when(cluster.getAccountId()).thenReturn(2L);
         Mockito.when(cluster.getNetworkId()).thenReturn(3L);
-        Mockito.when(cluster.getName()).thenReturn("test-cluster");
     }
 
     @Test
-    public void reconcileDirectAccessNetworkIsANoOp() {
+    public void reconcileDirectAccessNetworkIsANoOp() throws Exception {
         AccountVO owner = Mockito.mock(AccountVO.class);
         NetworkVO network = Mockito.mock(NetworkVO.class);
         Mockito.when(accountDao.findById(2L)).thenReturn(owner);
         Mockito.when(networkDao.findById(3L)).thenReturn(network);
         Mockito.when(manager.isDirectAccess(network)).thenReturn(true);
+        Mockito.doNothing().when(worker).deleteManagedNetworkRulesNotIn(Mockito.anySet(), Mockito.eq(network));
 
         Assert.assertTrue(worker.reconcileKubernetesClusterNetworkRules());
 
         Mockito.verify(worker, Mockito.never()).getKubernetesClusterVMMaps();
+        Mockito.verify(worker).deleteManagedNetworkRulesNotIn(Mockito.eq(java.util.Collections.emptySet()), Mockito.eq(network));
     }
 
-    @Test(expected = CloudRuntimeException.class)
-    public void reconcileVpcTierWithoutAclFailsClearly() {
+    @Test
+    public void reconcileVpcTierDelegatesToVpcRuleProvisioning() throws Exception {
         AccountVO owner = Mockito.mock(AccountVO.class);
         NetworkVO network = Mockito.mock(NetworkVO.class);
+        IpAddress publicIp = Mockito.mock(IpAddress.class);
+        UserVmVO controlVm = Mockito.mock(UserVmVO.class);
+        KubernetesClusterVmMapVO controlMap = new KubernetesClusterVmMapVO(1L, 12L, true);
         Mockito.when(accountDao.findById(2L)).thenReturn(owner);
         Mockito.when(networkDao.findById(3L)).thenReturn(network);
         Mockito.when(manager.isDirectAccess(network)).thenReturn(false);
         Mockito.when(network.getVpcId()).thenReturn(4L);
-        Mockito.when(network.getNetworkACLId()).thenReturn(null);
+        Mockito.when(network.getNetworkACLId()).thenReturn(com.cloud.network.vpc.NetworkACL.DEFAULT_ALLOW);
+        Mockito.when(network.getNetworkOfferingId()).thenReturn(5L);
+        NetworkOfferingVO offering = Mockito.mock(NetworkOfferingVO.class);
+        Mockito.when(networkOfferingDao.findById(5L)).thenReturn(offering);
+        Mockito.doReturn(List.of(controlMap)).when(worker).getKubernetesClusterVMMaps();
+        Mockito.when(userVmDao.findById(12L)).thenReturn(controlVm);
+        Mockito.when(controlVm.getId()).thenReturn(12L);
+        Mockito.doReturn(publicIp).when(worker).getPublicIp(network);
+        Mockito.when(publicIp.getAddress()).thenReturn(new Ip("203.0.113.10"));
+        Mockito.doNothing().when(worker).setupKubernetesClusterVpcTierRules(publicIp, network, List.of(12L));
+        Mockito.doNothing().when(worker).deleteManagedNetworkRulesNotIn(Mockito.anySet(), Mockito.eq(network));
 
-        worker.reconcileKubernetesClusterNetworkRules();
+        Assert.assertTrue(worker.reconcileKubernetesClusterNetworkRules());
+
+        org.mockito.InOrder ordering = Mockito.inOrder(worker);
+        ordering.verify(worker).deleteManagedNetworkRulesNotIn(Mockito.anySet(), Mockito.eq(network));
+        ordering.verify(worker).setupKubernetesClusterVpcTierRules(publicIp, network, List.of(12L));
     }
 
     @SuppressWarnings("unchecked")
@@ -127,6 +150,7 @@ public class KubernetesClusterStartWorkerTest {
         Mockito.when(accountDao.findById(2L)).thenReturn(owner);
         Mockito.when(networkDao.findById(3L)).thenReturn(network);
         Mockito.when(manager.isDirectAccess(network)).thenReturn(false);
+        Mockito.when(network.getVpcId()).thenReturn(null);
         Mockito.doReturn(List.of(workerMap, etcdMap, controlMap)).when(worker).getKubernetesClusterVMMaps();
         Mockito.when(userVmDao.findById(10L)).thenReturn(workerVm);
         Mockito.when(userVmDao.findById(11L)).thenReturn(etcdVm);
@@ -135,6 +159,7 @@ public class KubernetesClusterStartWorkerTest {
         Mockito.when(publicIp.getAddress()).thenReturn(new Ip("203.0.113.10"));
         Mockito.doNothing().when(worker).setupKubernetesClusterNetworkRules(Mockito.eq(network), Mockito.anyList(), Mockito.eq(publicIp));
         Mockito.doNothing().when(worker).setupKubernetesEtcdNetworkRules(Mockito.anyList(), Mockito.eq(network), Mockito.eq(publicIp));
+        Mockito.doNothing().when(worker).deleteManagedNetworkRulesNotIn(Mockito.anySet(), Mockito.eq(network));
 
         Assert.assertTrue(worker.reconcileKubernetesClusterNetworkRules());
 
@@ -144,5 +169,9 @@ public class KubernetesClusterStartWorkerTest {
         Mockito.verify(worker).setupKubernetesEtcdNetworkRules(etcdVms.capture(), Mockito.eq(network), Mockito.eq(publicIp));
         Assert.assertEquals(List.of(controlVm, workerVm), clusterVms.getValue());
         Assert.assertEquals(List.of(etcdVm), etcdVms.getValue());
+        ArgumentCaptor<Set<String>> desiredRoles = ArgumentCaptor.forClass(Set.class);
+        Mockito.verify(worker).deleteManagedNetworkRulesNotIn(desiredRoles.capture(), Mockito.eq(network));
+        Assert.assertEquals(Set.of("API_FIREWALL", "SSH_FIREWALL", "ETCD_SSH_FIREWALL:11", "API_LOAD_BALANCER",
+                "SSH_PORT_FORWARD:10", "SSH_PORT_FORWARD:11", "SSH_PORT_FORWARD:12"), desiredRoles.getValue());
     }
 }

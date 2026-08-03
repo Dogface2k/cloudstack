@@ -29,6 +29,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import com.cloud.exception.InvalidParameterValueException;
@@ -60,6 +61,7 @@ import com.cloud.hypervisor.Hypervisor;
 import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleAdoptionSpec;
 import com.cloud.kubernetes.cluster.KubernetesClusterService;
 import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
@@ -644,12 +646,14 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
             int etcdStartPort = startPort + i;
             try {
                 if (Objects.isNull(network.getVpcId())) {
-                    provisionFirewallRules(publicIp, owner, etcdStartPort, etcdStartPort);
+                    provisionFirewallRules(publicIp, owner, etcdStartPort, etcdStartPort,
+                            ETCD_SSH_FIREWALL_ROLE_PREFIX + etcdVmIds.get(i));
                 } else if (network.getNetworkACLId() == null) {
                     throw new ManagementServerException(String.format("Failed to provision ACL rules for etcd access for the Kubernetes cluster : %s as VPC tier %s does not have a network ACL attached", kubernetesCluster.getName(), network.getName()));
-                } else if (network.getNetworkACLId() != NetworkACL.DEFAULT_ALLOW) {
+                } else if (!Objects.equals(network.getNetworkACLId(), NetworkACL.DEFAULT_ALLOW)) {
                     try {
-                        provisionVpcTierAllowPortACLRule(network, ETCD_NODE_CLIENT_REQUEST_PORT, ETCD_NODE_CLIENT_REQUEST_PORT);
+                        provisionVpcTierAllowPortACLRule(network, ETCD_NODE_CLIENT_REQUEST_PORT,
+                                ETCD_NODE_CLIENT_REQUEST_PORT, ETCD_CLIENT_ACL_ROLE);
                         if (logger.isInfoEnabled()) {
                             logger.info(String.format("Provisioned ACL rule to open up port %d on %s for etcd nodes for Kubernetes cluster %s",
                                     ETCD_NODE_CLIENT_REQUEST_PORT, publicIpAddress, kubernetesCluster.getName()));
@@ -676,13 +680,19 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
             throw new CloudRuntimeException(String.format("Network for Kubernetes cluster %s cannot be found", kubernetesCluster.getName()));
         }
         if (manager.isDirectAccess(network)) {
+            try {
+                deleteManagedNetworkRulesNotIn(Collections.emptySet(), network);
+            } catch (ManagementServerException e) {
+                throw new CloudRuntimeException(String.format(
+                        "Failed to remove stale managed network rules for direct-access Kubernetes cluster %s",
+                        kubernetesCluster.getName()), e);
+            }
             logger.debug("Network {} for Kubernetes cluster {} uses direct access and has no CloudStack-managed public network rules to reconcile", network, kubernetesCluster);
             return true;
         }
         if (network.getVpcId() != null && network.getNetworkACLId() == null) {
             throw new CloudRuntimeException(String.format("VPC tier %s for Kubernetes cluster %s has no network ACL", network.getName(), kubernetesCluster.getName()));
         }
-
         List<KubernetesClusterVmMapVO> vmMaps = getKubernetesClusterVMMaps();
         if (CollectionUtils.isEmpty(vmMaps)) {
             throw new CloudRuntimeException(String.format("Kubernetes cluster %s has no mapped virtual machines", kubernetesCluster.getName()));
@@ -710,6 +720,9 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         clusterVms.addAll(workerVms);
 
         try {
+            Set<String> desiredRoles = new KubernetesClusterNetworkRuleOwnershipValidator(this)
+                    .getExpectedLogicalRoles(network, vmMaps);
+            deleteManagedNetworkRulesNotIn(desiredRoles, network);
             IpAddress publicIp = getPublicIp(network);
             publicIpAddress = publicIp.getAddress().addr();
             setupKubernetesClusterNetworkRules(network, clusterVms, publicIp);
@@ -721,6 +734,10 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         } catch (ManagementServerException | ResourceUnavailableException e) {
             throw new CloudRuntimeException(String.format("Failed to reconcile network rules for Kubernetes cluster %s", kubernetesCluster.getName()), e);
         }
+    }
+
+    public boolean adoptKubernetesClusterNetworkRules(List<KubernetesClusterNetworkRuleAdoptionSpec> specs) {
+        return new KubernetesClusterNetworkRuleOwnershipValidator(this).adopt(specs);
     }
 
     private void startKubernetesClusterVMs(Long domainId, Long accountId) {

@@ -32,6 +32,8 @@ import com.cloud.kubernetes.cluster.dao.KubernetesClusterDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterVmMapDao;
 import com.cloud.kubernetes.version.KubernetesSupportedVersion;
 import com.cloud.network.Network;
+import com.cloud.network.dao.NetworkDao;
+import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.FirewallRuleVO;
@@ -53,6 +55,7 @@ import com.cloud.host.dao.HostDao;
 import org.apache.cloudstack.affinity.AffinityGroupVO;
 import org.apache.cloudstack.affinity.dao.AffinityGroupDao;
 import org.apache.cloudstack.api.BaseCmd;
+import org.apache.cloudstack.api.command.admin.kubernetes.cluster.AdoptKubernetesClusterNetworkRulesCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.AddVirtualMachinesToKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.RemoveVirtualMachinesFromKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.ReconcileKubernetesClusterNetworkRulesCmd;
@@ -103,6 +106,9 @@ public class KubernetesClusterManagerImplTest {
     KubernetesClusterVmMapDao kubernetesClusterVmMapDao;
 
     @Mock
+    NetworkDao networkDao;
+
+    @Mock
     VMInstanceDao vmInstanceDao;
 
     @Mock
@@ -123,6 +129,68 @@ public class KubernetesClusterManagerImplTest {
     @Spy
     @InjectMocks
     KubernetesClusterManagerImpl kubernetesClusterManager;
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void topologyMutationRejectsLegacyUnmanagedIsolatedCluster() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        NetworkVO network = Mockito.mock(NetworkVO.class);
+        Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(cluster.getNetworkId()).thenReturn(2L);
+        Mockito.when(cluster.getNetworkRuleOwnershipState()).thenReturn(KubernetesClusterNetworkRuleOwnershipState.LEGACY_UNMANAGED);
+        Mockito.when(networkDao.findById(2L)).thenReturn(network);
+        Mockito.doReturn(false).when(kubernetesClusterManager).isDirectAccess(network);
+
+        kubernetesClusterManager.validateNetworkRuleOwnershipForTopologyMutation(cluster);
+    }
+
+    @Test
+    public void topologyMutationAllowsManagedIsolatedCluster() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        NetworkVO network = Mockito.mock(NetworkVO.class);
+        Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(cluster.getNetworkId()).thenReturn(2L);
+        Mockito.when(cluster.getNetworkRuleOwnershipState()).thenReturn(KubernetesClusterNetworkRuleOwnershipState.MANAGED);
+        Mockito.when(networkDao.findById(2L)).thenReturn(network);
+        Mockito.doReturn(false).when(kubernetesClusterManager).isDirectAccess(network);
+
+        kubernetesClusterManager.validateNetworkRuleOwnershipForTopologyMutation(cluster);
+    }
+
+    @Test
+    public void topologyMutationAllowsLegacyDirectAccessCluster() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        NetworkVO network = Mockito.mock(NetworkVO.class);
+        Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(cluster.getNetworkId()).thenReturn(2L);
+        Mockito.when(networkDao.findById(2L)).thenReturn(network);
+        Mockito.doReturn(true).when(kubernetesClusterManager).isDirectAccess(network);
+
+        kubernetesClusterManager.validateNetworkRuleOwnershipForTopologyMutation(cluster);
+
+        Mockito.verify(cluster, Mockito.never()).getNetworkRuleOwnershipState();
+    }
+
+    @Test
+    public void newCloudManagedClusterStartsWithManagedNetworkRuleOwnership() {
+        KubernetesClusterVO cluster = createClusterVo(KubernetesCluster.ClusterType.CloudManaged);
+
+        Assert.assertEquals(KubernetesClusterNetworkRuleOwnershipState.MANAGED,
+                cluster.getNetworkRuleOwnershipState());
+    }
+
+    @Test
+    public void newExternalManagedClusterDoesNotClaimNetworkRuleOwnership() {
+        KubernetesClusterVO cluster = createClusterVo(KubernetesCluster.ClusterType.ExternalManaged);
+
+        Assert.assertEquals(KubernetesClusterNetworkRuleOwnershipState.LEGACY_UNMANAGED,
+                cluster.getNetworkRuleOwnershipState());
+    }
+
+    private KubernetesClusterVO createClusterVo(KubernetesCluster.ClusterType clusterType) {
+        return new KubernetesClusterVO("cluster", "cluster", 1L, 1L, 1L, 1L, 1L,
+                1L, 1L, 1L, 1L, KubernetesCluster.State.Created, null, 1L, 1L,
+                8L, "", clusterType);
+    }
 
     @Test(expected = InvalidParameterValueException.class)
     public void testValidateVpcTierNoAclAttached() {
@@ -372,6 +440,20 @@ public class KubernetesClusterManagerImplTest {
         kubernetesClusterManager.reconcileKubernetesClusterNetworkRules(cmd);
     }
 
+    @Test(expected = InvalidParameterValueException.class)
+    public void reconcileNetworkRulesRejectsLegacyUnmanagedCluster() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        ReconcileKubernetesClusterNetworkRulesCmd cmd = Mockito.mock(ReconcileKubernetesClusterNetworkRulesCmd.class);
+        Mockito.when(cmd.getId()).thenReturn(1L);
+        Mockito.when(cmd.getActualCommandName()).thenReturn(BaseCmd.getCommandNameByClass(ReconcileKubernetesClusterNetworkRulesCmd.class));
+        Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(cluster);
+        Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(cluster.getState()).thenReturn(KubernetesCluster.State.Running);
+        Mockito.when(cluster.getNetworkRuleOwnershipState()).thenReturn(KubernetesClusterNetworkRuleOwnershipState.LEGACY_UNMANAGED);
+
+        kubernetesClusterManager.reconcileKubernetesClusterNetworkRules(cmd);
+    }
+
     @Test
     public void reconcileNetworkRulesRunsForAccessibleRunningCloudManagedCluster() {
         KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
@@ -382,6 +464,7 @@ public class KubernetesClusterManagerImplTest {
         Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(cluster);
         Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
         Mockito.when(cluster.getState()).thenReturn(KubernetesCluster.State.Running);
+        Mockito.when(cluster.getNetworkRuleOwnershipState()).thenReturn(KubernetesClusterNetworkRuleOwnershipState.MANAGED);
         Mockito.doReturn(worker).when(kubernetesClusterManager).createKubernetesClusterStartWorker(cluster);
         Mockito.when(worker.reconcileKubernetesClusterNetworkRules()).thenReturn(true);
 
@@ -389,6 +472,69 @@ public class KubernetesClusterManagerImplTest {
 
         Mockito.verify(accountManager).checkAccess(Mockito.any(Account.class), Mockito.any(), Mockito.eq(false), Mockito.eq(cluster));
         Mockito.verify(worker).reconcileKubernetesClusterNetworkRules();
+    }
+
+    @Test(expected = PermissionDeniedException.class)
+    public void adoptNetworkRulesRejectsNonRootCaller() {
+        AdoptKubernetesClusterNetworkRulesCmd cmd = Mockito.mock(AdoptKubernetesClusterNetworkRulesCmd.class);
+        Mockito.when(accountManager.isRootAdmin(Mockito.anyLong())).thenReturn(false);
+
+        kubernetesClusterManager.adoptKubernetesClusterNetworkRules(cmd);
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void adoptNetworkRulesRejectsMissingCluster() {
+        AdoptKubernetesClusterNetworkRulesCmd cmd = Mockito.mock(AdoptKubernetesClusterNetworkRulesCmd.class);
+        Mockito.when(accountManager.isRootAdmin(Mockito.anyLong())).thenReturn(true);
+        Mockito.when(cmd.getId()).thenReturn(1L);
+        Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(null);
+
+        kubernetesClusterManager.adoptKubernetesClusterNetworkRules(cmd);
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void adoptNetworkRulesRejectsExternallyManagedCluster() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        AdoptKubernetesClusterNetworkRulesCmd cmd = Mockito.mock(AdoptKubernetesClusterNetworkRulesCmd.class);
+        Mockito.when(accountManager.isRootAdmin(Mockito.anyLong())).thenReturn(true);
+        Mockito.when(cmd.getId()).thenReturn(1L);
+        Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(cluster);
+        Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.ExternalManaged);
+
+        kubernetesClusterManager.adoptKubernetesClusterNetworkRules(cmd);
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void adoptNetworkRulesRejectsTransientClusterState() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        AdoptKubernetesClusterNetworkRulesCmd cmd = Mockito.mock(AdoptKubernetesClusterNetworkRulesCmd.class);
+        Mockito.when(accountManager.isRootAdmin(Mockito.anyLong())).thenReturn(true);
+        Mockito.when(cmd.getId()).thenReturn(1L);
+        Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(cluster);
+        Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(cluster.getState()).thenReturn(KubernetesCluster.State.Starting);
+
+        kubernetesClusterManager.adoptKubernetesClusterNetworkRules(cmd);
+    }
+
+    @Test
+    public void adoptNetworkRulesRunsForRootOnStableCloudManagedCluster() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        KubernetesClusterStartWorker worker = Mockito.mock(KubernetesClusterStartWorker.class);
+        AdoptKubernetesClusterNetworkRulesCmd cmd = Mockito.mock(AdoptKubernetesClusterNetworkRulesCmd.class);
+        List<KubernetesClusterNetworkRuleAdoptionSpec> specs = Collections.emptyList();
+        Mockito.when(accountManager.isRootAdmin(Mockito.anyLong())).thenReturn(true);
+        Mockito.when(cmd.getId()).thenReturn(1L);
+        Mockito.when(cmd.getRuleSpecs()).thenReturn(specs);
+        Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(cluster);
+        Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(cluster.getState()).thenReturn(KubernetesCluster.State.Stopped);
+        Mockito.doReturn(worker).when(kubernetesClusterManager).createKubernetesClusterStartWorker(cluster);
+        Mockito.when(worker.adoptKubernetesClusterNetworkRules(specs)).thenReturn(true);
+
+        Assert.assertTrue(kubernetesClusterManager.adoptKubernetesClusterNetworkRules(cmd));
+
+        Mockito.verify(worker).adoptKubernetesClusterNetworkRules(specs);
     }
 
     @Test

@@ -18,12 +18,22 @@
 package com.cloud.kubernetes.cluster.actionworkers;
 
 import java.util.List;
+import java.util.Set;
 
+import com.cloud.exception.ManagementServerException;
 import com.cloud.exception.NetworkRuleConflictException;
 import com.cloud.kubernetes.cluster.KubernetesCluster;
+import com.cloud.kubernetes.cluster.KubernetesClusterFirewallRuleMapVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkACLItemMapVO;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleLifecycleState;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleOwnershipState;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleRole;
+import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDetailsDao;
+import com.cloud.kubernetes.cluster.dao.KubernetesClusterFirewallRuleMapDao;
+import com.cloud.kubernetes.cluster.dao.KubernetesClusterNetworkACLItemMapDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterVmMapDao;
 import com.cloud.kubernetes.version.dao.KubernetesSupportedVersionDao;
 import com.cloud.network.IpAddress;
@@ -33,6 +43,7 @@ import com.cloud.network.dao.FirewallRulesDao;
 import com.cloud.network.dao.LoadBalancerDao;
 import com.cloud.network.dao.LoadBalancerVMMapDao;
 import com.cloud.network.dao.LoadBalancerVO;
+import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.firewall.FirewallService;
 import com.cloud.network.lb.LoadBalancingRulesService;
 import com.cloud.network.rules.FirewallRule;
@@ -44,6 +55,9 @@ import com.cloud.network.vpc.NetworkACLItem;
 import com.cloud.network.vpc.NetworkACLItemDao;
 import com.cloud.network.vpc.NetworkACLItemVO;
 import com.cloud.network.vpc.NetworkACLService;
+import com.cloud.network.vpc.NetworkACL;
+import com.cloud.network.vpc.NetworkACLVO;
+import com.cloud.network.vpc.dao.NetworkACLDao;
 import com.cloud.user.Account;
 import com.cloud.utils.net.Ip;
 import com.cloud.utils.net.NetUtils;
@@ -59,6 +73,19 @@ import org.mockito.junit.MockitoJUnitRunner;
 
 @RunWith(MockitoJUnitRunner.class)
 public class KubernetesClusterResourceModifierActionWorkerTest {
+    private static class TestKubernetesClusterResourceModifierActionWorker extends KubernetesClusterResourceModifierActionWorker {
+        private int provisionAclRuleCalls;
+
+        TestKubernetesClusterResourceModifierActionWorker(KubernetesCluster kubernetesCluster, KubernetesClusterManagerImpl clusterManager) {
+            super(kubernetesCluster, clusterManager);
+        }
+
+        @Override
+        protected void provisionVpcTierAllowPortACLRule(Network network, int startPort, int endPort, String logicalRole) {
+            provisionAclRuleCalls++;
+        }
+    }
+
     @Mock
     private KubernetesClusterDao kubernetesClusterDaoMock;
 
@@ -76,6 +103,15 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
 
     @Mock
     private KubernetesCluster kubernetesClusterMock;
+
+    @Mock
+    private KubernetesClusterVO lockedKubernetesClusterMock;
+
+    @Mock
+    private KubernetesClusterFirewallRuleMapDao kubernetesClusterFirewallRuleMapDaoMock;
+
+    @Mock
+    private KubernetesClusterNetworkACLItemMapDao kubernetesClusterNetworkACLItemMapDaoMock;
 
     @Mock
     private FirewallRulesDao firewallRulesDaoMock;
@@ -96,6 +132,11 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
     private NetworkACLService networkACLServiceMock;
 
     @Mock
+    private NetworkDao networkDaoMock;
+    @Mock
+    private NetworkACLDao networkACLDaoMock;
+
+    @Mock
     private LoadBalancerDao loadBalancerDaoMock;
 
     @Mock
@@ -107,11 +148,17 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
     private KubernetesClusterResourceModifierActionWorker kubernetesClusterResourceModifierActionWorker;
 
     @Before
-    public void setUp() {
+    public void setUp() throws Exception {
         kubernetesClusterManagerMock.kubernetesClusterDao = kubernetesClusterDaoMock;
         kubernetesClusterManagerMock.kubernetesSupportedVersionDao = kubernetesSupportedVersionDaoMock;
         kubernetesClusterManagerMock.kubernetesClusterDetailsDao = kubernetesClusterDetailsDaoMock;
         kubernetesClusterManagerMock.kubernetesClusterVmMapDao = kubernetesClusterVmMapDaoMock;
+        kubernetesClusterManagerMock.kubernetesClusterFirewallRuleMapDao = kubernetesClusterFirewallRuleMapDaoMock;
+        kubernetesClusterManagerMock.kubernetesClusterNetworkACLItemMapDao = kubernetesClusterNetworkACLItemMapDaoMock;
+
+        Mockito.when(kubernetesClusterMock.getId()).thenReturn(1L);
+        Mockito.when(kubernetesClusterDaoMock.lockRow(1L, true)).thenReturn(lockedKubernetesClusterMock);
+        Mockito.when(lockedKubernetesClusterMock.getNetworkRuleOwnershipState()).thenReturn(KubernetesClusterNetworkRuleOwnershipState.MANAGED);
 
         kubernetesClusterResourceModifierActionWorker = new KubernetesClusterResourceModifierActionWorker(kubernetesClusterMock, kubernetesClusterManagerMock);
         kubernetesClusterResourceModifierActionWorker.firewallRulesDao = firewallRulesDaoMock;
@@ -120,9 +167,15 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         kubernetesClusterResourceModifierActionWorker.rulesService = rulesServiceMock;
         kubernetesClusterResourceModifierActionWorker.networkACLItemDao = networkACLItemDaoMock;
         kubernetesClusterResourceModifierActionWorker.networkACLService = networkACLServiceMock;
+        kubernetesClusterResourceModifierActionWorker.networkDao = networkDaoMock;
+        kubernetesClusterResourceModifierActionWorker.networkACLDao = networkACLDaoMock;
         kubernetesClusterResourceModifierActionWorker.loadBalancerDao = loadBalancerDaoMock;
         kubernetesClusterResourceModifierActionWorker.loadBalancerVMMapDao = loadBalancerVMMapDaoMock;
         kubernetesClusterResourceModifierActionWorker.lbService = loadBalancingRulesServiceMock;
+
+        Mockito.when(firewallServiceMock.applyIngressFwRules(Mockito.anyLong(), Mockito.any())).thenReturn(true);
+        Mockito.when(rulesServiceMock.applyPortForwardingRules(Mockito.anyLong(), Mockito.any())).thenReturn(true);
+        Mockito.when(networkACLServiceMock.applyNetworkACL(Mockito.anyLong())).thenReturn(true);
     }
 
     @Test
@@ -198,8 +251,8 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Assert.assertEquals(expectedPrefix, kubernetesClusterResourceModifierActionWorker.getKubernetesClusterNodeNamePrefix());
     }
 
-    @Test
-    public void provisionFirewallRulesLeavesUnownedLegacyRuleInPlace() throws Exception {
+    @Test(expected = NetworkRuleConflictException.class)
+    public void provisionFirewallRulesRejectsUnownedLegacyRule() throws Exception {
         IpAddress publicIp = Mockito.mock(IpAddress.class);
         Account account = Mockito.mock(Account.class);
         FirewallRuleVO existingRule = Mockito.mock(FirewallRuleVO.class);
@@ -208,15 +261,12 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Mockito.when(firewallRulesDaoMock.listByIpPurposePortsProtocolAndNotRevoked(10L, 6443, 6443,
                 NetUtils.TCP_PROTO, FirewallRule.Purpose.Firewall)).thenReturn(List.of(existingRule));
 
-        kubernetesClusterResourceModifierActionWorker.provisionFirewallRules(publicIp, account, 6443, 6443);
-
-        Mockito.verify(firewallRulesDaoMock).loadSourceCidrs(existingRule);
-        Mockito.verify(kubernetesClusterResourceModifierActionWorker.firewallService, Mockito.never()).applyIngressFwRules(10L, account);
-        Mockito.verify(kubernetesClusterResourceModifierActionWorker.firewallService, Mockito.never()).createIngressFirewallRule(Mockito.any());
+        kubernetesClusterResourceModifierActionWorker.provisionFirewallRules(publicIp, account, 6443, 6443,
+                KubernetesClusterActionWorker.API_FIREWALL_ROLE);
     }
 
-    @Test
-    public void provisionPortForwardingRuleLeavesUnownedLegacyRuleInPlace() throws Exception {
+    @Test(expected = NetworkRuleConflictException.class)
+    public void provisionPortForwardingRuleRejectsUnownedLegacyRule() throws Exception {
         long publicIpId = 10L;
         long networkId = 20L;
         long accountId = 30L;
@@ -225,7 +275,7 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         int destinationPort = 22;
         Ip vmIp = new Ip("10.1.1.10");
         IpAddress publicIp = Mockito.mock(IpAddress.class);
-        Network network = Mockito.mock(Network.class);
+        com.cloud.network.dao.NetworkVO network = Mockito.mock(com.cloud.network.dao.NetworkVO.class);
         Account account = Mockito.mock(Account.class);
         Nic nic = Mockito.mock(Nic.class);
         PortForwardingRuleVO existingRule = Mockito.mock(PortForwardingRuleVO.class);
@@ -275,11 +325,13 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
                 40L, 2222, 22);
     }
 
-    @Test
-    public void provisionVpcTierAclRuleLeavesUnownedLegacyRuleInPlace() throws Exception {
-        Network network = Mockito.mock(Network.class);
+    @Test(expected = NetworkRuleConflictException.class)
+    public void provisionVpcTierAclRuleRejectsUnownedLegacyRule() throws Exception {
+        com.cloud.network.dao.NetworkVO network = Mockito.mock(com.cloud.network.dao.NetworkVO.class);
         NetworkACLItemVO existingRule = Mockito.mock(NetworkACLItemVO.class);
+        Mockito.when(network.getId()).thenReturn(20L);
         Mockito.when(network.getNetworkACLId()).thenReturn(50L);
+        Mockito.when(networkDaoMock.findById(20L)).thenReturn(network);
         Mockito.when(networkACLItemDaoMock.listByACL(50L)).thenReturn(List.of(existingRule));
         Mockito.when(existingRule.getState()).thenReturn(NetworkACLItem.State.Active);
         Mockito.when(existingRule.getProtocol()).thenReturn(NetUtils.TCP_PROTO);
@@ -289,10 +341,30 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Mockito.when(existingRule.getAction()).thenReturn(NetworkACLItem.Action.Allow);
         Mockito.when(existingRule.getSourceCidrList()).thenReturn(List.of(NetUtils.ALL_IP4_CIDRS, NetUtils.ALL_IP6_CIDRS));
 
-        kubernetesClusterResourceModifierActionWorker.provisionVpcTierAllowPortACLRule(network, 6443, 6443);
+        kubernetesClusterResourceModifierActionWorker.provisionVpcTierAllowPortACLRule(network, 6443, 6443,
+                KubernetesClusterActionWorker.API_ACL_ROLE);
+    }
 
-        Mockito.verify(networkACLServiceMock, Mockito.never()).applyNetworkACL(Mockito.anyLong());
-        Mockito.verify(networkACLServiceMock, Mockito.never()).createNetworkACLItem(Mockito.any());
+    @Test(expected = ManagementServerException.class)
+    public void createVpcTierAclRulesWithoutAclFails() throws Exception {
+        Network network = Mockito.mock(Network.class);
+        Mockito.when(network.getNetworkACLId()).thenReturn(null);
+        TestKubernetesClusterResourceModifierActionWorker worker =
+                new TestKubernetesClusterResourceModifierActionWorker(kubernetesClusterMock, kubernetesClusterManagerMock);
+
+        worker.createVpcTierAclRules(network);
+    }
+
+    @Test
+    public void createVpcTierAclRulesWithDefaultAllowDoesNotProvisionRules() throws Exception {
+        Network network = Mockito.mock(Network.class);
+        Mockito.when(network.getNetworkACLId()).thenReturn(NetworkACL.DEFAULT_ALLOW);
+        TestKubernetesClusterResourceModifierActionWorker worker =
+                new TestKubernetesClusterResourceModifierActionWorker(kubernetesClusterMock, kubernetesClusterManagerMock);
+
+        worker.createVpcTierAclRules(network);
+
+        Assert.assertEquals(0, worker.provisionAclRuleCalls);
     }
 
     @Test
@@ -300,55 +372,78 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         IpAddress publicIp = Mockito.mock(IpAddress.class);
         Account account = Mockito.mock(Account.class);
         FirewallRuleVO ownedRule = Mockito.mock(FirewallRuleVO.class);
-        Mockito.when(kubernetesClusterMock.getId()).thenReturn(1L);
+        KubernetesClusterFirewallRuleMapVO ownership = mockFirewallOwnership(20L,
+                KubernetesClusterActionWorker.API_FIREWALL_ROLE, KubernetesClusterNetworkRuleLifecycleState.ACTIVE);
         Mockito.when(publicIp.getId()).thenReturn(10L);
-        Mockito.when(kubernetesClusterDetailsDaoMock.findDetail(1L, KubernetesClusterActionWorker.MANAGED_FIREWALL_RULE_IDS))
-                .thenReturn(new com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO(1L, KubernetesClusterActionWorker.MANAGED_FIREWALL_RULE_IDS, "20", false));
+        Mockito.when(account.getId()).thenReturn(30L);
+        Mockito.when(account.getDomainId()).thenReturn(40L);
+        Mockito.when(kubernetesClusterMock.getNetworkId()).thenReturn(20L);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.findByClusterIdAndLogicalRole(1L,
+                KubernetesClusterActionWorker.API_FIREWALL_ROLE)).thenReturn(ownership);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.findByFirewallRuleId(20L)).thenReturn(ownership);
         Mockito.when(firewallRulesDaoMock.findById(20L)).thenReturn(ownedRule);
+        Mockito.when(ownedRule.getId()).thenReturn(20L);
         Mockito.when(ownedRule.getState()).thenReturn(FirewallRule.State.Active);
         Mockito.when(ownedRule.getSourceIpAddressId()).thenReturn(10L);
         Mockito.when(ownedRule.getSourcePortStart()).thenReturn(6443);
         Mockito.when(ownedRule.getSourcePortEnd()).thenReturn(6443);
+        Mockito.when(ownedRule.getNetworkId()).thenReturn(20L);
+        Mockito.when(ownedRule.getAccountId()).thenReturn(30L);
+        Mockito.when(ownedRule.getDomainId()).thenReturn(40L);
         Mockito.when(ownedRule.getPurpose()).thenReturn(FirewallRule.Purpose.Firewall);
+        Mockito.when(ownedRule.getTrafficType()).thenReturn(FirewallRule.TrafficType.Ingress);
         Mockito.when(ownedRule.getProtocol()).thenReturn(NetUtils.TCP_PROTO);
+        Mockito.when(ownedRule.getSourceCidrList()).thenReturn(List.of(NetUtils.ALL_IP4_CIDRS));
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.update(Mockito.anyLong(), Mockito.any())).thenReturn(true);
 
-        kubernetesClusterResourceModifierActionWorker.provisionFirewallRules(publicIp, account, 6443, 6443);
+        kubernetesClusterResourceModifierActionWorker.provisionFirewallRules(publicIp, account, 6443, 6443,
+                KubernetesClusterActionWorker.API_FIREWALL_ROLE);
 
         Mockito.verify(firewallServiceMock).applyIngressFwRules(10L, account);
         Mockito.verify(firewallServiceMock, Mockito.never()).createIngressFirewallRule(Mockito.any());
     }
 
     @Test(expected = CloudRuntimeException.class)
-    public void malformedNetworkRuleManifestFailsClosed() throws Exception {
-        IpAddress publicIp = Mockito.mock(IpAddress.class);
-        Account account = Mockito.mock(Account.class);
-        Mockito.when(kubernetesClusterMock.getId()).thenReturn(1L);
-        Mockito.when(kubernetesClusterMock.getName()).thenReturn("cluster");
-        Mockito.when(publicIp.getId()).thenReturn(10L);
-        Mockito.when(kubernetesClusterDetailsDaoMock.findDetail(1L, KubernetesClusterActionWorker.MANAGED_FIREWALL_RULE_IDS))
-                .thenReturn(new com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO(1L,
-                        KubernetesClusterActionWorker.MANAGED_FIREWALL_RULE_IDS, "not-an-id", false));
+    public void ownershipForAnotherClusterFailsClosed() {
+        KubernetesClusterFirewallRuleMapVO foreignOwnership = Mockito.mock(KubernetesClusterFirewallRuleMapVO.class);
+        Mockito.when(foreignOwnership.getClusterId()).thenReturn(2L);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.findByFirewallRuleId(20L)).thenReturn(foreignOwnership);
 
-        kubernetesClusterResourceModifierActionWorker.provisionFirewallRules(publicIp, account, 6443, 6443);
+        kubernetesClusterResourceModifierActionWorker.recordManagedFirewallRule(20L,
+                KubernetesClusterActionWorker.API_FIREWALL_ROLE);
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void firewallRuleCreationFailsWhenOwnershipCannotBePersisted() {
+        kubernetesClusterResourceModifierActionWorker.recordManagedFirewallRule(20L,
+                KubernetesClusterActionWorker.API_FIREWALL_ROLE);
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void networkAclItemCreationFailsWhenOwnershipCannotBePersisted() {
+        kubernetesClusterResourceModifierActionWorker.recordManagedNetworkAclItem(20L,
+                KubernetesClusterActionWorker.API_ACL_ROLE);
     }
 
     @Test
-    public void cleanupDoesNotTouchUnmanifestedFirewallRule() {
-        IpAddress publicIp = Mockito.mock(IpAddress.class);
-
-        Assert.assertNull(kubernetesClusterResourceModifierActionWorker.removeApiFirewallRule(publicIp));
-        Mockito.verifyNoInteractions(firewallServiceMock, firewallRulesDaoMock);
-    }
-
-    @Test
-    public void cleanupDoesNotTouchUnmanifestedLoadBalancerRule() throws Exception {
-        IpAddress publicIp = Mockito.mock(IpAddress.class);
+    public void deleteManagedNetworkRulesNotInDeletesOnlyStaleOwnership() throws Exception {
         Network network = Mockito.mock(Network.class);
-        Account account = Mockito.mock(Account.class);
+        String desiredRole = KubernetesClusterNetworkRuleRole.SSH_PORT_FORWARD.toLogicalRole(40L);
+        String staleRole = KubernetesClusterNetworkRuleRole.SSH_PORT_FORWARD.toLogicalRole(41L);
+        KubernetesClusterFirewallRuleMapVO desired = Mockito.mock(KubernetesClusterFirewallRuleMapVO.class);
+        KubernetesClusterFirewallRuleMapVO stale = Mockito.mock(KubernetesClusterFirewallRuleMapVO.class);
+        Mockito.when(desired.getFirewallRuleId()).thenReturn(20L);
+        Mockito.when(desired.getLogicalRole()).thenReturn(desiredRole);
+        Mockito.when(stale.getFirewallRuleId()).thenReturn(21L);
+        Mockito.when(stale.getLogicalRole()).thenReturn(staleRole);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.listByClusterId(1L)).thenReturn(List.of(desired, stale));
+        KubernetesClusterResourceModifierActionWorker spyWorker = Mockito.spy(kubernetesClusterResourceModifierActionWorker);
+        Mockito.doNothing().when(spyWorker).deleteManagedFirewallRuleByRole(Mockito.any(), Mockito.eq(network));
 
-        kubernetesClusterResourceModifierActionWorker.removeLoadBalancingRule(publicIp, network, account);
+        spyWorker.deleteManagedNetworkRulesNotIn(Set.of(desiredRole), network);
 
-        Mockito.verifyNoInteractions(loadBalancerDaoMock, loadBalancingRulesServiceMock);
+        Mockito.verify(spyWorker).deleteManagedFirewallRuleByRole(stale, network);
+        Mockito.verify(spyWorker, Mockito.never()).deleteManagedFirewallRuleByRole(desired, network);
     }
 
     @Test
@@ -358,14 +453,19 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Account account = Mockito.mock(Account.class);
         Nic nic = Mockito.mock(Nic.class);
         PortForwardingRuleVO ownedRule = Mockito.mock(PortForwardingRuleVO.class);
+        KubernetesClusterFirewallRuleMapVO ownership = mockFirewallOwnership(21L,
+                KubernetesClusterActionWorker.SSH_PORT_FORWARD_ROLE_PREFIX + 40L,
+                KubernetesClusterNetworkRuleLifecycleState.ACTIVE);
         kubernetesClusterResourceModifierActionWorker.networkModel = Mockito.mock(NetworkModel.class);
-        Mockito.when(kubernetesClusterMock.getId()).thenReturn(1L);
         Mockito.when(publicIp.getId()).thenReturn(10L);
         Mockito.when(network.getId()).thenReturn(20L);
         Mockito.when(account.getId()).thenReturn(30L);
-        Mockito.when(kubernetesClusterDetailsDaoMock.findDetail(1L, KubernetesClusterActionWorker.MANAGED_PORT_FORWARDING_RULE_IDS))
-                .thenReturn(new com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO(1L, KubernetesClusterActionWorker.MANAGED_PORT_FORWARDING_RULE_IDS, "21", false));
+        Mockito.when(account.getDomainId()).thenReturn(40L);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.findByClusterIdAndLogicalRole(1L,
+                KubernetesClusterActionWorker.SSH_PORT_FORWARD_ROLE_PREFIX + 40L)).thenReturn(ownership);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.findByFirewallRuleId(21L)).thenReturn(ownership);
         Mockito.when(portForwardingRulesDaoMock.findById(21L)).thenReturn(ownedRule);
+        Mockito.when(ownedRule.getId()).thenReturn(21L);
         Mockito.when(ownedRule.getState()).thenReturn(FirewallRule.State.Active);
         Mockito.when(ownedRule.getSourceIpAddressId()).thenReturn(10L);
         Mockito.when(ownedRule.getSourcePortStart()).thenReturn(2222);
@@ -374,10 +474,14 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Mockito.when(ownedRule.getDestinationPortEnd()).thenReturn(22);
         Mockito.when(ownedRule.getVirtualMachineId()).thenReturn(40L);
         Mockito.when(ownedRule.getNetworkId()).thenReturn(20L);
+        Mockito.when(ownedRule.getAccountId()).thenReturn(30L);
+        Mockito.when(ownedRule.getDomainId()).thenReturn(40L);
+        Mockito.when(ownedRule.getPurpose()).thenReturn(FirewallRule.Purpose.PortForwarding);
         Mockito.when(ownedRule.getProtocol()).thenReturn(NetUtils.TCP_PROTO);
         Mockito.when(ownedRule.getDestinationIpAddress()).thenReturn(new Ip("10.1.1.10"));
         Mockito.when(kubernetesClusterResourceModifierActionWorker.networkModel.getNicInNetwork(40L, 20L)).thenReturn(nic);
         Mockito.when(nic.getIPv4Address()).thenReturn("10.1.1.10");
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.update(Mockito.anyLong(), Mockito.any())).thenReturn(true);
 
         kubernetesClusterResourceModifierActionWorker.provisionPublicIpPortForwardingRule(publicIp, network, account, 40L, 2222, 22);
 
@@ -392,8 +496,10 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Account account = Mockito.mock(Account.class);
         Nic nic = Mockito.mock(Nic.class);
         PortForwardingRuleVO createdRule = Mockito.mock(PortForwardingRuleVO.class);
+        KubernetesClusterFirewallRuleMapVO ownership = mockFirewallOwnership(41L,
+                KubernetesClusterActionWorker.SSH_PORT_FORWARD_ROLE_PREFIX + 40L,
+                KubernetesClusterNetworkRuleLifecycleState.PENDING_APPLY);
         kubernetesClusterResourceModifierActionWorker.networkModel = Mockito.mock(NetworkModel.class);
-        Mockito.when(kubernetesClusterMock.getId()).thenReturn(1L);
         Mockito.when(publicIp.getId()).thenReturn(10L);
         Mockito.when(network.getId()).thenReturn(20L);
         Mockito.when(account.getId()).thenReturn(30L);
@@ -403,22 +509,33 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Mockito.when(portForwardingRulesDaoMock.listByIpAndNotRevoked(10L)).thenReturn(List.of());
         Mockito.when(portForwardingRulesDaoMock.persist(Mockito.any(PortForwardingRuleVO.class))).thenReturn(createdRule);
         Mockito.when(createdRule.getId()).thenReturn(41L);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.persist(Mockito.any(KubernetesClusterFirewallRuleMapVO.class))).thenReturn(ownership);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.findByFirewallRuleId(41L)).thenReturn(null, ownership);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.update(Mockito.anyLong(), Mockito.any())).thenReturn(true);
 
         kubernetesClusterResourceModifierActionWorker.provisionPublicIpPortForwardingRule(publicIp, network, account, 40L, 2222, 22);
 
-        Mockito.verify(kubernetesClusterDetailsDaoMock).addDetail(1L, KubernetesClusterActionWorker.MANAGED_PORT_FORWARDING_RULE_IDS, "41", false);
+        Mockito.verify(kubernetesClusterFirewallRuleMapDaoMock).persist(Mockito.argThat(mapping -> mapping.getClusterId() == 1L
+                && mapping.getFirewallRuleId() == 41L
+                && (KubernetesClusterActionWorker.SSH_PORT_FORWARD_ROLE_PREFIX + 40L).equals(mapping.getLogicalRole())));
         Mockito.verify(rulesServiceMock).applyPortForwardingRules(10L, account);
     }
 
     @Test
-    public void provisionVpcTierAclRuleReusesOnlyManifestedRule() throws Exception {
-        Network network = Mockito.mock(Network.class);
+    public void provisionVpcTierAclRuleReloadsTierBeforeReusingManifestedRule() throws Exception {
+        Network staleNetwork = Mockito.mock(Network.class);
+        com.cloud.network.dao.NetworkVO effectiveNetwork = Mockito.mock(com.cloud.network.dao.NetworkVO.class);
         NetworkACLItemVO ownedRule = Mockito.mock(NetworkACLItemVO.class);
-        Mockito.when(kubernetesClusterMock.getId()).thenReturn(1L);
-        Mockito.when(network.getNetworkACLId()).thenReturn(50L);
-        Mockito.when(kubernetesClusterDetailsDaoMock.findDetail(1L, KubernetesClusterActionWorker.MANAGED_NETWORK_ACL_ITEM_IDS))
-                .thenReturn(new com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO(1L, KubernetesClusterActionWorker.MANAGED_NETWORK_ACL_ITEM_IDS, "22", false));
+        KubernetesClusterNetworkACLItemMapVO ownership = mockAclOwnership(22L, KubernetesClusterActionWorker.API_ACL_ROLE,
+                KubernetesClusterNetworkRuleLifecycleState.ACTIVE);
+        Mockito.when(staleNetwork.getId()).thenReturn(20L);
+        Mockito.when(effectiveNetwork.getNetworkACLId()).thenReturn(50L);
+        Mockito.when(networkDaoMock.findById(20L)).thenReturn(effectiveNetwork);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.findByClusterIdAndLogicalRole(1L,
+                KubernetesClusterActionWorker.API_ACL_ROLE)).thenReturn(ownership);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.findByNetworkAclItemId(22L)).thenReturn(ownership);
         Mockito.when(networkACLItemDaoMock.findById(22L)).thenReturn(ownedRule);
+        Mockito.when(ownedRule.getId()).thenReturn(22L);
         Mockito.when(ownedRule.getState()).thenReturn(NetworkACLItem.State.Active);
         Mockito.when(ownedRule.getAclId()).thenReturn(50L);
         Mockito.when(ownedRule.getSourcePortStart()).thenReturn(6443);
@@ -426,11 +543,83 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Mockito.when(ownedRule.getProtocol()).thenReturn(NetUtils.TCP_PROTO);
         Mockito.when(ownedRule.getTrafficType()).thenReturn(NetworkACLItem.TrafficType.Ingress);
         Mockito.when(ownedRule.getAction()).thenReturn(NetworkACLItem.Action.Allow);
+        Mockito.when(ownedRule.getSourceCidrList()).thenReturn(List.of(NetUtils.ALL_IP4_CIDRS, NetUtils.ALL_IP6_CIDRS));
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.update(Mockito.anyLong(), Mockito.any())).thenReturn(true);
 
-        kubernetesClusterResourceModifierActionWorker.provisionVpcTierAllowPortACLRule(network, 6443, 6443);
+        kubernetesClusterResourceModifierActionWorker.provisionVpcTierAllowPortACLRule(staleNetwork, 6443, 6443,
+                KubernetesClusterActionWorker.API_ACL_ROLE);
 
         Mockito.verify(networkACLServiceMock).applyNetworkACL(50L);
         Mockito.verify(networkACLServiceMock, Mockito.never()).createNetworkACLItem(Mockito.any());
+        Mockito.verify(staleNetwork, Mockito.never()).getNetworkACLId();
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void deleteManagedAclItemRejectsRuleWhoseAclWasAttachedToAnotherTier() throws Exception {
+        Network network = Mockito.mock(Network.class);
+        com.cloud.network.dao.NetworkVO otherTier = Mockito.mock(com.cloud.network.dao.NetworkVO.class);
+        NetworkACLItemVO item = Mockito.mock(NetworkACLItemVO.class);
+        NetworkACLVO acl = Mockito.mock(NetworkACLVO.class);
+        KubernetesClusterNetworkACLItemMapVO ownership = mockAclOwnership(22L,
+                KubernetesClusterActionWorker.API_ACL_ROLE, KubernetesClusterNetworkRuleLifecycleState.ACTIVE);
+        Mockito.when(network.getId()).thenReturn(20L);
+        Mockito.when(network.getVpcId()).thenReturn(10L);
+        Mockito.when(otherTier.getId()).thenReturn(21L);
+        Mockito.when(networkACLItemDaoMock.findById(22L)).thenReturn(item);
+        Mockito.when(item.getId()).thenReturn(22L);
+        Mockito.when(item.getAclId()).thenReturn(50L);
+        Mockito.when(networkACLDaoMock.findById(50L)).thenReturn(acl);
+        Mockito.when(acl.getVpcId()).thenReturn(10L);
+        Mockito.when(networkDaoMock.listByAclId(50L)).thenReturn(List.of(otherTier));
+
+        try {
+            kubernetesClusterResourceModifierActionWorker.deleteManagedNetworkAclItem(ownership, network);
+        } finally {
+            Mockito.verify(networkACLServiceMock, Mockito.never()).revokeNetworkACLItem(Mockito.anyLong());
+        }
+    }
+
+    @Test
+    public void deleteManagedAclItemForgetsOwnershipWhenItemIsAlreadyMissing() throws Exception {
+        Network network = Mockito.mock(Network.class);
+        KubernetesClusterNetworkACLItemMapVO ownership = mockAclOwnership(22L,
+                KubernetesClusterActionWorker.API_ACL_ROLE, KubernetesClusterNetworkRuleLifecycleState.ACTIVE);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.findByNetworkAclItemId(22L)).thenReturn(ownership);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.update(1022L, ownership)).thenReturn(true);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.findById(1022L)).thenReturn(ownership);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.remove(1022L)).thenReturn(true);
+
+        kubernetesClusterResourceModifierActionWorker.deleteManagedNetworkAclItem(ownership, network);
+
+        Mockito.verify(networkACLServiceMock, Mockito.never()).revokeNetworkACLItem(Mockito.anyLong());
+        Mockito.verify(kubernetesClusterNetworkACLItemMapDaoMock).remove(1022L);
+    }
+
+    @Test
+    public void deleteManagedAclItemRevokesExactItemAndForgetsOwnership() throws Exception {
+        com.cloud.network.dao.NetworkVO network = Mockito.mock(com.cloud.network.dao.NetworkVO.class);
+        NetworkACLItemVO item = Mockito.mock(NetworkACLItemVO.class);
+        NetworkACLVO acl = Mockito.mock(NetworkACLVO.class);
+        KubernetesClusterNetworkACLItemMapVO ownership = mockAclOwnership(22L,
+                KubernetesClusterActionWorker.API_ACL_ROLE, KubernetesClusterNetworkRuleLifecycleState.ACTIVE);
+        Mockito.when(network.getId()).thenReturn(20L);
+        Mockito.when(network.getVpcId()).thenReturn(10L);
+        Mockito.when(item.getId()).thenReturn(22L);
+        Mockito.when(item.getAclId()).thenReturn(50L);
+        Mockito.when(networkACLItemDaoMock.findById(22L)).thenReturn(item, item, null);
+        Mockito.when(networkACLDaoMock.findById(50L)).thenReturn(acl);
+        Mockito.when(acl.getVpcId()).thenReturn(10L);
+        Mockito.when(networkDaoMock.listByAclId(50L)).thenReturn(List.of(network));
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.findByNetworkAclItemId(22L)).thenReturn(ownership);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.update(1022L, ownership)).thenReturn(true);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.findById(1022L)).thenReturn(ownership);
+        Mockito.when(kubernetesClusterNetworkACLItemMapDaoMock.remove(1022L)).thenReturn(true);
+        Mockito.when(networkACLServiceMock.revokeNetworkACLItem(22L)).thenReturn(true);
+
+        kubernetesClusterResourceModifierActionWorker.deleteManagedNetworkAclItem(ownership, network);
+
+        Mockito.verify(networkACLServiceMock).revokeNetworkACLItem(22L);
+        Mockito.verify(kubernetesClusterNetworkACLItemMapDaoMock).remove(1022L);
     }
 
     @Test(expected = NetworkRuleConflictException.class)
@@ -446,8 +635,8 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
                 List.of(), 6443);
     }
 
-    @Test
-    public void provisionLoadBalancerRuleLeavesUnownedLegacyRuleInPlace() throws Exception {
+    @Test(expected = NetworkRuleConflictException.class)
+    public void provisionLoadBalancerRuleRejectsUnownedLegacyRule() throws Exception {
         IpAddress publicIp = Mockito.mock(IpAddress.class);
         Network network = Mockito.mock(Network.class);
         Account account = Mockito.mock(Account.class);
@@ -478,10 +667,12 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         IpAddress publicIp = Mockito.mock(IpAddress.class);
         Network network = Mockito.mock(Network.class);
         LoadBalancerVO ownedRule = Mockito.mock(LoadBalancerVO.class);
-        Mockito.when(kubernetesClusterMock.getId()).thenReturn(1L);
+        KubernetesClusterFirewallRuleMapVO ownership = mockFirewallOwnership(23L,
+                KubernetesClusterActionWorker.API_LOAD_BALANCER_ROLE, KubernetesClusterNetworkRuleLifecycleState.ACTIVE);
         Mockito.when(publicIp.getId()).thenReturn(10L);
-        Mockito.when(kubernetesClusterDetailsDaoMock.findDetail(1L, KubernetesClusterActionWorker.MANAGED_LOAD_BALANCER_RULE_IDS))
-                .thenReturn(new com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO(1L, KubernetesClusterActionWorker.MANAGED_LOAD_BALANCER_RULE_IDS, "23", false));
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.findByClusterIdAndLogicalRole(1L,
+                KubernetesClusterActionWorker.API_LOAD_BALANCER_ROLE)).thenReturn(ownership);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.findByFirewallRuleId(23L)).thenReturn(ownership);
         Mockito.when(loadBalancerDaoMock.findById(23L)).thenReturn(ownedRule);
         Mockito.when(ownedRule.getState()).thenReturn(FirewallRule.State.Active);
         Mockito.when(ownedRule.getSourceIpAddressId()).thenReturn(10L);
@@ -501,6 +692,7 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Mockito.when(account.getId()).thenReturn(30L);
         Mockito.when(loadBalancerVMMapDaoMock.listByLoadBalancerId(23L, false)).thenReturn(List.of());
         Mockito.when(loadBalancingRulesServiceMock.applyLoadBalancerConfig(23L)).thenReturn(true);
+        Mockito.when(kubernetesClusterFirewallRuleMapDaoMock.update(Mockito.anyLong(), Mockito.any())).thenReturn(true);
 
         kubernetesClusterResourceModifierActionWorker.provisionLoadBalancerRule(publicIp, network, account, List.of(), 6443);
 
@@ -520,5 +712,26 @@ public class KubernetesClusterResourceModifierActionWorkerTest {
         Mockito.when(existingRule.getSourcePortEnd()).thenReturn(6443);
 
         kubernetesClusterResourceModifierActionWorker.provisionLoadBalancerRule(publicIp, Mockito.mock(Network.class), Mockito.mock(Account.class), List.of(), 6443);
+    }
+
+    private KubernetesClusterFirewallRuleMapVO mockFirewallOwnership(long ruleId, String logicalRole,
+            KubernetesClusterNetworkRuleLifecycleState lifecycleState) {
+        KubernetesClusterFirewallRuleMapVO ownership = Mockito.mock(KubernetesClusterFirewallRuleMapVO.class);
+        Mockito.when(ownership.getId()).thenReturn(ruleId + 1000L);
+        Mockito.when(ownership.getClusterId()).thenReturn(1L);
+        Mockito.when(ownership.getFirewallRuleId()).thenReturn(ruleId);
+        Mockito.when(ownership.getLifecycleState()).thenReturn(lifecycleState);
+        return ownership;
+    }
+
+    private KubernetesClusterNetworkACLItemMapVO mockAclOwnership(long itemId, String logicalRole,
+            KubernetesClusterNetworkRuleLifecycleState lifecycleState) {
+        KubernetesClusterNetworkACLItemMapVO ownership = Mockito.mock(KubernetesClusterNetworkACLItemMapVO.class);
+        Mockito.when(ownership.getId()).thenReturn(itemId + 1000L);
+        Mockito.when(ownership.getClusterId()).thenReturn(1L);
+        Mockito.when(ownership.getNetworkAclItemId()).thenReturn(itemId);
+        Mockito.when(ownership.getLogicalRole()).thenReturn(logicalRole);
+        Mockito.when(ownership.getLifecycleState()).thenReturn(lifecycleState);
+        return ownership;
     }
 }

@@ -135,6 +135,7 @@ public class ApiConstants {
     public static final String CLUSTER_IDS = "clusterids";
     public static final String CLUSTER_NAME = "clustername";
     public static final String CLUSTER_TYPE = "clustertype";
+    public static final String NETWORK_RULE_OWNERSHIP_STATE = "networkruleownershipstate";
     public static final String CN = "cn";
     public static final String COMMAND = "command";
     public static final String CMD_EVENT_TYPE = "cmdeventtype";

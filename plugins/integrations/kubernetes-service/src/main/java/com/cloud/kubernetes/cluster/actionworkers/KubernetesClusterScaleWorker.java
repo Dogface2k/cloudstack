@@ -46,13 +46,13 @@ import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.exception.VirtualMachineMigrationException;
 import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleOwnershipState;
 import com.cloud.kubernetes.cluster.KubernetesClusterService;
 import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
 import com.cloud.kubernetes.cluster.utils.KubernetesClusterUtil;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
-import com.cloud.network.rules.FirewallRule;
 import com.cloud.offering.ServiceOffering;
 import com.cloud.storage.LaunchPermissionVO;
 import com.cloud.uservm.UserVm;
@@ -129,22 +129,6 @@ public class KubernetesClusterScaleWorker extends KubernetesClusterResourceModif
         if (publicIp == null) {
             throw new ManagementServerException(String.format("No source NAT IP addresses found for network : %s, Kubernetes cluster : %s", network.getName(), kubernetesCluster.getName()));
         }
-
-        // Remove existing SSH firewall rules
-        FirewallRule firewallRule = removeSshFirewallRule(publicIp, network.getId());
-        int existingFirewallRuleSourcePortEnd;
-        if (firewallRule == null) {
-            logger.warn("SSH firewall rule not found for Kubernetes cluster: {}. It may have been manually deleted or modified.", kubernetesCluster.getName());
-            existingFirewallRuleSourcePortEnd = CLUSTER_NODES_DEFAULT_START_SSH_PORT + clusterVMIds.size() - 1;
-        } else {
-            existingFirewallRuleSourcePortEnd = firewallRule.getSourcePortEnd();
-        }
-
-        try {
-            removePortForwardingRules(publicIp, network, owner, CLUSTER_NODES_DEFAULT_START_SSH_PORT, existingFirewallRuleSourcePortEnd);
-        } catch (ResourceUnavailableException e) {
-            throw new ManagementServerException(String.format("Failed to remove SSH port forwarding rules for removed VMs for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
-        }
         setupKubernetesClusterIsolatedNetworkRules(publicIp, network, clusterVMIds, false);
     }
 
@@ -152,11 +136,6 @@ public class KubernetesClusterScaleWorker extends KubernetesClusterResourceModif
         IpAddress publicIp = getVpcTierKubernetesPublicIp(network);
         if (publicIp == null) {
             throw new ManagementServerException(String.format("No public IP addresses found for VPC tier : %s, Kubernetes cluster : %s", network.getName(), kubernetesCluster.getName()));
-        }
-        try {
-            removePortForwardingRules(publicIp, network, owner, CLUSTER_NODES_DEFAULT_START_SSH_PORT, CLUSTER_NODES_DEFAULT_START_SSH_PORT + clusterVMIds.size() - 1);
-        } catch (ResourceUnavailableException e) {
-            throw new ManagementServerException(String.format("Failed to remove SSH port forwarding rules for removed VMs for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
         }
         // Add port forwarding rule for SSH access on each node VM
         try {
@@ -167,15 +146,27 @@ public class KubernetesClusterScaleWorker extends KubernetesClusterResourceModif
         }
     }
 
+    void deleteStaleManagedNetworkRulesForScale(Network clusterNetwork) throws ManagementServerException {
+        if (manager.isDirectAccess(clusterNetwork)) {
+            KubernetesClusterVO cluster = kubernetesClusterDao.findById(kubernetesCluster.getId());
+            if (cluster == null || !KubernetesClusterNetworkRuleOwnershipState.MANAGED.equals(
+                    cluster.getNetworkRuleOwnershipState())) {
+                return;
+            }
+        }
+        Set<String> desiredRoles = new KubernetesClusterNetworkRuleOwnershipValidator(this)
+                .getExpectedLogicalRoles(clusterNetwork, getKubernetesClusterVMMaps());
+        deleteManagedNetworkRulesNotIn(desiredRoles, clusterNetwork);
+    }
+
     /**
-     * Scale network rules for an existing Kubernetes cluster while scaling it
-     * Open up firewall for SSH access from port NODES_DEFAULT_START_SSH_PORT to NODES_DEFAULT_START_SSH_PORT+n.
-     * Also remove port forwarding rules for all virtual machines and re-create port-forwarding rule
-     * to forward public IP traffic to all node VMs' private IP.
-     * @param clusterVMIds
-     * @throws ManagementServerException
+     * Reconcile the cluster-owned network rules with the current VM mappings after scaling.
+     *
+     * @param clusterVMIds current non-etcd cluster VM IDs
+     * @throws ManagementServerException when the rules cannot be reconciled
      */
     private void scaleKubernetesClusterNetworkRules(final List<Long> clusterVMIds) throws ManagementServerException {
+        deleteStaleManagedNetworkRulesForScale(network);
         if (manager.isDirectAccess(network)) {
             if (logger.isDebugEnabled())
                 logger.debug("Network: {} for Kubernetes cluster: {} is not an isolated network " +

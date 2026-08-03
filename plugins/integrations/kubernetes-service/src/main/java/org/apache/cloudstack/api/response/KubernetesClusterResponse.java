@@ -25,6 +25,7 @@ import org.apache.cloudstack.api.BaseResponseWithAnnotations;
 import org.apache.cloudstack.api.EntityReference;
 
 import com.cloud.kubernetes.cluster.KubernetesCluster;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleOwnershipState;
 import com.cloud.serializer.Param;
 import com.google.gson.annotations.SerializedName;
 
@@ -215,6 +216,10 @@ public class KubernetesClusterResponse extends BaseResponseWithAnnotations imple
     @SerializedName(ApiConstants.CLUSTER_TYPE)
     @Param(description = "The type of the cluster")
     private KubernetesCluster.ClusterType clusterType;
+
+    @SerializedName(ApiConstants.NETWORK_RULE_OWNERSHIP_STATE)
+    @Param(description = "The ownership state of network rules managed for the Kubernetes cluster", since = "4.23.0")
+    private KubernetesClusterNetworkRuleOwnershipState networkRuleOwnershipState;
 
     @SerializedName(ApiConstants.CREATED)
     @Param(description = "The date when this Kubernetes cluster was created")
@@ -546,6 +551,14 @@ public class KubernetesClusterResponse extends BaseResponseWithAnnotations imple
 
     public void setClusterType(KubernetesCluster.ClusterType clusterType) {
         this.clusterType = clusterType;
+    }
+
+    public KubernetesClusterNetworkRuleOwnershipState getNetworkRuleOwnershipState() {
+        return networkRuleOwnershipState;
+    }
+
+    public void setNetworkRuleOwnershipState(KubernetesClusterNetworkRuleOwnershipState networkRuleOwnershipState) {
+        this.networkRuleOwnershipState = networkRuleOwnershipState;
     }
 
     public void setCniConfigId(String cniConfigId) {

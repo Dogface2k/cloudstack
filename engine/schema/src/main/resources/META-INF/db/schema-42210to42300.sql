@@ -670,3 +670,40 @@ CREATE TABLE IF NOT EXISTS `cloud`.`nsx_vrf_gateways` (
     INDEX `i_nsx_vrf_gateways__account_id`(`account_id`),
     INDEX `i_nsx_vrf_gateways__domain_id`(`domain_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`('cloud.kubernetes_cluster', 'network_rule_ownership_state',
+    'varchar(32) NOT NULL DEFAULT ''LEGACY_UNMANAGED'' COMMENT ''CKS managed network-rule ownership migration state'' AFTER `cluster_type`');
+
+-- CKS-managed network-rule ownership. Firewall, port-forwarding, and load-balancer
+-- rules share firewall_rules; VPC ACL items have their own table. Logical roles are
+-- stable desired identities while lifecycle_state preserves ownership across
+-- asynchronous provider application and deletion.
+CREATE TABLE IF NOT EXISTS `cloud`.`kubernetes_cluster_firewall_rule_map` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `cluster_id` bigint unsigned NOT NULL COMMENT 'Kubernetes cluster that owns the rule',
+    `firewall_rule_id` bigint unsigned NOT NULL COMMENT 'CloudStack-managed firewall, port-forwarding, or load-balancer rule',
+    `logical_role` varchar(128) NOT NULL COMMENT 'Stable desired role within the Kubernetes cluster',
+    `lifecycle_state` varchar(32) NOT NULL COMMENT 'PENDING_APPLY, ACTIVE, or PENDING_DELETE',
+    `created` datetime NOT NULL,
+    `updated` datetime NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_kubernetes_cluster_firewall_rule_map__rule_id` (`firewall_rule_id`),
+    UNIQUE KEY `uk_kubernetes_cluster_firewall_rule_map__cluster_role` (`cluster_id`, `logical_role`),
+    CONSTRAINT `fk_kubernetes_cluster_firewall_rule_map__rule_id` FOREIGN KEY (`firewall_rule_id`) REFERENCES `firewall_rules` (`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_kubernetes_cluster_firewall_rule_map__cluster_id` FOREIGN KEY (`cluster_id`) REFERENCES `kubernetes_cluster` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+CREATE TABLE IF NOT EXISTS `cloud`.`kubernetes_cluster_network_acl_item_map` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `cluster_id` bigint unsigned NOT NULL COMMENT 'Kubernetes cluster that owns the ACL item',
+    `network_acl_item_id` bigint unsigned NOT NULL COMMENT 'CloudStack-managed VPC network ACL item',
+    `logical_role` varchar(128) NOT NULL COMMENT 'Stable desired role within the Kubernetes cluster',
+    `lifecycle_state` varchar(32) NOT NULL COMMENT 'PENDING_APPLY, ACTIVE, or PENDING_DELETE',
+    `created` datetime NOT NULL,
+    `updated` datetime NOT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_kubernetes_cluster_network_acl_item_map__item_id` (`network_acl_item_id`),
+    UNIQUE KEY `uk_kubernetes_cluster_network_acl_item_map__cluster_role` (`cluster_id`, `logical_role`),
+    CONSTRAINT `fk_kubernetes_cluster_network_acl_item_map__item_id` FOREIGN KEY (`network_acl_item_id`) REFERENCES `network_acl_item` (`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_kubernetes_cluster_network_acl_item_map__cluster_id` FOREIGN KEY (`cluster_id`) REFERENCES `kubernetes_cluster` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;

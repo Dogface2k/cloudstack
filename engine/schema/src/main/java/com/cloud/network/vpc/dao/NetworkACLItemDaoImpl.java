@@ -86,7 +86,9 @@ public class NetworkACLItemDaoImpl extends GenericDaoBase<NetworkACLItemVO, Long
     @Override
     public NetworkACLItemVO findById(Long id) {
         NetworkACLItemVO item = super.findById(id);
-        loadCidrs(item);
+        if (item != null) {
+            loadCidrs(item);
+        }
         return item;
     }
 

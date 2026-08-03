@@ -17,7 +17,6 @@
 
 package com.cloud.kubernetes.cluster.actionworkers;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -42,13 +41,15 @@ import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleOwnershipState;
 import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMap;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
 import com.cloud.network.dao.NetworkVO;
-import com.cloud.network.rules.FirewallRule;
+import com.cloud.network.dao.RemoteAccessVpnDao;
+import com.cloud.network.dao.Site2SiteVpnGatewayDao;
 import com.cloud.user.Account;
 import com.cloud.user.AccountManager;
 import com.cloud.user.User;
@@ -71,6 +72,10 @@ public class KubernetesClusterDestroyWorker extends KubernetesClusterResourceMod
     private ASNumberDao asNumberDao;
     @Inject
     private BGPService bgpService;
+    @Inject
+    protected RemoteAccessVpnDao remoteAccessVpnDao;
+    @Inject
+    protected Site2SiteVpnGatewayDao site2SiteVpnGatewayDao;
 
     private List<KubernetesClusterVmMapVO> clusterVMs;
 
@@ -164,58 +169,22 @@ public class KubernetesClusterDestroyWorker extends KubernetesClusterResourceMod
         }
     }
 
-    protected void deleteKubernetesClusterIsolatedNetworkRules(Network network, List<Long> removedVmIds) throws ManagementServerException {
-        IpAddress publicIp = getNetworkSourceNatIp(network);
-        if (publicIp == null) {
-            throw new ManagementServerException(String.format("No source NAT IP addresses found for network : %s", network.getName()));
-        }
-        try {
-            removeLoadBalancingRule(publicIp, network, owner);
-        } catch (ResourceUnavailableException e) {
-            throw new ManagementServerException(String.format("Failed to KubernetesCluster load balancing rule for network : %s", network.getName()), e);
-        }
-        FirewallRule firewallRule = removeApiFirewallRule(publicIp);
-        if (firewallRule == null) {
-            logMessage(Level.WARN, "Firewall rule for API access can't be removed", null);
-        }
-        firewallRule = removeSshFirewallRule(publicIp, network.getId());
-        if (firewallRule == null) {
-            logMessage(Level.WARN, "Firewall rule for SSH access can't be removed", null);
-        }
-        try {
-            removePortForwardingRules(publicIp, network, owner, removedVmIds);
-        } catch (ResourceUnavailableException e) {
-            throw new ManagementServerException(String.format("Failed to KubernetesCluster port forwarding rules for network : %s", network.getName()), e);
-        }
-    }
-
-    protected void deleteKubernetesClusterVpcTierRules(Network network, List<Long> removedVmIds) throws ManagementServerException {
-        IpAddress publicIp = getVpcTierKubernetesPublicIp(network);
-        if (publicIp == null) {
+    protected void deleteManagedNetworkRulesIfPresent(NetworkVO network,
+            KubernetesClusterNetworkRuleOwnershipState ownershipState) throws ManagementServerException {
+        if (!KubernetesClusterNetworkRuleOwnershipState.MANAGED.equals(ownershipState)) {
             return;
         }
-        removeVpcTierAclRules(network);
-        try {
-            removePortForwardingRules(publicIp, network, owner, removedVmIds);
-        } catch (ResourceUnavailableException e) {
-            throw new ManagementServerException(String.format("Failed to KubernetesCluster port forwarding rules for network : %s", network.getName()));
-        }
-    }
-
-    private void deleteKubernetesClusterNetworkRules() throws ManagementServerException {
-        NetworkVO network = networkDao.findById(kubernetesCluster.getNetworkId());
-        if (network == null) {
+        if (network != null) {
+            deleteAllManagedNetworkRules(network);
             return;
         }
-        List<Long> removedVmIds = new ArrayList<>();
-        if (!CollectionUtils.isEmpty(clusterVMs)) {
-            removedVmIds = clusterVMs.stream().map(KubernetesClusterVmMapVO::getVmId).collect(Collectors.toList());
+        boolean hasFirewallMappings = !kubernetesClusterFirewallRuleMapDao.listByClusterId(kubernetesCluster.getId()).isEmpty();
+        boolean hasAclMappings = !kubernetesClusterNetworkACLItemMapDao.listByClusterId(kubernetesCluster.getId()).isEmpty();
+        if (hasFirewallMappings || hasAclMappings) {
+            throw new ManagementServerException(String.format(
+                    "Network for Kubernetes cluster %s is missing while managed network-rule ownership records remain",
+                    kubernetesCluster.getName()));
         }
-        if (network.getVpcId() != null) {
-            deleteKubernetesClusterVpcTierRules(network, removedVmIds);
-            return;
-        }
-        deleteKubernetesClusterIsolatedNetworkRules(network, removedVmIds);
     }
 
     private void validateClusterVMsDestroyed() {
@@ -242,14 +211,8 @@ public class KubernetesClusterDestroyWorker extends KubernetesClusterResourceMod
         }
     }
 
-    private void checkForRulesToDelete() throws ManagementServerException {
-        NetworkVO kubernetesClusterNetwork = networkDao.findById(kubernetesCluster.getNetworkId());
-        if (kubernetesClusterNetwork != null && !manager.isDirectAccess(kubernetesClusterNetwork)) {
-            deleteKubernetesClusterNetworkRules();
-        }
-    }
-
-    private void releaseVpcTierPublicIpIfNeeded() throws InsufficientAddressCapacityException {
+    protected void releaseVpcTierPublicIpIfNeeded(KubernetesClusterNetworkRuleOwnershipState ownershipState)
+            throws InsufficientAddressCapacityException {
         NetworkVO networkVO = networkDao.findById(kubernetesCluster.getNetworkId());
         if (networkVO == null || networkVO.getVpcId() == null) {
             return;
@@ -258,7 +221,26 @@ public class KubernetesClusterDestroyWorker extends KubernetesClusterResourceMod
         if (address == null) {
             return;
         }
-        networkService.releaseIpAddress(address.getId());
+        if (!KubernetesClusterNetworkRuleOwnershipState.MANAGED.equals(ownershipState)) {
+            logger.warn("Retaining public IP {} while deleting legacy Kubernetes cluster {}; ownership of resources on the IP is unknown",
+                    address.getAddress().addr(), kubernetesCluster.getName());
+            return;
+        }
+        boolean hasDirectIpBinding = address.isSourceNat() || address.isOneToOneNat()
+                || address.getAssociatedWithVmId() != null || address.getSystem()
+                || address.isForSystemVms() || address.isForRouter() || address.isPortable();
+        boolean hasFirewallRules = CollectionUtils.isNotEmpty(firewallRulesDao.listByIpAndNotRevoked(address.getId()));
+        boolean hasRemoteAccessVpn = remoteAccessVpnDao.findByPublicIpAddress(address.getId()) != null;
+        boolean hasSiteToSiteVpnGateway = site2SiteVpnGatewayDao.findByPublicIpAddress(address.getId()) != null;
+        if (hasDirectIpBinding || hasFirewallRules || hasRemoteAccessVpn || hasSiteToSiteVpnGateway) {
+            logger.warn("Retaining public IP {} after deleting Kubernetes cluster {} because resources not owned by the cluster remain on the IP",
+                    address.getAddress().addr(), kubernetesCluster.getName());
+            return;
+        }
+        if (!networkService.releaseIpAddress(address.getId())) {
+            throw new InsufficientAddressCapacityException(String.format("Failed to release public IP address %s for Kubernetes cluster %s",
+                    address.getAddress().addr(), kubernetesCluster.getName()), Network.class, networkVO.getId());
+        }
         kubernetesClusterDetailsDao.removeDetail(kubernetesCluster.getId(), ApiConstants.PUBLIC_IP_ID);
     }
 
@@ -275,6 +257,13 @@ public class KubernetesClusterDestroyWorker extends KubernetesClusterResourceMod
         if (clusterDetails != null) {
             cleanupNetwork = Boolean.parseBoolean(clusterDetails.getValue());
         }
+        NetworkVO clusterNetwork = networkDao.findById(kubernetesCluster.getNetworkId());
+        boolean directAccess = clusterNetwork != null && manager.isDirectAccess(clusterNetwork);
+        KubernetesClusterVO persistedCluster = kubernetesClusterDao.findById(kubernetesCluster.getId());
+        if (persistedCluster == null) {
+            throw new CloudRuntimeException(String.format("Kubernetes cluster %s no longer exists", kubernetesCluster.getName()));
+        }
+        boolean legacyNetworkRules = persistedCluster.getNetworkRuleOwnershipState() != KubernetesClusterNetworkRuleOwnershipState.MANAGED;
         if (cleanupNetwork) { // if network has additional VM, cannot proceed with cluster destroy
             NetworkVO network = networkDao.findById(kubernetesCluster.getNetworkId());
             List<KubernetesClusterVmMapVO> externalNodes = clusterVMs.stream().filter(KubernetesClusterVmMapVO::isExternalNode).collect(Collectors.toList());
@@ -313,25 +302,31 @@ public class KubernetesClusterDestroyWorker extends KubernetesClusterResourceMod
         if (vmsDestroyed) {
             if (cleanupNetwork) {
                 validateClusterVMsDestroyed();
+            }
+            try {
+                deleteManagedNetworkRulesIfPresent(clusterNetwork, persistedCluster.getNetworkRuleOwnershipState());
+            } catch (ManagementServerException | CloudRuntimeException e) {
+                String msg = String.format("Failed to remove managed network rules of Kubernetes cluster: %s", kubernetesCluster);
+                logger.warn(msg, e);
+                updateKubernetesClusterEntryForGC();
+                throw new CloudRuntimeException(msg, e);
+            }
+            if (cleanupNetwork) {
                 try {
                     destroyKubernetesClusterNetwork();
-                } catch (ManagementServerException e) {
+                } catch (ManagementServerException | CloudRuntimeException e) {
                     String msg = String.format("Failed to destroy network of Kubernetes cluster: %s cleanup", kubernetesCluster);
                     logger.warn(msg, e);
                     updateKubernetesClusterEntryForGC();
                     throw new CloudRuntimeException(msg, e);
                 }
             } else {
-                try {
-                    checkForRulesToDelete();
-                } catch (ManagementServerException e) {
-                    String msg = String.format("Failed to remove network rules of Kubernetes cluster: %s", kubernetesCluster);
-                    logger.warn(msg, e);
-                    updateKubernetesClusterEntryForGC();
-                    throw new CloudRuntimeException(msg, e);
+                if (legacyNetworkRules && !directAccess) {
+                    logger.warn("Leaving unowned legacy network rules in retained network {} while deleting Kubernetes cluster {}; "
+                            + "only explicitly adopted rules can be removed safely", clusterNetwork, kubernetesCluster);
                 }
                 try {
-                    releaseVpcTierPublicIpIfNeeded();
+                    releaseVpcTierPublicIpIfNeeded(persistedCluster.getNetworkRuleOwnershipState());
                 } catch (InsufficientAddressCapacityException e) {
                     String msg = String.format("Failed to release public IP for VPC tier used by Kubernetes cluster: %s", kubernetesCluster);
                     logger.warn(msg, e);

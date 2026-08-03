@@ -75,3 +75,10 @@ example.ver.1 > example.ver.2:
     creation. Existing networks cannot be moved to an offering with different
     profile bindings; operators must create replacement networks when profile
     changes are required.
+
+  * CloudStack-managed Kubernetes clusters now record explicit ownership of
+    their generated firewall, port-forwarding, load-balancing, and VPC ACL
+    rules. A reconcile API restores missing or drifted managed rules without
+    adopting unrelated customer policy. Existing clusters remain
+    legacy-unmanaged until a root administrator validates and adopts an exact
+    rule topology through the dedicated adoption API.

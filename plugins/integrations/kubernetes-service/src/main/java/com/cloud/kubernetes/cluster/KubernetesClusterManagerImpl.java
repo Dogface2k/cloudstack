@@ -113,6 +113,7 @@ import org.apache.cloudstack.api.command.user.volume.DeleteVolumeCmd;
 import org.apache.cloudstack.api.command.user.volume.DetachVolumeCmd;
 import org.apache.cloudstack.api.command.user.volume.ListVolumesCmd;
 import org.apache.cloudstack.api.command.user.volume.ResizeVolumeCmd;
+import org.apache.cloudstack.api.command.admin.kubernetes.cluster.AdoptKubernetesClusterNetworkRulesCmd;
 import org.apache.cloudstack.api.response.KubernetesClusterConfigResponse;
 import org.apache.cloudstack.api.response.KubernetesClusterResponse;
 import org.apache.cloudstack.api.response.KubernetesUserVmResponse;
@@ -177,6 +178,8 @@ import com.cloud.kubernetes.cluster.actionworkers.KubernetesClusterUpgradeWorker
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterAffinityGroupMapDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDetailsDao;
+import com.cloud.kubernetes.cluster.dao.KubernetesClusterFirewallRuleMapDao;
+import com.cloud.kubernetes.cluster.dao.KubernetesClusterNetworkACLItemMapDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterVmMapDao;
 import com.cloud.kubernetes.version.KubernetesSupportedVersion;
 import com.cloud.kubernetes.version.KubernetesSupportedVersionVO;
@@ -320,6 +323,10 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
     public KubernetesClusterVmMapDao kubernetesClusterVmMapDao;
     @Inject
     public KubernetesClusterDetailsDao kubernetesClusterDetailsDao;
+    @Inject
+    public KubernetesClusterFirewallRuleMapDao kubernetesClusterFirewallRuleMapDao;
+    @Inject
+    public KubernetesClusterNetworkACLItemMapDao kubernetesClusterNetworkACLItemMapDao;
     @Inject
     public KubernetesClusterAffinityGroupMapDao kubernetesClusterAffinityGroupMapDao;
     @Inject
@@ -613,7 +620,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         if (networkAclId == null) {
             throw new InvalidParameterValueException(String.format("Network ID: %s can not be used for Kubernetes cluster as it does not have a network ACL attached. Attach a network ACL allowing the required traffic to the VPC tier and retry", network.getUuid()));
         }
-        if (networkAclId == NetworkACL.DEFAULT_DENY) {
+        if (Objects.equals(networkAclId, NetworkACL.DEFAULT_DENY)) {
             throw new InvalidParameterValueException(String.format("Network ID: %s can not be used for Kubernetes cluster as it uses default deny ACL", network.getUuid()));
         }
     }
@@ -945,6 +952,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         response.setMinSize(kubernetesCluster.getMinSize());
         response.setMaxSize(kubernetesCluster.getMaxSize());
         response.setClusterType(kubernetesCluster.getClusterType());
+        response.setNetworkRuleOwnershipState(kubernetesCluster.getNetworkRuleOwnershipState());
         response.setCsiEnabled(kubernetesCluster.isCsiEnabled());
         response.setCreated(kubernetesCluster.getCreated());
         setNodeTypeAffinityGroupResponse(response, kubernetesCluster.getId());
@@ -1065,7 +1073,8 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
                         BaseCmd.getCommandNameByClass(UpgradeKubernetesClusterCmd.class),
                         BaseCmd.getCommandNameByClass(AddNodesToKubernetesClusterCmd.class),
                         BaseCmd.getCommandNameByClass(RemoveNodesFromKubernetesClusterCmd.class),
-                        BaseCmd.getCommandNameByClass(ReconcileKubernetesClusterNetworkRulesCmd.class)
+                        BaseCmd.getCommandNameByClass(ReconcileKubernetesClusterNetworkRulesCmd.class),
+                        BaseCmd.getCommandNameByClass(AdoptKubernetesClusterNetworkRulesCmd.class)
                 ).contains(cmdName);
             case ExternalManaged:
                 return Arrays.asList(
@@ -2266,6 +2275,10 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         }
         validateKubernetesClusterScaleParameters(cmd);
         KubernetesClusterVO kubernetesCluster = kubernetesClusterDao.findById(cmd.getId());
+        if ((cmd.getClusterSize() != null && cmd.getClusterSize() != kubernetesCluster.getNodeCount())
+                || CollectionUtils.isNotEmpty(cmd.getNodeIds())) {
+            validateNetworkRuleOwnershipForTopologyMutation(kubernetesCluster);
+        }
         Map<String, ServiceOffering> nodeToOfferingMap = createNodeTypeToServiceOfferingMap(cmd.getServiceOfferingNodeTypeMap(), cmd.getServiceOfferingId(), kubernetesCluster);
 
         String[] keys = getServiceUserKeys(kubernetesCluster);
@@ -2301,9 +2314,44 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         if (!KubernetesCluster.State.Running.equals(cluster.getState())) {
             throw new InvalidParameterValueException(String.format("Kubernetes cluster %s must be running to reconcile its network rules", cluster.getName()));
         }
+        if (!KubernetesClusterNetworkRuleOwnershipState.MANAGED.equals(cluster.getNetworkRuleOwnershipState())) {
+            throw new InvalidParameterValueException(String.format(
+                    "Kubernetes cluster %s network-rule ownership must be adopted before reconciliation",
+                    cluster.getName()));
+        }
 
         KubernetesClusterStartWorker worker = createKubernetesClusterStartWorker(cluster);
         return worker.reconcileKubernetesClusterNetworkRules();
+    }
+
+    @Override
+    @ActionEvent(eventType = KubernetesClusterEventTypes.EVENT_KUBERNETES_CLUSTER_NETWORK_RULES_ADOPT,
+            eventDescription = "adopting Kubernetes cluster network-rule ownership", async = true)
+    public boolean adoptKubernetesClusterNetworkRules(AdoptKubernetesClusterNetworkRulesCmd cmd) throws CloudRuntimeException {
+        if (!KubernetesServiceEnabled.value()) {
+            logAndThrow(Level.ERROR, "Kubernetes Service plugin is disabled");
+        }
+        Account caller = CallContext.current().getCallingAccount();
+        if (caller == null || !accountManager.isRootAdmin(caller.getId())) {
+            throw new PermissionDeniedException("Only a root administrator can adopt Kubernetes cluster network-rule ownership");
+        }
+        KubernetesClusterVO cluster = kubernetesClusterDao.findById(cmd.getId());
+        if (cluster == null || cluster.getRemoved() != null) {
+            throw new InvalidParameterValueException("Invalid Kubernetes cluster ID specified");
+        }
+        if (!KubernetesCluster.ClusterType.CloudManaged.equals(cluster.getClusterType())) {
+            throw new InvalidParameterValueException(String.format(
+                    "Network-rule ownership adoption is not supported for externally managed cluster %s", cluster.getName()));
+        }
+        Set<KubernetesCluster.State> stableStates = EnumSet.of(KubernetesCluster.State.Running,
+                KubernetesCluster.State.Stopped, KubernetesCluster.State.Alert, KubernetesCluster.State.Error);
+        if (!stableStates.contains(cluster.getState())) {
+            throw new InvalidParameterValueException(String.format(
+                    "Kubernetes cluster %s must be in a stable state before network-rule ownership can be adopted", cluster.getName()));
+        }
+
+        KubernetesClusterStartWorker worker = createKubernetesClusterStartWorker(cluster);
+        return worker.adoptKubernetesClusterNetworkRules(cmd.getRuleSpecs());
     }
 
     protected KubernetesClusterStartWorker createKubernetesClusterStartWorker(KubernetesCluster cluster) {
@@ -2494,6 +2542,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
             logAndThrow(Level.ERROR, "Kubernetes Service plugin is disabled");
         }
         KubernetesClusterVO kubernetesCluster = validateCluster(cmd.getClusterId());
+        validateNetworkRuleOwnershipForTopologyMutation(kubernetesCluster);
         long networkId = kubernetesCluster.getNetworkId();
         NetworkVO networkVO = networkDao.findById(networkId);
         List<Long> validNodeIds = validateNodes(cmd.getNodeIds(), networkId, networkVO.getName(), kubernetesCluster, false);
@@ -2512,6 +2561,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
             logAndThrow(Level.ERROR, "Kubernetes Service plugin is disabled");
         }
         KubernetesClusterVO kubernetesCluster = validateCluster(cmd.getClusterId());
+        validateNetworkRuleOwnershipForTopologyMutation(kubernetesCluster);
         List<Long> validNodeIds = validateNodes(cmd.getNodeIds(), null, null, kubernetesCluster, true);
         if (validNodeIds.isEmpty()) {
             throw new CloudRuntimeException("No valid nodes found to be removed from the Kubernetes cluster");
@@ -2527,6 +2577,23 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
             throw new InvalidParameterValueException("Invalid Kubernetes cluster ID specified");
         }
         return kubernetesCluster;
+    }
+
+    protected void validateNetworkRuleOwnershipForTopologyMutation(KubernetesClusterVO kubernetesCluster) {
+        if (!KubernetesCluster.ClusterType.CloudManaged.equals(kubernetesCluster.getClusterType())) {
+            return;
+        }
+        Network network = networkDao.findById(kubernetesCluster.getNetworkId());
+        if (network == null) {
+            throw new InvalidParameterValueException(String.format("Network for Kubernetes cluster %s cannot be found",
+                    kubernetesCluster.getName()));
+        }
+        if (!isDirectAccess(network)
+                && !KubernetesClusterNetworkRuleOwnershipState.MANAGED.equals(kubernetesCluster.getNetworkRuleOwnershipState())) {
+            throw new InvalidParameterValueException(String.format(
+                    "Kubernetes cluster %s network-rule ownership must be adopted before changing its node topology",
+                    kubernetesCluster.getName()));
+        }
     }
 
     private List<Long> validateNodes(List<Long> nodeIds, Long networkId, String networkName, KubernetesCluster cluster,  boolean removeNodes) {
@@ -2790,6 +2857,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         cmdList.add(RemoveNodesFromKubernetesClusterCmd.class);
         cmdList.add(UpdateKubernetesClusterAffinityGroupCmd.class);
         cmdList.add(ReconcileKubernetesClusterNetworkRulesCmd.class);
+        cmdList.add(AdoptKubernetesClusterNetworkRulesCmd.class);
         return cmdList;
     }
 

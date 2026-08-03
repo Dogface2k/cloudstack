@@ -25,22 +25,19 @@ import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.hypervisor.Hypervisor;
 import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterEventTypes;
+import com.cloud.kubernetes.cluster.KubernetesClusterFirewallRuleMapVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
 import com.cloud.kubernetes.cluster.KubernetesClusterService;
 import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.utils.KubernetesClusterUtil;
 import com.cloud.network.IpAddress;
 import com.cloud.network.Network;
-import com.cloud.network.rules.FirewallRule;
-import com.cloud.network.rules.FirewallRuleVO;
-import com.cloud.network.rules.PortForwardingRuleVO;
 import com.cloud.service.ServiceOfferingVO;
 import com.cloud.user.Account;
 import com.cloud.uservm.UserVm;
 import com.cloud.utils.Pair;
 import com.cloud.utils.Ternary;
 import com.cloud.utils.exception.CloudRuntimeException;
-import com.cloud.utils.net.NetUtils;
 import com.cloud.utils.ssh.SshHelper;
 import com.cloud.vm.UserVmVO;
 import org.apache.cloudstack.api.ApiCommandResourceType;
@@ -78,9 +75,9 @@ public class KubernetesClusterAddWorker extends KubernetesClusterActionWorker {
                 throw new CloudRuntimeException(String.format("Failed to find network with id: %s", networkId));
             }
             templateDao.findById(kubernetesCluster.getTemplateId());
-            IpAddress publicIp = null;
+            IpAddress publicIp;
             try {
-                publicIp = getPublicIp(network);
+                publicIp = getPublicIpForNodeAccess(network);
             } catch (ManagementServerException e) {
                 throw new CloudRuntimeException(String.format("Failed to retrieve public IP for the network: %s ", network.getName()));
             }
@@ -223,13 +220,10 @@ public class KubernetesClusterAddWorker extends KubernetesClusterActionWorker {
         int startSshPortNumber = KubernetesClusterActionWorker.CLUSTER_NODES_DEFAULT_START_SSH_PORT + (int) kubernetesCluster.getTotalNodeCount() - kubernetesCluster.getEtcdNodeCount().intValue();
         int sshStartPort = startSshPortNumber + nodeIndex;
         try {
-            if (Objects.isNull(network.getVpcId())) {
-                provisionFirewallRules(publicIp, owner, sshStartPort, sshStartPort);
-            }
-            provisionPublicIpPortForwardingRule(publicIp, network, account, nodeId, sshStartPort, DEFAULT_SSH_PORT);
-            boolean isCompatible = validateNodeCompatibility(publicIp, nodeId, sshStartPort);
+            Pair<String, Integer> nodeAccess = prepareNodeAccess(network, publicIp, account, nodeId, sshStartPort);
+            boolean isCompatible = validateNodeCompatibility(nodeAccess.first(), nodeId, nodeAccess.second());
             if (!isCompatible) {
-                revertNetworkRules(network, nodeId, sshStartPort);
+                revertNetworkRules(network, nodeId);
                 return new Pair<>(false, nodeIndex);
             }
 
@@ -243,20 +237,33 @@ public class KubernetesClusterAddWorker extends KubernetesClusterActionWorker {
             idField.set(rebootVMCmd, nodeId);
             userVmService.rebootVirtualMachine(rebootVMCmd);
             finalNodeIds.add(nodeId);
-        } catch (ResourceUnavailableException | NetworkRuleConflictException | NoSuchFieldException |
+        } catch (ManagementServerException | ResourceUnavailableException | NoSuchFieldException |
                  InsufficientCapacityException | IllegalAccessException e) {
             logger.error(String.format("Failed to activate API port forwarding rules for the Kubernetes cluster : %s", kubernetesCluster.getName()));
             // remove added Firewall and PF rules
-            revertNetworkRules(network, nodeId, sshStartPort);
+            revertNetworkRules(network, nodeId);
             return new Pair<>( false, nodeIndex);
         } catch (Exception e) {
             String errMsg = String.format("Unexpected exception while trying to add the external node %s to the Kubernetes cluster %s: %s",
                     nodeId, kubernetesCluster.getName(), e.getMessage());
             logger.error(errMsg, e);
-            revertNetworkRules(network, nodeId, sshStartPort);
+            revertNetworkRules(network, nodeId);
             throw new CloudRuntimeException(e);
         }
         return new Pair<>(true, ++nodeIndex);
+    }
+
+    protected Pair<String, Integer> prepareNodeAccess(Network network, IpAddress publicIp, Account account,
+            long nodeId, int sshStartPort) throws ManagementServerException, ResourceUnavailableException,
+            NetworkRuleConflictException {
+        if (!manager.isDirectAccess(network)) {
+            if (Objects.isNull(network.getVpcId())) {
+                provisionFirewallRules(publicIp, owner, sshStartPort, sshStartPort,
+                        EXTERNAL_SSH_FIREWALL_ROLE_PREFIX + nodeId);
+            }
+            provisionPublicIpPortForwardingRule(publicIp, network, account, nodeId, sshStartPort, DEFAULT_SSH_PORT);
+        }
+        return getNodeIpSshPort(network, nodeId, publicIp, sshStartPort);
     }
 
     private void updateKubernetesCluster(long clusterId, Ternary<Integer, Long, Long> additionalNodesDetails, boolean manualUpgrade) {
@@ -272,14 +279,14 @@ public class KubernetesClusterAddWorker extends KubernetesClusterActionWorker {
     }
 
 
-    private boolean validateNodeCompatibility(IpAddress publicIp, long nodeId, int nodeSshPort) throws CloudRuntimeException {
+    private boolean validateNodeCompatibility(String nodeIp, long nodeId, int nodeSshPort) throws CloudRuntimeException {
         File pkFile = getManagementServerSshPublicKeyFile();
         try {
             File validateNodeScriptFile = retrieveScriptFile(validateNodeScript);
             Thread.sleep(15*1000);
-            copyScriptFile(publicIp.getAddress().addr(), nodeSshPort, validateNodeScriptFile, validateNodeScript);
+            copyScriptFile(nodeIp, nodeSshPort, validateNodeScriptFile, validateNodeScript);
             String command = String.format("%s%s", scriptPath, validateNodeScript);
-            Pair<Boolean, String> result = SshHelper.sshExecute(publicIp.getAddress().addr(), nodeSshPort, getControlNodeLoginUser(),
+            Pair<Boolean, String> result = SshHelper.sshExecute(nodeIp, nodeSshPort, getControlNodeLoginUser(),
                     pkFile, null, command, 10000, 10000, 10 * 60 * 1000);
             if (Boolean.FALSE.equals(result.first())) {
                 logger.error(String.format("Node with ID: %s cannot be added as a worker node as it does not have " +
@@ -291,14 +298,14 @@ public class KubernetesClusterAddWorker extends KubernetesClusterActionWorker {
             return false;
         }
         UserVmVO userVm = userVmDao.findById(nodeId);
-        cleanupCloudInitSemFolder(userVm, publicIp, pkFile, nodeSshPort);
+        cleanupCloudInitSemFolder(userVm, nodeIp, pkFile, nodeSshPort);
         return true;
     }
 
-    private void cleanupCloudInitSemFolder(UserVm userVm, IpAddress publicIp, File pkFile, int nodeSshPort) {
+    private void cleanupCloudInitSemFolder(UserVm userVm, String nodeIp, File pkFile, int nodeSshPort) {
         try {
             String command = String.format("sudo rm -rf /var/lib/cloud/instances/%s/sem/*", userVm.getUuid());
-            Pair<Boolean, String> result = SshHelper.sshExecute(publicIp.getAddress().addr(), nodeSshPort, getControlNodeLoginUser(),
+            Pair<Boolean, String> result = SshHelper.sshExecute(nodeIp, nodeSshPort, getControlNodeLoginUser(),
                     pkFile, null, command, 10000, 10000, 10 * 60 * 1000);
             if (Boolean.FALSE.equals(result.first())) {
                 logger.error(String.format("Failed to cleanup previous applied userdata on node: %s; This may hamper to addition of the node to the cluster ", userVm.getName()));
@@ -308,49 +315,30 @@ public class KubernetesClusterAddWorker extends KubernetesClusterActionWorker {
         }
     }
 
-    private void revertNetworkRules(Network network, long vmId, int port) {
+    private void revertNetworkRules(Network network, long vmId) {
         logger.debug(String.format("Reverting network rules for VM ID %s on network %s", vmId, network.getName()));
-        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_PORT_FORWARDING_RULE_IDS)) {
-            PortForwardingRuleVO pfRule = portForwardingRulesDao.findById(ruleId);
-            if (pfRule == null || FirewallRule.State.Revoke.equals(pfRule.getState())
-                    || !Objects.equals(pfRule.getVirtualMachineId(), vmId)
-                    || !Objects.equals(pfRule.getNetworkId(), network.getId())
-                    || !Objects.equals(pfRule.getSourcePortStart(), port)
-                    || !Objects.equals(pfRule.getSourcePortEnd(), port)) {
-                continue;
-            }
-            logger.debug("Removing managed port forwarding rule {}", pfRule.getId());
-            if (rulesService.revokePortForwardingRule(pfRule.getId(), true)) {
-                forgetManagedNetworkRuleId(MANAGED_PORT_FORWARDING_RULE_IDS, pfRule.getId());
+        if (manager.isDirectAccess(network)) {
+            return;
+        }
+        KubernetesClusterFirewallRuleMapVO portForwardingOwnership = kubernetesClusterFirewallRuleMapDao.findByClusterIdAndLogicalRole(
+                kubernetesCluster.getId(), SSH_PORT_FORWARD_ROLE_PREFIX + vmId);
+        if (portForwardingOwnership != null) {
+            try {
+                deleteManagedPortForwardingRule(portForwardingOwnership);
+            } catch (ResourceUnavailableException e) {
+                logger.warn("Failed to revert the managed port forwarding rule for VM {} in Kubernetes cluster {}",
+                        vmId, kubernetesCluster.getName(), e);
             }
         }
         if (Objects.isNull(network.getVpcId())) {
-            IpAddress publicIp;
-            try {
-                publicIp = getPublicIp(network);
-            } catch (ManagementServerException e) {
-                logger.warn("Cannot identify the public IP while reverting network rules for Kubernetes cluster {}", kubernetesCluster.getName(), e);
-                return;
-            }
-            for (Long ruleId : getManagedNetworkRuleIds(MANAGED_FIREWALL_RULE_IDS)) {
-                FirewallRuleVO ruleVO = firewallRulesDao.findById(ruleId);
-                if (ruleVO == null || FirewallRule.State.Revoke.equals(ruleVO.getState())
-                        || !Objects.equals(ruleVO.getSourceIpAddressId(), publicIp.getId())
-                        || !Objects.equals(ruleVO.getSourcePortStart(), port)
-                        || !Objects.equals(ruleVO.getSourcePortEnd(), port)
-                        || !NetUtils.TCP_PROTO.equalsIgnoreCase(ruleVO.getProtocol())
-                        || !FirewallRule.Purpose.Firewall.equals(ruleVO.getPurpose())) {
-                    continue;
-                }
-                boolean portForwardingStillUsesPort = portForwardingRulesDao.listByIpAndNotRevoked(publicIp.getId()).stream()
-                        .anyMatch(pfRule -> Objects.equals(pfRule.getNetworkId(), network.getId())
-                                && pfRule.getSourcePortStart() <= port && pfRule.getSourcePortEnd() >= port);
-                if (portForwardingStillUsesPort) {
-                    continue;
-                }
-                logger.debug("Removing managed firewall rule {}", ruleVO.getId());
-                if (firewallService.revokeIngressFirewallRule(ruleVO.getId(), true)) {
-                    forgetManagedNetworkRuleId(MANAGED_FIREWALL_RULE_IDS, ruleVO.getId());
+            KubernetesClusterFirewallRuleMapVO firewallOwnership = kubernetesClusterFirewallRuleMapDao.findByClusterIdAndLogicalRole(
+                    kubernetesCluster.getId(), EXTERNAL_SSH_FIREWALL_ROLE_PREFIX + vmId);
+            if (firewallOwnership != null) {
+                try {
+                    deleteManagedFirewallRule(firewallOwnership);
+                } catch (ResourceUnavailableException e) {
+                    logger.warn("Failed to revert the managed firewall rule for VM {} in Kubernetes cluster {}",
+                            vmId, kubernetesCluster.getName(), e);
                 }
             }
         }

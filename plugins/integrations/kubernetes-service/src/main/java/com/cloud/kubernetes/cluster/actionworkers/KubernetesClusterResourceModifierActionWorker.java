@@ -25,10 +25,14 @@ import static com.cloud.utils.NumbersUtil.toHumanReadableSize;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -73,7 +77,11 @@ import com.cloud.host.HostVO;
 import com.cloud.host.dao.HostDao;
 import com.cloud.hypervisor.Hypervisor;
 import com.cloud.kubernetes.cluster.KubernetesCluster;
+import com.cloud.kubernetes.cluster.KubernetesClusterFirewallRuleMapVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkACLItemMapVO;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleLifecycleState;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleRole;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.network.IpAddress;
@@ -86,12 +94,13 @@ import com.cloud.network.lb.LoadBalancingRulesService;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.FirewallRuleVO;
 import com.cloud.network.rules.LoadBalancer;
-import com.cloud.network.rules.PortForwardingRuleVO;
 import com.cloud.network.vpc.NetworkACL;
 import com.cloud.network.vpc.NetworkACLItem;
 import com.cloud.network.vpc.NetworkACLItemDao;
 import com.cloud.network.vpc.NetworkACLItemVO;
 import com.cloud.network.vpc.NetworkACLService;
+import com.cloud.network.vpc.NetworkACLVO;
+import com.cloud.network.vpc.dao.NetworkACLDao;
 import com.cloud.offering.ServiceOffering;
 import com.cloud.resource.ResourceManager;
 import com.cloud.storage.Volume;
@@ -104,6 +113,7 @@ import com.cloud.uservm.UserVm;
 import com.cloud.utils.Pair;
 import com.cloud.utils.component.ComponentContext;
 import com.cloud.utils.db.TransactionCallback;
+import com.cloud.utils.db.TransactionCallbackWithException;
 import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.utils.ssh.SshHelper;
@@ -129,6 +139,8 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
     protected NetworkACLService networkACLService;
     @Inject
     protected  NetworkACLItemDao networkACLItemDao;
+    @Inject
+    protected NetworkACLDao networkACLDao;
     @Inject
     protected LoadBalancingRulesService lbService;
     @Inject
@@ -491,166 +503,95 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
     protected void provisionSshPortForwardingRules(IpAddress publicIp, Network network, Account account,
             List<Long> clusterVMIds, Map<Long, Integer> vmIdPortMap) throws ResourceUnavailableException,
             NetworkRuleConflictException {
-        if (!CollectionUtils.isEmpty(clusterVMIds)) {
-            int defaultNodesCount = clusterVMIds.size() - vmIdPortMap.size();
-            int sourcePort = CLUSTER_NODES_DEFAULT_START_SSH_PORT;
-            for (int i = 0; i < defaultNodesCount; ++i) {
-                sourcePort = CLUSTER_NODES_DEFAULT_START_SSH_PORT + i;
-                provisionPublicIpPortForwardingRule(publicIp, network, account, clusterVMIds.get(i), sourcePort, DEFAULT_SSH_PORT);
+        if (CollectionUtils.isEmpty(clusterVMIds)) {
+            return;
+        }
+        Map<Long, Integer> explicitPorts = vmIdPortMap == null ? Collections.emptyMap() : vmIdPortMap;
+        Set<Integer> reservedPorts = new HashSet<>();
+        for (Map.Entry<Long, Integer> entry : explicitPorts.entrySet()) {
+            Integer port = entry.getValue();
+            if (port == null || port < CLUSTER_NODES_DEFAULT_START_SSH_PORT || port > NetUtils.PORT_RANGE_MAX) {
+                throw new NetworkRuleConflictException(String.format("Invalid SSH public port configured for VM %d", entry.getKey()));
             }
-            for (int i = defaultNodesCount; i < clusterVMIds.size(); ++i) {
-                sourcePort += 1;
-                provisionPublicIpPortForwardingRule(publicIp, network, account, clusterVMIds.get(i), sourcePort, DEFAULT_SSH_PORT);
+            if (!reservedPorts.add(port)) {
+                throw new NetworkRuleConflictException(String.format("SSH public port %d is assigned to more than one VM", port));
             }
         }
-    }
 
-    protected FirewallRule removeApiFirewallRule(final IpAddress publicIp) {
-        FirewallRule rule = null;
-        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_FIREWALL_RULE_IDS)) {
-            FirewallRuleVO firewallRule = firewallRulesDao.findById(ruleId);
-            if (firewallRule == null || FirewallRule.State.Revoke.equals(firewallRule.getState())
-                    || !Objects.equals(firewallRule.getSourceIpAddressId(), publicIp.getId())
-                    || !FirewallRule.Purpose.Firewall.equals(firewallRule.getPurpose())
-                    || !NetUtils.TCP_PROTO.equalsIgnoreCase(firewallRule.getProtocol())) {
-                continue;
+        int nextDefaultPort = CLUSTER_NODES_DEFAULT_START_SSH_PORT;
+        Set<Long> processedVmIds = new HashSet<>();
+        for (Long vmId : clusterVMIds) {
+            if (vmId == null || !processedVmIds.add(vmId)) {
+                throw new NetworkRuleConflictException("Kubernetes cluster VM list contains a missing or duplicate VM id");
             }
-            Integer startPort = firewallRule.getSourcePortStart();
-            Integer endPort = firewallRule.getSourcePortEnd();
-            if (startPort != null && startPort == CLUSTER_API_PORT &&
-                endPort != null && endPort == CLUSTER_API_PORT) {
-                if (firewallService.revokeIngressFwRule(firewallRule.getId(), true)) {
-                    rule = firewallRule;
-                    forgetManagedNetworkRuleId(MANAGED_FIREWALL_RULE_IDS, firewallRule.getId());
+            Integer sourcePort = explicitPorts.get(vmId);
+            if (sourcePort == null) {
+                while (reservedPorts.contains(nextDefaultPort)) {
+                    nextDefaultPort++;
                 }
-                logger.debug("The API firewall rule [%s] with the id [%s] was revoked",firewallRule.getName(),firewallRule.getId());
-                break;
-            }
-        }
-        return rule;
-    }
-
-    protected FirewallRule removeSshFirewallRule(final IpAddress publicIp, final long networkId) {
-        FirewallRule rule = null;
-        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_FIREWALL_RULE_IDS)) {
-            FirewallRuleVO firewallRule = firewallRulesDao.findById(ruleId);
-            if (firewallRule == null || FirewallRule.State.Revoke.equals(firewallRule.getState())
-                    || !Objects.equals(firewallRule.getSourceIpAddressId(), publicIp.getId())
-                    || !FirewallRule.Purpose.Firewall.equals(firewallRule.getPurpose())
-                    || !NetUtils.TCP_PROTO.equalsIgnoreCase(firewallRule.getProtocol())) {
-                continue;
-            }
-            boolean hasManagedSshForwardingRule = getManagedNetworkRuleIds(MANAGED_PORT_FORWARDING_RULE_IDS).stream()
-                    .map(portForwardingRulesDao::findById)
-                    .filter(Objects::nonNull)
-                    .anyMatch(pfRule -> !FirewallRule.State.Revoke.equals(pfRule.getState())
-                            && Objects.equals(pfRule.getSourceIpAddressId(), publicIp.getId())
-                            && Objects.equals(pfRule.getNetworkId(), networkId)
-                            && Objects.equals(pfRule.getSourcePortStart(), firewallRule.getSourcePortStart())
-                            && Objects.equals(pfRule.getSourcePortEnd(), firewallRule.getSourcePortEnd())
-                            && Objects.equals(pfRule.getDestinationPortStart(), DEFAULT_SSH_PORT));
-            if (Objects.equals(firewallRule.getSourcePortStart(), CLUSTER_NODES_DEFAULT_START_SSH_PORT) || hasManagedSshForwardingRule) {
-                if (firewallService.revokeIngressFwRule(firewallRule.getId(), true)) {
-                    rule = firewallRule;
-                    forgetManagedNetworkRuleId(MANAGED_FIREWALL_RULE_IDS, firewallRule.getId());
+                if (nextDefaultPort > NetUtils.PORT_RANGE_MAX) {
+                    throw new NetworkRuleConflictException("No public SSH port is available for the Kubernetes cluster");
                 }
-                logger.debug("The SSH firewall rule {} with the id {} was revoked", firewallRule.getName(), firewallRule.getId());
-                break;
+                sourcePort = nextDefaultPort++;
             }
-        }
-        return rule;
-    }
-
-    protected void removePortForwardingRules(final IpAddress publicIp, final Network network, final Account account, final List<Long> removedVMIds) throws ResourceUnavailableException {
-        if (!CollectionUtils.isEmpty(removedVMIds)) {
-            List<PortForwardingRuleVO> revokedRules = new ArrayList<>();
-            List<Long> revokedRuleIds = new ArrayList<>();
-            for (Long vmId : removedVMIds) {
-                for (Long ruleId : getManagedNetworkRuleIds(MANAGED_PORT_FORWARDING_RULE_IDS)) {
-                    PortForwardingRuleVO pfRule = portForwardingRulesDao.findById(ruleId);
-                    if (pfRule == null
-                            || !Objects.equals(pfRule.getSourceIpAddressId(), publicIp.getId())
-                            || !Objects.equals(pfRule.getNetworkId(), network.getId())
-                            || !Objects.equals(pfRule.getAccountId(), account.getId())) {
-                        continue;
-                    }
-                    if (pfRule.getVirtualMachineId() == vmId) {
-                        logger.trace("Marking PF rule {} with Revoke state", pfRule);
-                        pfRule.setState(FirewallRule.State.Revoke);
-                        revokedRules.add(pfRule);
-                        revokedRuleIds.add(pfRule.getId());
-                        logger.debug("The Port forwarding rule {} with the id {} was removed.", pfRule.getName(), pfRule.getId());
-                        break;
-                    }
-                }
-            }
-            if (firewallManager.applyRules(revokedRules, false, true)) {
-                revokedRuleIds.forEach(id -> forgetManagedNetworkRuleId(MANAGED_PORT_FORWARDING_RULE_IDS, id));
-            }
+            provisionPublicIpPortForwardingRule(publicIp, network, account, vmId, sourcePort, DEFAULT_SSH_PORT);
         }
     }
 
-    protected void removePortForwardingRules(final IpAddress publicIp, final Network network, final Account account, int startPort, int endPort)
+    protected void deleteManagedLoadBalancerRule(KubernetesClusterFirewallRuleMapVO mapping, Network network)
             throws ResourceUnavailableException {
-        List<PortForwardingRuleVO> pfRules = new ArrayList<>();
-        List<Long> revokedRuleIds = new ArrayList<>();
-        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_PORT_FORWARDING_RULE_IDS)) {
-            PortForwardingRuleVO pfRule = portForwardingRulesDao.findById(ruleId);
-            if (pfRule == null
-                    || !Objects.equals(pfRule.getSourceIpAddressId(), publicIp.getId())
-                    || !Objects.equals(pfRule.getNetworkId(), network.getId())
-                    || !Objects.equals(pfRule.getAccountId(), account.getId())) {
-                continue;
-            }
-            if (startPort <= pfRule.getSourcePortStart() && pfRule.getSourcePortStart() <= endPort) {
-                logger.debug("The Port forwarding rule [{}] with the id [{}] was mark as revoked.", pfRule.getName(), pfRule.getId());
-                pfRule.setState(FirewallRule.State.Revoke);
-                revokedRuleIds.add(pfRule.getId());
-                pfRules.add(pfRule);
-            }
+        markManagedFirewallRulePendingDelete(mapping.getFirewallRuleId());
+        LoadBalancerVO rule = loadBalancerDao.findById(mapping.getFirewallRuleId());
+        if (rule != null && !lbService.deleteLoadBalancerRule(rule.getId(), true)) {
+            throw new ResourceUnavailableException("Failed to remove the Kubernetes cluster load balancing rule", Network.class, network.getId());
         }
-        if (firewallManager.applyRules(pfRules, false, true)) {
-            revokedRuleIds.forEach(id -> forgetManagedNetworkRuleId(MANAGED_PORT_FORWARDING_RULE_IDS, id));
+        FirewallRuleVO removedRule = firewallRulesDao.findByIdIncludingRemoved(mapping.getFirewallRuleId());
+        if (removedRule != null && removedRule.getRemoved() == null) {
+            throw new ResourceUnavailableException("Kubernetes cluster load balancing rule removal was not confirmed", Network.class, network.getId());
         }
+        forgetManagedFirewallRule(mapping);
     }
 
-    protected void removeLoadBalancingRule(final IpAddress publicIp, final Network network,
-            final Account account) throws ResourceUnavailableException {
-        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_LOAD_BALANCER_RULE_IDS)) {
-            LoadBalancerVO lbRule = loadBalancerDao.findById(ruleId);
-            if (lbRule == null || FirewallRule.State.Revoke.equals(lbRule.getState()) || !Objects.equals(lbRule.getSourceIpAddressId(), publicIp.getId())) {
-                continue;
-            }
-            if (Objects.equals(lbRule.getNetworkId(), network.getId()) && lbRule.getAccountId() == account.getId()
-                    && lbRule.getSourcePortStart() == CLUSTER_API_PORT && lbRule.getSourcePortEnd() == CLUSTER_API_PORT
-                    && lbRule.getDefaultPortStart() == CLUSTER_API_PORT && lbRule.getDefaultPortEnd() == CLUSTER_API_PORT
-                    && NetUtils.TCP_PROTO.equalsIgnoreCase(lbRule.getProtocol())
-                    && NetUtils.TCP_PROTO.equalsIgnoreCase(lbRule.getLbProtocol())
-                    && "api-lb".equals(lbRule.getName()) && "roundrobin".equalsIgnoreCase(lbRule.getAlgorithm())) {
-                if (lbService.deleteLoadBalancerRule(lbRule.getId(), true)) {
-                    forgetManagedNetworkRuleId(MANAGED_LOAD_BALANCER_RULE_IDS, lbRule.getId());
-                }
-                logger.debug("The load balancing rule with the Id: {} was removed",lbRule.getId());
-            }
-        }
-    }
-
-    protected void provisionVpcTierAllowPortACLRule(final Network network, int startPort, int endPorts)
+    protected void provisionVpcTierAllowPortACLRule(final Network network, int startPort, int endPorts, String logicalRole)
             throws ResourceUnavailableException, NetworkRuleConflictException {
-        List<NetworkACLItemVO> aclItems = networkACLItemDao.listByACL(network.getNetworkACLId());
+        Network effectiveNetwork = networkDao.findById(network.getId());
+        if (effectiveNetwork == null) {
+            throw new ResourceUnavailableException("Kubernetes cluster network no longer exists", Network.class, network.getId());
+        }
+        Long networkAclId = effectiveNetwork.getNetworkACLId();
+        if (networkAclId == null) {
+            throw new NetworkRuleConflictException(String.format("VPC tier %s does not have a network ACL attached", effectiveNetwork.getName()));
+        }
+        boolean sharedAcl = networkDao.listByAclId(networkAclId).stream()
+                .anyMatch(attachedNetwork -> attachedNetwork.getId() != effectiveNetwork.getId());
+        if (sharedAcl) {
+            throw new NetworkRuleConflictException(String.format("Network ACL %d is shared by multiple VPC tiers and cannot contain Kubernetes cluster-owned rules",
+                    networkAclId));
+        }
+        List<NetworkACLItemVO> aclItems = networkACLItemDao.listByACL(networkAclId);
         aclItems = aclItems.stream().filter(networkACLItem -> !NetworkACLItem.State.Revoke.equals(networkACLItem.getState())).collect(Collectors.toList());
-        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_NETWORK_ACL_ITEM_IDS)) {
-            NetworkACLItemVO ownedRule = networkACLItemDao.findById(ruleId);
-            if (ownedRule != null && !NetworkACLItem.State.Revoke.equals(ownedRule.getState())
-                    && Objects.equals(ownedRule.getAclId(), network.getNetworkACLId())
+        KubernetesClusterNetworkACLItemMapVO existingMapping = kubernetesClusterNetworkACLItemMapDao.findByClusterIdAndLogicalRole(
+                kubernetesCluster.getId(), logicalRole);
+        if (existingMapping != null) {
+            NetworkACLItemVO ownedRule = networkACLItemDao.findById(existingMapping.getNetworkAclItemId());
+            boolean desiredRule = ownedRule != null && !NetworkACLItem.State.Revoke.equals(ownedRule.getState())
+                    && Objects.equals(ownedRule.getAclId(), networkAclId)
                     && Objects.equals(ownedRule.getSourcePortStart(), startPort)
                     && Objects.equals(ownedRule.getSourcePortEnd(), endPorts)
                     && NetUtils.TCP_PROTO.equalsIgnoreCase(ownedRule.getProtocol())
                     && NetworkACLItem.TrafficType.Ingress.equals(ownedRule.getTrafficType())
-                    && NetworkACLItem.Action.Allow.equals(ownedRule.getAction())) {
-                networkACLService.applyNetworkACL(ownedRule.getAclId());
+                    && NetworkACLItem.Action.Allow.equals(ownedRule.getAction())
+                    && ownedRule.getSourceCidrList() != null
+                    && ownedRule.getSourceCidrList().size() == 2
+                    && new HashSet<>(ownedRule.getSourceCidrList()).equals(Set.of(NetUtils.ALL_IP4_CIDRS, NetUtils.ALL_IP6_CIDRS));
+            if (desiredRule && existingMapping.getLifecycleState() != KubernetesClusterNetworkRuleLifecycleState.PENDING_DELETE) {
+                if (!networkACLService.applyNetworkACL(ownedRule.getAclId())) {
+                    throw new ResourceUnavailableException("Failed to apply the Kubernetes cluster network ACL item", Network.class, network.getId());
+                }
+                activateManagedNetworkAclItem(ownedRule.getId());
                 return;
             }
+            deleteManagedNetworkAclItem(existingMapping, effectiveNetwork);
         }
         for (NetworkACLItemVO aclItem : aclItems) {
             List<String> sourceCidrs = aclItem.getSourceCidrList();
@@ -662,9 +603,8 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
                     && sourceCidrs != null && sourceCidrs.contains(NetUtils.ALL_IP4_CIDRS)
                     && sourceCidrs.contains(NetUtils.ALL_IP6_CIDRS);
             if (desiredRule) {
-                logger.warn("Leaving unowned matching network ACL item {} in place for legacy Kubernetes cluster {}; explicit ownership migration is required before cleanup",
-                        aclItem.getId(), kubernetesCluster.getName());
-                return;
+                throw new NetworkRuleConflictException(String.format("Matching network ACL item %d is not owned by Kubernetes cluster %s",
+                        aclItem.getId(), kubernetesCluster.getName()));
             }
         }
         CreateNetworkACLCmd networkACLRule = new CreateNetworkACLCmd();
@@ -678,44 +618,155 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
 
         networkACLRule.setTrafficType(NetworkACLItem.TrafficType.Ingress.toString());
 
-        networkACLRule.setNetworkId(network.getId());
+        networkACLRule.setNetworkId(effectiveNetwork.getId());
 
-        networkACLRule.setAclId(network.getNetworkACLId());
+        networkACLRule.setAclId(networkAclId);
 
         networkACLRule.setAction(NetworkACLItem.Action.Allow.toString());
 
-        NetworkACLItem aclRule = networkACLService.createNetworkACLItem(networkACLRule);
-        recordManagedNetworkRuleId(MANAGED_NETWORK_ACL_ITEM_IDS, aclRule.getId());
+        CreateNetworkACLCmd finalNetworkACLRule = networkACLRule;
+        NetworkACLItem aclRule = Transaction.execute((TransactionCallback<NetworkACLItem>) status -> {
+            lockClusterForNetworkRuleMutation();
+            NetworkACLItem rule = networkACLService.createNetworkACLItem(finalNetworkACLRule);
+            recordManagedNetworkAclItem(rule.getId(), logicalRole);
+            return rule;
+        });
         networkACLService.moveRuleToTheTopInACLList(aclRule);
-        networkACLService.applyNetworkACL(aclRule.getAclId());
+        if (!networkACLService.applyNetworkACL(aclRule.getAclId())) {
+            throw new ResourceUnavailableException("Failed to apply the Kubernetes cluster network ACL item", Network.class, effectiveNetwork.getId());
+        }
+        activateManagedNetworkAclItem(aclRule.getId());
     }
 
-    protected void removeVpcTierAllowPortACLRule(final Network network, int startPort, int endPort) throws ResourceUnavailableException {
-        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_NETWORK_ACL_ITEM_IDS)) {
-            NetworkACLItemVO aclItem = networkACLItemDao.findById(ruleId);
-            if (aclItem == null || NetworkACLItem.State.Revoke.equals(aclItem.getState())
-                    || !Objects.equals(aclItem.getAclId(), network.getNetworkACLId())) {
-                continue;
-            }
-            if (NetUtils.TCP_PROTO.equalsIgnoreCase(aclItem.getProtocol())
-                    && Objects.equals(aclItem.getSourcePortStart(), startPort)
-                    && Objects.equals(aclItem.getSourcePortEnd(), endPort)
-                    && NetworkACLItem.TrafficType.Ingress.equals(aclItem.getTrafficType())
-                    && NetworkACLItem.Action.Allow.equals(aclItem.getAction())) {
-                if (networkACLService.revokeNetworkACLItem(aclItem.getId())) {
-                    forgetManagedNetworkRuleId(MANAGED_NETWORK_ACL_ITEM_IDS, aclItem.getId());
-                }
-            }
+    protected void deleteManagedNetworkAclItem(KubernetesClusterNetworkACLItemMapVO mapping, Network network)
+            throws ResourceUnavailableException {
+        validateManagedNetworkAclItemMapping(mapping, network);
+        markManagedNetworkAclItemPendingDelete(mapping.getNetworkAclItemId());
+        NetworkACLItemVO item = networkACLItemDao.findById(mapping.getNetworkAclItemId());
+        if (item != null && !networkACLService.revokeNetworkACLItem(item.getId())) {
+            throw new ResourceUnavailableException("Failed to remove the Kubernetes cluster network ACL item", Network.class, network.getId());
         }
+        if (networkACLItemDao.findById(mapping.getNetworkAclItemId()) != null) {
+            throw new ResourceUnavailableException("Kubernetes cluster network ACL item removal was not confirmed", Network.class, network.getId());
+        }
+        forgetManagedNetworkAclItem(mapping);
+    }
+
+    protected void validateManagedFirewallRuleMapping(KubernetesClusterFirewallRuleMapVO mapping, Network network) {
+        KubernetesClusterNetworkRuleRole role = KubernetesClusterNetworkRuleRole.fromLogicalRole(mapping.getLogicalRole());
+        if (KubernetesClusterNetworkRuleRole.ResourceType.NETWORK_ACL_ITEM.equals(role.getResourceType())) {
+            throw new CloudRuntimeException(String.format("Network ACL role %s is stored as firewall-rule ownership", mapping.getLogicalRole()));
+        }
+        role.getVmId(mapping.getLogicalRole());
+        FirewallRuleVO rule = firewallRulesDao.findById(mapping.getFirewallRuleId());
+        if (rule == null) {
+            return;
+        }
+        FirewallRule.Purpose expectedPurpose;
+        switch (role.getResourceType()) {
+            case FIREWALL:
+                expectedPurpose = FirewallRule.Purpose.Firewall;
+                break;
+            case PORT_FORWARDING:
+                expectedPurpose = FirewallRule.Purpose.PortForwarding;
+                break;
+            case LOAD_BALANCER:
+                expectedPurpose = FirewallRule.Purpose.LoadBalancing;
+                break;
+            default:
+                throw new CloudRuntimeException(String.format("Unsupported firewall-rule resource type %s", role.getResourceType()));
+        }
+        if (!expectedPurpose.equals(rule.getPurpose())
+                || !Objects.equals(rule.getNetworkId(), network.getId())
+                || rule.getAccountId() != kubernetesCluster.getAccountId()
+                || rule.getDomainId() != kubernetesCluster.getDomainId()) {
+            throw new CloudRuntimeException(String.format(
+                    "Managed rule %d for role %s does not belong to Kubernetes cluster %s; refusing deletion",
+                    rule.getId(), mapping.getLogicalRole(), kubernetesCluster.getName()));
+        }
+    }
+
+    protected void validateManagedNetworkAclItemMapping(KubernetesClusterNetworkACLItemMapVO mapping, Network network) {
+        KubernetesClusterNetworkRuleRole role = KubernetesClusterNetworkRuleRole.fromLogicalRole(mapping.getLogicalRole());
+        if (!KubernetesClusterNetworkRuleRole.ResourceType.NETWORK_ACL_ITEM.equals(role.getResourceType())) {
+            throw new CloudRuntimeException(String.format("Firewall-rule role %s is stored as network ACL ownership", mapping.getLogicalRole()));
+        }
+        role.getVmId(mapping.getLogicalRole());
+        NetworkACLItemVO item = networkACLItemDao.findById(mapping.getNetworkAclItemId());
+        if (item == null) {
+            return;
+        }
+        NetworkACLVO acl = networkACLDao.findById(item.getAclId());
+        if (acl == null || !Objects.equals(acl.getVpcId(), network.getVpcId())) {
+            throw new CloudRuntimeException(String.format(
+                    "Managed network ACL item %d for role %s does not belong to Kubernetes cluster %s VPC; refusing deletion",
+                    item.getId(), mapping.getLogicalRole(), kubernetesCluster.getName()));
+        }
+        if (networkDao.listByAclId(item.getAclId()).stream()
+                .anyMatch(attachedNetwork -> attachedNetwork.getId() != network.getId())) {
+            throw new CloudRuntimeException(String.format(
+                    "Managed network ACL item %d for role %s is attached to another VPC tier; refusing deletion",
+                    item.getId(), mapping.getLogicalRole()));
+        }
+    }
+
+    protected void deleteManagedFirewallRuleByRole(KubernetesClusterFirewallRuleMapVO mapping, Network network)
+            throws ResourceUnavailableException {
+        KubernetesClusterNetworkRuleRole role = KubernetesClusterNetworkRuleRole.fromLogicalRole(mapping.getLogicalRole());
+        switch (role.getResourceType()) {
+            case FIREWALL:
+                deleteManagedFirewallRule(mapping);
+                break;
+            case PORT_FORWARDING:
+                deleteManagedPortForwardingRule(mapping);
+                break;
+            case LOAD_BALANCER:
+                deleteManagedLoadBalancerRule(mapping, network);
+                break;
+            default:
+                throw new CloudRuntimeException(String.format("Unsupported firewall-rule ownership role %s", mapping.getLogicalRole()));
+        }
+    }
+
+    protected void deleteManagedNetworkRulesNotIn(Set<String> desiredRoles, Network network) throws ManagementServerException {
+        List<KubernetesClusterFirewallRuleMapVO> allFirewallMappings = kubernetesClusterFirewallRuleMapDao.listByClusterId(kubernetesCluster.getId());
+        List<KubernetesClusterNetworkACLItemMapVO> allAclMappings = kubernetesClusterNetworkACLItemMapDao.listByClusterId(kubernetesCluster.getId());
+        allFirewallMappings.forEach(mapping -> validateManagedFirewallRuleMapping(mapping, network));
+        allAclMappings.forEach(mapping -> validateManagedNetworkAclItemMapping(mapping, network));
+        List<KubernetesClusterFirewallRuleMapVO> firewallMappings = allFirewallMappings.stream()
+                .filter(mapping -> !desiredRoles.contains(mapping.getLogicalRole()))
+                .sorted(Comparator.comparingLong(KubernetesClusterFirewallRuleMapVO::getId))
+                .collect(Collectors.toList());
+        List<KubernetesClusterNetworkACLItemMapVO> aclMappings = allAclMappings.stream()
+                .filter(mapping -> !desiredRoles.contains(mapping.getLogicalRole()))
+                .sorted(Comparator.comparingLong(KubernetesClusterNetworkACLItemMapVO::getId))
+                .collect(Collectors.toList());
+        try {
+            for (KubernetesClusterFirewallRuleMapVO mapping : firewallMappings) {
+                deleteManagedFirewallRuleByRole(mapping, network);
+            }
+            for (KubernetesClusterNetworkACLItemMapVO mapping : aclMappings) {
+                deleteManagedNetworkAclItem(mapping, network);
+            }
+        } catch (ResourceUnavailableException e) {
+            throw new ManagementServerException(String.format("Failed to remove stale managed network rules for Kubernetes cluster %s",
+                    kubernetesCluster.getName()), e);
+        }
+    }
+
+    protected void deleteAllManagedNetworkRules(Network network) throws ManagementServerException {
+        deleteManagedNetworkRulesNotIn(Collections.emptySet(), network);
     }
 
     protected void provisionLoadBalancerRule(final IpAddress publicIp, final Network network,
             final Account account, final List<Long> clusterVMIds, final int port) throws NetworkRuleConflictException,
             InsufficientAddressCapacityException, ResourceUnavailableException {
         LoadBalancer lb = null;
-        for (Long ruleId : getManagedNetworkRuleIds(MANAGED_LOAD_BALANCER_RULE_IDS)) {
-            LoadBalancerVO ownedRule = loadBalancerDao.findById(ruleId);
-            if (ownedRule != null && !FirewallRule.State.Revoke.equals(ownedRule.getState())
+        KubernetesClusterFirewallRuleMapVO existingMapping = kubernetesClusterFirewallRuleMapDao.findByClusterIdAndLogicalRole(
+                kubernetesCluster.getId(), API_LOAD_BALANCER_ROLE);
+        if (existingMapping != null) {
+            LoadBalancerVO ownedRule = loadBalancerDao.findById(existingMapping.getFirewallRuleId());
+            boolean desiredRule = ownedRule != null && !FirewallRule.State.Revoke.equals(ownedRule.getState())
                     && Objects.equals(ownedRule.getSourceIpAddressId(), publicIp.getId())
                     && Objects.equals(ownedRule.getSourcePortStart(), port)
                     && Objects.equals(ownedRule.getSourcePortEnd(), port)
@@ -723,12 +774,15 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
                     && Objects.equals(ownedRule.getDefaultPortEnd(), port)
                     && Objects.equals(ownedRule.getNetworkId(), network.getId())
                     && ownedRule.getAccountId() == account.getId()
+                    && ownedRule.getDomainId() == account.getDomainId()
                     && NetUtils.TCP_PROTO.equalsIgnoreCase(ownedRule.getProtocol())
                     && NetUtils.TCP_PROTO.equalsIgnoreCase(ownedRule.getLbProtocol())
                     && "api-lb".equals(ownedRule.getName())
-                    && "roundrobin".equalsIgnoreCase(ownedRule.getAlgorithm())) {
+                    && "roundrobin".equalsIgnoreCase(ownedRule.getAlgorithm());
+            if (desiredRule && existingMapping.getLifecycleState() != KubernetesClusterNetworkRuleLifecycleState.PENDING_DELETE) {
                 lb = ownedRule;
-                break;
+            } else {
+                deleteManagedLoadBalancerRule(existingMapping, network);
             }
         }
         if (lb == null) {
@@ -738,13 +792,13 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
                     boolean desiredRule = existingRule.getSourcePortStart() == port && existingRule.getSourcePortEnd() == port
                             && existingRule.getDefaultPortStart() == port && existingRule.getDefaultPortEnd() == port
                             && Objects.equals(existingRule.getNetworkId(), network.getId()) && existingRule.getAccountId() == account.getId()
+                            && existingRule.getDomainId() == account.getDomainId()
                             && NetUtils.TCP_PROTO.equalsIgnoreCase(existingRule.getProtocol())
                             && NetUtils.TCP_PROTO.equalsIgnoreCase(existingRule.getLbProtocol())
                             && "api-lb".equals(existingRule.getName()) && "roundrobin".equalsIgnoreCase(existingRule.getAlgorithm());
                     if (desiredRule) {
-                        logger.warn("Leaving unowned matching load balancer rule {} in place for legacy Kubernetes cluster {}; explicit ownership migration is required before cleanup",
-                                existingRule.getId(), kubernetesCluster.getName());
-                        return;
+                        throw new NetworkRuleConflictException(String.format("Matching load balancing rule %d is not owned by Kubernetes cluster %s",
+                                existingRule.getId(), kubernetesCluster.getName()));
                     }
                     throw new NetworkRuleConflictException(String.format("A matching load balancing rule %d is not owned by Kubernetes cluster %s",
                             existingRule.getId(), kubernetesCluster.getName()));
@@ -752,14 +806,23 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
             }
         }
         if (lb == null) {
-            lb = lbService.createPublicLoadBalancerRule(null, "api-lb", "LB rule for API access",
-                    port, port, port, port,
-                    publicIp.getId(), NetUtils.TCP_PROTO, "roundrobin", network.getId(),
-                    account.getId(), false, NetUtils.TCP_PROTO, true);
-            recordManagedNetworkRuleId(MANAGED_LOAD_BALANCER_RULE_IDS, lb.getId());
+            try {
+                lb = Transaction.execute((TransactionCallbackWithException<LoadBalancer, Exception>) status -> {
+                    lockClusterForNetworkRuleMutation();
+                    LoadBalancer created = lbService.createPublicLoadBalancerRule(null, "api-lb", "LB rule for API access",
+                            port, port, port, port, publicIp.getId(), NetUtils.TCP_PROTO, "roundrobin", network.getId(),
+                            account.getId(), false, NetUtils.TCP_PROTO, true);
+                    recordManagedFirewallRule(created.getId(), API_LOAD_BALANCER_ROLE);
+                    return created;
+                });
+            } catch (NetworkRuleConflictException | InsufficientAddressCapacityException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new CloudRuntimeException("Failed to create the Kubernetes cluster load balancing rule ownership atomically", e);
+            }
         }
 
-        Map<Long, List<String>> vmIdIpMap = new HashMap<>();
+        Map<Long, List<String>> desiredVmIdIpMap = new HashMap<>();
         List<LoadBalancerVMMapVO> existingMappings = loadBalancerVMMapDao.listByLoadBalancerId(lb.getId(), false);
         Map<Long, KubernetesClusterVmMapVO> clusterVmMappings = kubernetesClusterVmMapDao.listByClusterId(kubernetesCluster.getId()).stream()
                 .collect(Collectors.toMap(KubernetesClusterVmMapVO::getVmId, vmMap -> vmMap));
@@ -768,24 +831,40 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
             if (vmMap == null || !vmMap.isControlNode()) {
                 continue;
             }
-            List<String> ips = new ArrayList<>();
             Nic controlVmNic = networkModel.getNicInNetwork(vmId, kubernetesCluster.getNetworkId());
-            ips.add(controlVmNic.getIPv4Address());
-            boolean alreadyMapped = existingMappings.stream().anyMatch(mapping -> Objects.equals(mapping.getInstanceId(), vmId)
-                    && Objects.equals(mapping.getInstanceIp(), controlVmNic.getIPv4Address()));
+            if (controlVmNic == null || StringUtils.isBlank(controlVmNic.getIPv4Address())) {
+                throw new CloudRuntimeException(String.format(
+                        "No IPv4 address was found for control node %d on Kubernetes cluster network %d",
+                        vmId, kubernetesCluster.getNetworkId()));
+            }
+            desiredVmIdIpMap.put(vmId, List.of(controlVmNic.getIPv4Address()));
+        }
+        Map<Long, List<String>> staleVmIdIpMap = new HashMap<>();
+        for (LoadBalancerVMMapVO existing : existingMappings) {
+            List<String> desiredIps = desiredVmIdIpMap.get(existing.getInstanceId());
+            if (desiredIps == null || !desiredIps.contains(existing.getInstanceIp())) {
+                staleVmIdIpMap.computeIfAbsent(existing.getInstanceId(), ignored -> new ArrayList<>()).add(existing.getInstanceIp());
+            }
+        }
+        if (!staleVmIdIpMap.isEmpty() && !lbService.removeFromLoadBalancer(lb.getId(), null, staleVmIdIpMap, false)) {
+            throw new ResourceUnavailableException("Failed to remove stale control nodes from the Kubernetes API load balancing rule", Network.class,
+                    network.getId());
+        }
+        Map<Long, List<String>> missingVmIdIpMap = new HashMap<>();
+        for (Map.Entry<Long, List<String>> desired : desiredVmIdIpMap.entrySet()) {
+            boolean alreadyMapped = existingMappings.stream().anyMatch(mapping -> Objects.equals(mapping.getInstanceId(), desired.getKey())
+                    && desired.getValue().contains(mapping.getInstanceIp()) && !staleVmIdIpMap.containsKey(mapping.getInstanceId()));
             if (!alreadyMapped) {
-                vmIdIpMap.put(vmId, ips);
+                missingVmIdIpMap.put(desired.getKey(), desired.getValue());
             }
         }
-        if (vmIdIpMap.isEmpty()) {
-            if (!lbService.applyLoadBalancerConfig(lb.getId())) {
-                throw new ResourceUnavailableException("Failed to apply the Kubernetes API load balancing rule", Network.class, network.getId());
-            }
-            return;
-        }
-        if (!lbService.assignToLoadBalancer(lb.getId(), null, vmIdIpMap, null, false)) {
+        if (!missingVmIdIpMap.isEmpty() && !lbService.assignToLoadBalancer(lb.getId(), null, missingVmIdIpMap, null, false)) {
             throw new ResourceUnavailableException("Failed to assign control nodes to the Kubernetes API load balancing rule", Network.class, network.getId());
         }
+        if (missingVmIdIpMap.isEmpty() && staleVmIdIpMap.isEmpty() && !lbService.applyLoadBalancerConfig(lb.getId())) {
+            throw new ResourceUnavailableException("Failed to apply the Kubernetes API load balancing rule", Network.class, network.getId());
+        }
+        activateManagedFirewallRule(lb.getId());
     }
 
     protected Map<Long, Integer> createFirewallRules(IpAddress publicIp, List<Long> clusterVMIds, boolean apiRule) throws ManagementServerException {
@@ -797,7 +876,7 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
         // Firewall rule for API access for control node VMs
         CallContext.register(CallContext.current(), null);
         try {
-            provisionFirewallRules(publicIp, owner, CLUSTER_API_PORT, CLUSTER_API_PORT);
+            provisionFirewallRules(publicIp, owner, CLUSTER_API_PORT, CLUSTER_API_PORT, API_FIREWALL_ROLE);
             if (logger.isInfoEnabled()) {
                 logger.info("Provisioned firewall rule to open up port {} on {} for Kubernetes cluster {}", CLUSTER_API_PORT, publicIp.getAddress().addr(), kubernetesCluster);
             }
@@ -846,13 +925,13 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
         if (networkAclId == null) {
             throw new ManagementServerException(String.format("Failed to provision ACL rules for the Kubernetes cluster : %s as VPC tier %s does not have a network ACL attached", kubernetesCluster.getName(), network.getName()));
         }
-        if (networkAclId == NetworkACL.DEFAULT_ALLOW) {
+        if (Objects.equals(networkAclId, NetworkACL.DEFAULT_ALLOW)) {
             return;
         }
         // ACL rule for API access for control node VMs
         CallContext.register(CallContext.current(), null);
         try {
-            provisionVpcTierAllowPortACLRule(network, CLUSTER_API_PORT, CLUSTER_API_PORT);
+            provisionVpcTierAllowPortACLRule(network, CLUSTER_API_PORT, CLUSTER_API_PORT, API_ACL_ROLE);
             if (logger.isInfoEnabled()) {
                 logger.info("Provisioned ACL rule to open up port {} on {} for Kubernetes cluster {}", CLUSTER_API_PORT, publicIpAddress, kubernetesCluster);
             }
@@ -863,7 +942,7 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
         }
         CallContext.register(CallContext.current(), null);
         try {
-            provisionVpcTierAllowPortACLRule(network, DEFAULT_SSH_PORT, DEFAULT_SSH_PORT);
+            provisionVpcTierAllowPortACLRule(network, DEFAULT_SSH_PORT, DEFAULT_SSH_PORT, SSH_ACL_ROLE);
             if (logger.isInfoEnabled()) {
                 logger.info("Provisioned ACL rule to open up port {} on {} for Kubernetes cluster {}", DEFAULT_SSH_PORT, publicIpAddress, kubernetesCluster);
             }
@@ -871,32 +950,6 @@ public class KubernetesClusterResourceModifierActionWorker extends KubernetesClu
             throw new ManagementServerException(String.format("Failed to provision firewall rules for API access for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
         } finally {
             CallContext.unregister();
-        }
-    }
-
-    protected void removeVpcTierAclRules(Network network) throws ManagementServerException {
-        Long networkAclId = network.getNetworkACLId();
-        if (networkAclId == null || networkAclId == NetworkACL.DEFAULT_ALLOW) {
-            // no ACL attached or default allow: no CKS-provisioned ACL rules can exist, nothing to remove
-            return;
-        }
-        // ACL rule for API access for control node VMs
-        try {
-            removeVpcTierAllowPortACLRule(network, CLUSTER_API_PORT, CLUSTER_API_PORT);
-            if (logger.isInfoEnabled()) {
-                logger.info("Removed network ACL rule to open up port {} on {} for Kubernetes cluster {}", CLUSTER_API_PORT, publicIpAddress, kubernetesCluster);
-            }
-        } catch (ResourceUnavailableException e) {
-            throw new ManagementServerException(String.format("Failed to remove network ACL rule for API access for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
-        }
-        // ACL rule for SSH access for all node VMs
-        try {
-            removeVpcTierAllowPortACLRule(network, DEFAULT_SSH_PORT, DEFAULT_SSH_PORT);
-            if (logger.isInfoEnabled()) {
-                logger.info("Removed network ACL rule to open up port {} on {} for Kubernetes cluster {}", DEFAULT_SSH_PORT, publicIpAddress, kubernetesCluster);
-            }
-        } catch (ResourceUnavailableException e) {
-            throw new ManagementServerException(String.format("Failed to remove network ACL rules for SSH access for the Kubernetes cluster : %s", kubernetesCluster.getName()), e);
         }
     }
 

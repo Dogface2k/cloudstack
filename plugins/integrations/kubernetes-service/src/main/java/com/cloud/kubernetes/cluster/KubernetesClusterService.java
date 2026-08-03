@@ -35,6 +35,7 @@ import org.apache.cloudstack.api.command.user.kubernetes.cluster.StartKubernetes
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.StopKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.UpdateKubernetesClusterAffinityGroupCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.UpgradeKubernetesClusterCmd;
+import org.apache.cloudstack.api.command.admin.kubernetes.cluster.AdoptKubernetesClusterNetworkRulesCmd;
 import org.apache.cloudstack.api.response.KubernetesClusterConfigResponse;
 import org.apache.cloudstack.api.response.KubernetesClusterResponse;
 import org.apache.cloudstack.api.response.ListResponse;
@@ -172,6 +173,8 @@ public interface KubernetesClusterService extends PluggableService, Configurable
     boolean scaleKubernetesCluster(ScaleKubernetesClusterCmd cmd) throws CloudRuntimeException;
 
     boolean reconcileKubernetesClusterNetworkRules(ReconcileKubernetesClusterNetworkRulesCmd cmd) throws CloudRuntimeException;
+
+    boolean adoptKubernetesClusterNetworkRules(AdoptKubernetesClusterNetworkRulesCmd cmd) throws CloudRuntimeException;
 
     boolean upgradeKubernetesCluster(UpgradeKubernetesClusterCmd cmd) throws CloudRuntimeException;
 

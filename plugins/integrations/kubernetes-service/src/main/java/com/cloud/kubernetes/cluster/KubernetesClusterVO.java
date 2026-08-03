@@ -23,6 +23,8 @@ import java.util.UUID;
 import javax.persistence.Column;
 
 import javax.persistence.Entity;
+import javax.persistence.EnumType;
+import javax.persistence.Enumerated;
 import javax.persistence.Id;
 import javax.persistence.Table;
 import javax.persistence.GeneratedValue;
@@ -117,6 +119,10 @@ public class KubernetesClusterVO implements KubernetesCluster {
 
     @Column(name = "cluster_type")
     private ClusterType clusterType;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "network_rule_ownership_state")
+    private KubernetesClusterNetworkRuleOwnershipState networkRuleOwnershipState;
 
     @Column(name = "control_node_service_offering_id")
     private Long controlNodeServiceOfferingId;
@@ -392,6 +398,14 @@ public class KubernetesClusterVO implements KubernetesCluster {
         this.clusterType = clusterType;
     }
 
+    public KubernetesClusterNetworkRuleOwnershipState getNetworkRuleOwnershipState() {
+        return networkRuleOwnershipState;
+    }
+
+    public void setNetworkRuleOwnershipState(KubernetesClusterNetworkRuleOwnershipState networkRuleOwnershipState) {
+        this.networkRuleOwnershipState = networkRuleOwnershipState;
+    }
+
     public boolean isCsiEnabled() {
         return csiEnabled;
     }
@@ -428,6 +442,9 @@ public class KubernetesClusterVO implements KubernetesCluster {
         }
         this.endpoint = endpoint;
         this.clusterType = clusterType;
+        this.networkRuleOwnershipState = ClusterType.CloudManaged.equals(clusterType)
+                ? KubernetesClusterNetworkRuleOwnershipState.MANAGED
+                : KubernetesClusterNetworkRuleOwnershipState.LEGACY_UNMANAGED;
         this.checkForGc = false;
     }
 
