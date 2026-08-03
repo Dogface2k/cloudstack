@@ -68,3 +68,10 @@ example.ver.1 > example.ver.2:
     strict subnet selectors are not supported. Some cryptographic options
     permitted by CloudStack are rejected by NSX (3des, md5, aes192,
     modp6144 and above, IKE lifetime below 21600 seconds) with a clear error.
+
+  * NSX network offerings can now reference existing IP discovery, MAC
+    discovery, and segment security profiles. New NSX segments created from
+    those offerings bind the selected profiles atomically with segment
+    creation. Existing networks cannot be moved to an offering with different
+    profile bindings; operators must create replacement networks when profile
+    changes are required.
