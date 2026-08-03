@@ -36,6 +36,7 @@ import com.cloud.network.PublicIpAddress;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.PhysicalNetworkVO;
 import com.cloud.network.guru.GuestNetworkGuru;
+import com.cloud.network.nsx.NsxService;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.offerings.NetworkOfferingVO;
@@ -49,7 +50,6 @@ import com.cloud.vm.VirtualMachineProfile;
 import org.apache.cloudstack.NsxAnswer;
 import org.apache.cloudstack.agent.api.CreateNsxDhcpRelayConfigCommand;
 import org.apache.cloudstack.agent.api.CreateNsxSegmentCommand;
-import org.apache.cloudstack.agent.api.CreateNsxTier1GatewayCommand;
 import org.apache.cloudstack.agent.api.CreateOrUpdateNsxTier1NatRuleCommand;
 import org.apache.cloudstack.utils.NsxControllerUtils;
 
@@ -69,6 +69,8 @@ public class NsxGuestNetworkGuru extends GuestNetworkGuru implements NetworkMigr
     NsxControllerUtils nsxControllerUtils;
     @Inject
     NetworkModel networkModel;
+    @Inject
+    NsxService nsxService;
 
     public NsxGuestNetworkGuru() {
         super();
@@ -316,11 +318,9 @@ public class NsxGuestNetworkGuru extends GuestNetworkGuru implements NetworkMigr
             NetworkOfferingVO networkOfferingVO = networkOfferingDao.findById(networkOfferingId);
             boolean isSourceNatSupported = !NetworkOffering.NetworkMode.ROUTED.equals(networkOfferingVO.getNetworkMode()) &&
                     networkOfferingServiceMapDao.areServicesSupportedByNetworkOffering(networkVO.getNetworkOfferingId(), Network.Service.SourceNat);
-            CreateNsxTier1GatewayCommand nsxTier1GatewayCommand =  new CreateNsxTier1GatewayCommand(domain.getId(), account.getId(), zone.getId(), networkVO.getId(), networkVO.getName(), false, isSourceNatSupported);
-
-            NsxAnswer nsxAnswer = nsxControllerUtils.sendNsxCommand(nsxTier1GatewayCommand, zone.getId());
-            if (!nsxAnswer.getResult()) {
-                String msg = String.format("Could not create a Tier 1 Gateway for network %s: %s", networkVO, nsxAnswer.getDetails());
+            if (!nsxService.createNetwork(zone.getId(), account.getId(), domain.getId(), networkVO.getId(),
+                    networkVO.getName(), isSourceNatSupported)) {
+                String msg = String.format("Could not create a Tier 1 Gateway for network %s", networkVO);
                 logger.error(msg);
                 throw new CloudRuntimeException(msg);
             }

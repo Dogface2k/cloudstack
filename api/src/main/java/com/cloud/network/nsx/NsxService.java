@@ -35,6 +35,7 @@ public interface NsxService {
             true, ConfigKey.Scope.Zone);
 
     boolean createVpcNetwork(Long zoneId, long accountId, long domainId, Long vpcId, String vpcName, boolean sourceNatEnabled);
+    boolean createNetwork(Long zoneId, long accountId, long domainId, Long networkId, String networkName, boolean sourceNatEnabled);
     boolean updateVpcSourceNatIp(Vpc vpc, IpAddress address);
     String getSegmentId(long domainId, long accountId, long zoneId, Long vpcId, long networkId);
 

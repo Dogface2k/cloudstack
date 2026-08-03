@@ -34,6 +34,7 @@ import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.PhysicalNetworkDao;
 import com.cloud.network.dao.PhysicalNetworkVO;
 import com.cloud.network.guru.GuestNetworkGuru;
+import com.cloud.network.nsx.NsxService;
 import com.cloud.network.vpc.VpcVO;
 import com.cloud.network.vpc.dao.VpcDao;
 import com.cloud.offering.NetworkOffering;
@@ -51,7 +52,6 @@ import com.cloud.vm.VirtualMachineProfile;
 import org.apache.cloudstack.NsxAnswer;
 import org.apache.cloudstack.agent.api.CreateNsxDhcpRelayConfigCommand;
 import org.apache.cloudstack.agent.api.CreateNsxSegmentCommand;
-import org.apache.cloudstack.agent.api.CreateNsxTier1GatewayCommand;
 import org.apache.cloudstack.agent.api.NsxCommand;
 import org.apache.cloudstack.utils.NsxControllerUtils;
 import org.junit.After;
@@ -122,6 +122,8 @@ public class NsxGuestNetworkGuruTest {
     IpAddressManager ipAddressManager;
     @Mock
     NetworkOfferingDao networkOfferingDao;
+    @Mock
+    NsxService nsxService;
 
     NsxGuestNetworkGuru guru;
     AutoCloseable closeable;
@@ -142,6 +144,7 @@ public class NsxGuestNetworkGuruTest {
 
         guru.networkOfferingServiceMapDao = networkOfferingServiceMapDao;
         guru.nsxControllerUtils = nsxControllerUtils;
+        guru.nsxService = nsxService;
         guru.accountDao = accountDao;
         guru.domainDao = domainDao;
 
@@ -338,16 +341,17 @@ public class NsxGuestNetworkGuruTest {
 
         when(networkVO.getAccountId()).thenReturn(1L);
         when(networkVO.getVpcId()).thenReturn(null);
-        when(nsxControllerUtils.sendNsxCommand(any(CreateNsxTier1GatewayCommand.class),
-                anyLong())).thenReturn(new NsxAnswer(new NsxCommand(), true, ""));
+        when(nsxService.createNetwork(anyLong(), anyLong(), anyLong(), anyLong(), any(),
+                ArgumentMatchers.anyBoolean())).thenReturn(true);
         when(nsxControllerUtils.sendNsxCommand(any(CreateNsxSegmentCommand.class),
                 anyLong())).thenReturn(new NsxAnswer(new NsxCommand(), true, ""));
         when(networkVO.getNetworkOfferingId()).thenReturn(1L);
         when(networkOfferingDao.findById(1L)).thenReturn(offeringVO);
         when(offeringVO.getNetworkMode()).thenReturn(NetworkOffering.NetworkMode.NATTED);
+        when(networkOfferingServiceMapDao.areServicesSupportedByNetworkOffering(1L, Network.Service.SourceNat)).thenReturn(true);
         guru.createNsxSegment(networkVO, dataCenter);
-        verify(nsxControllerUtils, times(1)).sendNsxCommand(any(CreateNsxTier1GatewayCommand.class),
-                anyLong());
+        verify(nsxService).createNetwork(anyLong(), anyLong(), anyLong(), anyLong(), any(),
+                ArgumentMatchers.eq(true));
         verify(nsxControllerUtils, times(1)).sendNsxCommand(any(CreateNsxSegmentCommand.class),
                 anyLong());
     }

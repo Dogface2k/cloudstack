@@ -48,6 +48,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
@@ -217,6 +218,27 @@ public class NsxServiceImplTest {
         when(createNsxTier1GatewayAnswer.getResult()).thenReturn(true);
 
         assertTrue(nsxService.createVpcNetwork(1L, 3L, 2L, 5L, "VPC01", false));
+    }
+
+    @Test
+    public void testCreateNetworkAppliesVrfPlacementAndSourceNatSetting() {
+        NsxAnswer answer = mock(NsxAnswer.class);
+        when(answer.getResult()).thenReturn(true);
+        when(nsxControllerUtils.sendNsxCommand(any(CreateNsxTier1GatewayCommand.class), eq(zoneId)))
+                .thenReturn(answer);
+        Mockito.doReturn("ACCOUNT").when(nsxService).getVrfScope(zoneId);
+        when(nsxVrfGatewayDao.findByAccount(zoneId, accountId))
+                .thenReturn(vrfGateway("CS-VRF-001", "v5-EdgeCluster-HOSTED"));
+        ArgumentCaptor<CreateNsxTier1GatewayCommand> commandCaptor =
+                ArgumentCaptor.forClass(CreateNsxTier1GatewayCommand.class);
+
+        assertTrue(nsxService.createNetwork(zoneId, accountId, domainId, 5L, "Network01", true));
+
+        verify(nsxControllerUtils).sendNsxCommand(commandCaptor.capture(), eq(zoneId));
+        CreateNsxTier1GatewayCommand command = commandCaptor.getValue();
+        assertEquals("CS-VRF-001", command.getTier0Gateway());
+        assertEquals("v5-EdgeCluster-HOSTED", command.getEdgeCluster());
+        assertTrue(command.isSourceNatEnabled());
     }
 
     @Test

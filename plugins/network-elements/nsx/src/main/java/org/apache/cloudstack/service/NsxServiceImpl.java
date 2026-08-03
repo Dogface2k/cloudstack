@@ -271,9 +271,11 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         return true;
     }
 
-    public boolean createNetwork(Long zoneId, long accountId, long domainId, Long networkId, String networkName) {
+    @Override
+    public boolean createNetwork(Long zoneId, long accountId, long domainId, Long networkId, String networkName,
+                                 boolean sourceNatEnabled) {
         CreateNsxTier1GatewayCommand createNsxTier1GatewayCommand =
-                new CreateNsxTier1GatewayCommand(domainId, accountId, zoneId, networkId, networkName, false, false);
+                new CreateNsxTier1GatewayCommand(domainId, accountId, zoneId, networkId, networkName, false, sourceNatEnabled);
         applyVrfGateway(createNsxTier1GatewayCommand, zoneId, accountId, domainId);
         NsxAnswer result = nsxControllerUtils.sendNsxCommand(createNsxTier1GatewayCommand, zoneId);
         return result.getResult();
