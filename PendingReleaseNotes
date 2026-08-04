@@ -71,10 +71,10 @@ example.ver.1 > example.ver.2:
 
   * NSX network offerings can now reference existing IP discovery, MAC
     discovery, and segment security profiles. New NSX segments created from
-    those offerings bind the selected profiles atomically with segment
-    creation. Existing networks cannot be moved to an offering with different
-    profile bindings; operators must create replacement networks when profile
-    changes are required.
+    those offerings bind the selected profiles in the same hierarchical
+    request as segment creation. Existing networks cannot be moved to an
+    offering with different profile bindings; operators must create
+    replacement networks when profile changes are required.
 
   * CloudStack-managed Kubernetes clusters now record explicit ownership of
     their generated firewall, port-forwarding, load-balancing, and VPC ACL

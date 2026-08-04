@@ -181,16 +181,22 @@ public class NsxApiClientTest {
         Assert.assertEquals("ChildSegment", childSegment.getResourceType());
         Assert.assertEquals("segment", childSegment.getId());
         Assert.assertEquals("Segment", childSegment.getSegment().getResourceType());
+        Assert.assertEquals("segment", childSegment.getSegment().getId());
         Assert.assertEquals(2, childSegment.getSegment().getChildren().size());
         ChildSegmentDiscoveryProfileBindingMap discoveryChild = (ChildSegmentDiscoveryProfileBindingMap)
                 childSegment.getSegment().getChildren().get(0);
         Assert.assertEquals("ChildSegmentDiscoveryProfileBindingMap", discoveryChild.getResourceType());
         SegmentDiscoveryProfileBindingMap discoveryBinding = discoveryChild.getSegmentDiscoveryProfileBindingMap();
+        Assert.assertEquals("cloudstack-discovery-profile-binding", discoveryChild.getId());
+        Assert.assertEquals("cloudstack-discovery-profile-binding", discoveryBinding.getId());
         Assert.assertEquals("SegmentDiscoveryProfileBindingMap", discoveryBinding.getResourceType());
         Assert.assertEquals("/infra/ip-discovery-profiles/ip-profile", discoveryBinding.getIpDiscoveryProfilePath());
         Assert.assertEquals("/infra/mac-discovery-profiles/mac-profile", discoveryBinding.getMacDiscoveryProfilePath());
         ChildSegmentSecurityProfileBindingMap securityChild = (ChildSegmentSecurityProfileBindingMap)
                 childSegment.getSegment().getChildren().get(1);
+        Assert.assertEquals("cloudstack-security-profile-binding", securityChild.getId());
+        Assert.assertEquals("cloudstack-security-profile-binding",
+                securityChild.getSegmentSecurityProfileBindingMap().getId());
         Assert.assertEquals("ChildSegmentSecurityProfileBindingMap", securityChild.getResourceType());
         Assert.assertEquals("SegmentSecurityProfileBindingMap",
                 securityChild.getSegmentSecurityProfileBindingMap().getResourceType());
@@ -287,6 +293,27 @@ public class NsxApiClientTest {
         when(ipProfile.getId()).thenReturn("ip-profile");
         when(ipProfile.getPath()).thenReturn("/infra/ip-discovery-profiles/ip-profile");
         when(ipProfile.getMarkedForDelete()).thenReturn(true);
+
+        Assert.assertThrows(CloudRuntimeException.class,
+                () -> client.createSegment("segment", "tier1", "10.10.10.1/24",
+                        "/infra/sites/default/enforcement-points/default",
+                        List.of(new com.vmware.nsx.model.TransportZone.Builder().setId("tz").build()),
+                        "ip-profile", null, null));
+
+        verify(segmentService, never()).patch(anyString(), any(Segment.class));
+        verify(nsxService, never()).apply(Infra.class);
+    }
+
+    @Test
+    public void testCreateSegmentRejectsProfileResolvedWithDifferentIdBeforeCreatingSegment() {
+        Segments segmentService = Mockito.mock(Segments.class);
+        IpDiscoveryProfiles ipProfiles = Mockito.mock(IpDiscoveryProfiles.class);
+        IPDiscoveryProfile ipProfile = Mockito.mock(IPDiscoveryProfile.class);
+        when(nsxService.apply(Segments.class)).thenReturn(segmentService);
+        when(nsxService.apply(IpDiscoveryProfiles.class)).thenReturn(ipProfiles);
+        when(ipProfiles.get("ip-profile")).thenReturn(ipProfile);
+        when(ipProfile.getId()).thenReturn("different-profile");
+        when(ipProfile.getPath()).thenReturn("/infra/ip-discovery-profiles/different-profile");
 
         Assert.assertThrows(CloudRuntimeException.class,
                 () -> client.createSegment("segment", "tier1", "10.10.10.1/24",
