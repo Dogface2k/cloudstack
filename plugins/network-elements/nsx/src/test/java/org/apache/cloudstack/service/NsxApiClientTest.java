@@ -175,19 +175,69 @@ public class NsxApiClientTest {
 
         verify(infraService).patch(infraCaptor.capture(), eq(false));
         verify(nsxService, never()).apply(Segments.class);
+        Assert.assertEquals("Infra", infraCaptor.getValue().getResourceType());
         Assert.assertEquals(1, infraCaptor.getValue().getChildren().size());
         ChildSegment childSegment = (ChildSegment) infraCaptor.getValue().getChildren().get(0);
+        Assert.assertEquals("ChildSegment", childSegment.getResourceType());
         Assert.assertEquals("segment", childSegment.getId());
+        Assert.assertEquals("Segment", childSegment.getSegment().getResourceType());
         Assert.assertEquals(2, childSegment.getSegment().getChildren().size());
         ChildSegmentDiscoveryProfileBindingMap discoveryChild = (ChildSegmentDiscoveryProfileBindingMap)
                 childSegment.getSegment().getChildren().get(0);
+        Assert.assertEquals("ChildSegmentDiscoveryProfileBindingMap", discoveryChild.getResourceType());
         SegmentDiscoveryProfileBindingMap discoveryBinding = discoveryChild.getSegmentDiscoveryProfileBindingMap();
+        Assert.assertEquals("SegmentDiscoveryProfileBindingMap", discoveryBinding.getResourceType());
         Assert.assertEquals("/infra/ip-discovery-profiles/ip-profile", discoveryBinding.getIpDiscoveryProfilePath());
         Assert.assertEquals("/infra/mac-discovery-profiles/mac-profile", discoveryBinding.getMacDiscoveryProfilePath());
         ChildSegmentSecurityProfileBindingMap securityChild = (ChildSegmentSecurityProfileBindingMap)
                 childSegment.getSegment().getChildren().get(1);
+        Assert.assertEquals("ChildSegmentSecurityProfileBindingMap", securityChild.getResourceType());
+        Assert.assertEquals("SegmentSecurityProfileBindingMap",
+                securityChild.getSegmentSecurityProfileBindingMap().getResourceType());
         Assert.assertEquals("/infra/segment-security-profiles/security-profile",
                 securityChild.getSegmentSecurityProfileBindingMap().getSegmentSecurityProfilePath());
+    }
+
+    @Test
+    public void testSegmentProfileBindingsWithOnlyIpDiscoveryProfile() {
+        List<Structure> bindings = client.getSegmentProfileBindings("/infra/ip-discovery-profiles/ip-profile", null, null);
+
+        Assert.assertEquals(1, bindings.size());
+        ChildSegmentDiscoveryProfileBindingMap child = (ChildSegmentDiscoveryProfileBindingMap) bindings.get(0);
+        Assert.assertEquals("ChildSegmentDiscoveryProfileBindingMap", child.getResourceType());
+        Assert.assertEquals("SegmentDiscoveryProfileBindingMap",
+                child.getSegmentDiscoveryProfileBindingMap().getResourceType());
+        Assert.assertEquals("/infra/ip-discovery-profiles/ip-profile",
+                child.getSegmentDiscoveryProfileBindingMap().getIpDiscoveryProfilePath());
+        Assert.assertNull(child.getSegmentDiscoveryProfileBindingMap().getMacDiscoveryProfilePath());
+    }
+
+    @Test
+    public void testSegmentProfileBindingsWithOnlyMacDiscoveryProfile() {
+        List<Structure> bindings = client.getSegmentProfileBindings(null, "/infra/mac-discovery-profiles/mac-profile", null);
+
+        Assert.assertEquals(1, bindings.size());
+        ChildSegmentDiscoveryProfileBindingMap child = (ChildSegmentDiscoveryProfileBindingMap) bindings.get(0);
+        Assert.assertEquals("ChildSegmentDiscoveryProfileBindingMap", child.getResourceType());
+        Assert.assertEquals("SegmentDiscoveryProfileBindingMap",
+                child.getSegmentDiscoveryProfileBindingMap().getResourceType());
+        Assert.assertNull(child.getSegmentDiscoveryProfileBindingMap().getIpDiscoveryProfilePath());
+        Assert.assertEquals("/infra/mac-discovery-profiles/mac-profile",
+                child.getSegmentDiscoveryProfileBindingMap().getMacDiscoveryProfilePath());
+    }
+
+    @Test
+    public void testSegmentProfileBindingsWithOnlySecurityProfile() {
+        List<Structure> bindings = client.getSegmentProfileBindings(null, null,
+                "/infra/segment-security-profiles/security-profile");
+
+        Assert.assertEquals(1, bindings.size());
+        ChildSegmentSecurityProfileBindingMap child = (ChildSegmentSecurityProfileBindingMap) bindings.get(0);
+        Assert.assertEquals("ChildSegmentSecurityProfileBindingMap", child.getResourceType());
+        Assert.assertEquals("SegmentSecurityProfileBindingMap",
+                child.getSegmentSecurityProfileBindingMap().getResourceType());
+        Assert.assertEquals("/infra/segment-security-profiles/security-profile",
+                child.getSegmentSecurityProfileBindingMap().getSegmentSecurityProfilePath());
     }
 
     @Test

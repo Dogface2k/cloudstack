@@ -179,6 +179,9 @@ public class NsxApiClient {
     private static final String TIER_1_RESOURCE_TYPE = "Tier1";
     private static final String TIER_1_LOCALE_SERVICE_ID = "default";
     private static final String SEGMENT_RESOURCE_TYPE = "Segment";
+    private static final String INFRA_RESOURCE_TYPE = "Infra";
+    private static final String SEGMENT_DISCOVERY_PROFILE_BINDING_RESOURCE_TYPE = "SegmentDiscoveryProfileBindingMap";
+    private static final String SEGMENT_SECURITY_PROFILE_BINDING_RESOURCE_TYPE = "SegmentSecurityProfileBindingMap";
     private static final String SEGMENT_DISCOVERY_PROFILE_BINDING_ID = "cloudstack-discovery-profile-binding";
     private static final String SEGMENT_SECURITY_PROFILE_BINDING_ID = "cloudstack-security-profile-binding";
     private static final String TIER_0_GATEWAY_PATH_PREFIX = "/infra/tier-0s/";
@@ -718,6 +721,7 @@ public class NsxApiClient {
                         .setSegment(segment)
                         .build();
                 com.vmware.nsx_policy.model.Infra infra = new com.vmware.nsx_policy.model.Infra.Builder()
+                        .setResourceType(INFRA_RESOURCE_TYPE)
                         .setChildren(List.of(childSegment))
                         .build();
                 Infra infraService = (Infra) nsxService.apply(Infra.class);
@@ -777,6 +781,7 @@ public class NsxApiClient {
         List<Structure> bindings = new ArrayList<>();
         if (StringUtils.isNotBlank(ipDiscoveryProfilePath) || StringUtils.isNotBlank(macDiscoveryProfilePath)) {
             SegmentDiscoveryProfileBindingMap binding = new SegmentDiscoveryProfileBindingMap.Builder()
+                    .setResourceType(SEGMENT_DISCOVERY_PROFILE_BINDING_RESOURCE_TYPE)
                     .setId(SEGMENT_DISCOVERY_PROFILE_BINDING_ID)
                     .setIpDiscoveryProfilePath(ipDiscoveryProfilePath)
                     .setMacDiscoveryProfilePath(macDiscoveryProfilePath)
@@ -788,6 +793,7 @@ public class NsxApiClient {
         }
         if (StringUtils.isNotBlank(segmentSecurityProfilePath)) {
             SegmentSecurityProfileBindingMap binding = new SegmentSecurityProfileBindingMap.Builder()
+                    .setResourceType(SEGMENT_SECURITY_PROFILE_BINDING_RESOURCE_TYPE)
                     .setId(SEGMENT_SECURITY_PROFILE_BINDING_ID)
                     .setSegmentSecurityProfilePath(segmentSecurityProfilePath)
                     .build();
