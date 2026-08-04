@@ -20,8 +20,12 @@ import com.cloud.network.IpAddress;
 import com.cloud.domain.DomainVO;
 import com.cloud.domain.dao.DomainDao;
 import com.cloud.network.dao.NetworkVO;
+import com.cloud.network.dao.NsxProviderDao;
 import com.cloud.network.dao.NsxVrfGatewayDao;
+import com.cloud.network.dao.NsxVrfGatewayPlacementDao;
 import com.cloud.network.element.NsxVrfGatewayVO;
+import com.cloud.network.element.NsxVrfGatewayPlacementVO;
+import com.cloud.network.element.NsxProviderVO;
 import com.cloud.network.Site2SiteVpnConnection;
 import com.cloud.network.dao.Site2SiteVpnConnectionVO;
 import com.cloud.network.dao.Site2SiteVpnConnectionDao;
@@ -34,6 +38,7 @@ import com.cloud.network.nsx.NsxVpnGatewayResult;
 import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.net.Ip;
 import org.apache.cloudstack.NsxAnswer;
+import org.apache.cloudstack.NsxVrfGatewayValidationAnswer;
 import org.apache.cloudstack.agent.api.CreateNsxStaticNatCommand;
 import org.apache.cloudstack.agent.api.CreateNsxTier1GatewayCommand;
 import org.apache.cloudstack.agent.api.CreateNsxVpnGatewayCommand;
@@ -41,6 +46,7 @@ import org.apache.cloudstack.agent.api.CreateOrUpdateNsxTier1NatRuleCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxNatRuleCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxSegmentCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxTier1GatewayCommand;
+import org.apache.cloudstack.agent.api.ValidateNsxVrfGatewayCommand;
 import org.apache.cloudstack.utils.NsxControllerUtils;
 import org.apache.cloudstack.resourcedetail.UserIpAddressDetailVO;
 import org.apache.cloudstack.resourcedetail.dao.UserIpAddressDetailsDao;
@@ -60,12 +66,15 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -83,6 +92,12 @@ public class NsxServiceImplTest {
     private VpcDao vpcDao;
     @Mock
     private NsxVrfGatewayDao nsxVrfGatewayDao;
+    @Mock
+    private NsxVrfGatewayPlacementDao nsxVrfGatewayPlacementDao;
+    @Mock
+    private NsxProviderDao nsxProviderDao;
+    @Mock
+    private NsxVrfGatewayLockManager nsxVrfGatewayLockManager;
     @Mock
     private DomainDao domainDao;
     @Mock
@@ -106,10 +121,27 @@ public class NsxServiceImplTest {
         nsxService.nsxControllerUtils = nsxControllerUtils;
         nsxService.vpcDao = vpcDao;
         nsxService.nsxVrfGatewayDao = nsxVrfGatewayDao;
+        nsxService.nsxVrfGatewayPlacementDao = nsxVrfGatewayPlacementDao;
+        nsxService.nsxProviderDao = nsxProviderDao;
+        nsxService.nsxVrfGatewayLockManager = nsxVrfGatewayLockManager;
         nsxService.domainDao = domainDao;
         nsxService.site2SiteVpnConnectionDao = site2SiteVpnConnectionDao;
         nsxService.site2SiteVpnGatewayDao = site2SiteVpnGatewayDao;
         nsxService.userIpAddressDetailsDao = userIpAddressDetailsDao;
+        Mockito.lenient().when(nsxVrfGatewayLockManager.withPlacementLock(anyBoolean(), anyLong(), any()))
+                .thenAnswer(invocation -> ((Supplier<?>) invocation.getArgument(2)).get());
+        Mockito.lenient().when(nsxVrfGatewayLockManager.withZoneLock(anyLong(), any()))
+                .thenAnswer(invocation -> ((Supplier<?>) invocation.getArgument(1)).get());
+        Mockito.lenient().when(nsxVrfGatewayPlacementDao.persist(any(NsxVrfGatewayPlacementVO.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        Mockito.lenient().when(nsxVrfGatewayPlacementDao.update(anyLong(), any(NsxVrfGatewayPlacementVO.class))).thenReturn(true);
+        NsxProviderVO provider = mock(NsxProviderVO.class);
+        Mockito.lenient().when(provider.getTier0Gateway()).thenReturn("v5-T0");
+        Mockito.lenient().when(nsxProviderDao.findByZoneId(anyLong())).thenReturn(provider);
+        NsxVrfGatewayValidationAnswer validationAnswer = mock(NsxVrfGatewayValidationAnswer.class);
+        Mockito.lenient().when(validationAnswer.getResult()).thenReturn(true);
+        Mockito.lenient().when(nsxControllerUtils.sendNsxCommandForResult(any(ValidateNsxVrfGatewayCommand.class), anyLong()))
+                .thenReturn(validationAnswer);
     }
 
     @After
@@ -119,6 +151,14 @@ public class NsxServiceImplTest {
 
     private NsxVrfGatewayVO vrfGateway(String tier0, String edgeCluster) {
         return new NsxVrfGatewayVO(zoneId, tier0, edgeCluster, "v5-T0");
+    }
+
+    private NsxVrfGatewayPlacementVO placement(Long gatewayId, Long vpcId, Long networkId,
+            String tier0, NsxVrfGatewayPlacementVO.State state) {
+        NsxVrfGatewayPlacementVO placement = new NsxVrfGatewayPlacementVO(gatewayId, zoneId, domainId,
+                accountId, vpcId, networkId, tier0);
+        placement.setState(state);
+        return placement;
     }
 
     @Test
@@ -190,34 +230,12 @@ public class NsxServiceImplTest {
     }
 
     @Test
-    public void testApplyVrfGatewaySetsTier0AndEdgeClusterOnTheCommand() {
-        Mockito.doReturn("ACCOUNT").when(nsxService).getVrfScope(zoneId);
-        when(nsxVrfGatewayDao.findByAccount(zoneId, accountId))
-                .thenReturn(vrfGateway("CS-VRF-001", "v5-EdgeCluster-HOSTED"));
-        CreateNsxTier1GatewayCommand cmd =
-                new CreateNsxTier1GatewayCommand(domainId, accountId, zoneId, 1L, "VPC01", true, true);
-        nsxService.applyVrfGateway(cmd, zoneId, accountId, domainId);
-        assertEquals("CS-VRF-001", cmd.getTier0Gateway());
-        assertEquals("v5-EdgeCluster-HOSTED", cmd.getEdgeCluster());
-    }
-
-    @Test
-    public void testApplyVrfGatewayLeavesCommandUntouchedWhenScopeIsNone() {
-        Mockito.doReturn("NONE").when(nsxService).getVrfScope(zoneId);
-        CreateNsxTier1GatewayCommand cmd =
-                new CreateNsxTier1GatewayCommand(domainId, accountId, zoneId, 1L, "VPC01", true, true);
-        nsxService.applyVrfGateway(cmd, zoneId, accountId, domainId);
-        assertNull(cmd.getTier0Gateway());
-        assertNull(cmd.getEdgeCluster());
-    }
-
-    @Test
     public void testCreateVpcNetwork() {
         NsxAnswer createNsxTier1GatewayAnswer = mock(NsxAnswer.class);
         when(nsxControllerUtils.sendNsxCommand(any(CreateNsxTier1GatewayCommand.class), anyLong())).thenReturn(createNsxTier1GatewayAnswer);
         when(createNsxTier1GatewayAnswer.getResult()).thenReturn(true);
 
-        assertTrue(nsxService.createVpcNetwork(1L, 3L, 2L, 5L, "VPC01", false));
+        assertTrue(nsxService.createVpcNetwork(1L, 3L, 2L, 5L, "VPC01", false, null));
     }
 
     @Test
@@ -239,6 +257,116 @@ public class NsxServiceImplTest {
         assertEquals("CS-VRF-001", command.getTier0Gateway());
         assertEquals("v5-EdgeCluster-HOSTED", command.getEdgeCluster());
         assertTrue(command.isSourceNatEnabled());
+    }
+
+    @Test
+    public void testCreateNetworkFailsCleanlyWhenVrfValidationReturnsNoAnswer() {
+        Mockito.doReturn("ACCOUNT").when(nsxService).getVrfScope(zoneId);
+        when(nsxVrfGatewayDao.findByAccount(zoneId, accountId))
+                .thenReturn(vrfGateway("CS-VRF-001", "v5-EdgeCluster-HOSTED"));
+        when(nsxControllerUtils.sendNsxCommandForResult(any(ValidateNsxVrfGatewayCommand.class), eq(zoneId)))
+                .thenReturn(null);
+        ArgumentCaptor<NsxVrfGatewayPlacementVO> placementCaptor =
+                ArgumentCaptor.forClass(NsxVrfGatewayPlacementVO.class);
+
+        CloudRuntimeException exception = assertThrows(CloudRuntimeException.class,
+                () -> nsxService.createNetwork(zoneId, accountId, domainId, 5L, "Network01", true));
+
+        assertTrue(exception.getMessage().contains("no answer was returned"));
+        verify(nsxVrfGatewayPlacementDao).persist(placementCaptor.capture());
+        assertEquals(NsxVrfGatewayPlacementVO.State.FAILED.name(), placementCaptor.getValue().getState());
+        verify(nsxControllerUtils, never()).sendNsxCommand(any(CreateNsxTier1GatewayCommand.class), anyLong());
+    }
+
+    @Test
+    public void testReserveTier1PlacementPersistsResolvedVrfBeforeReturningItsVlan() {
+        long vpcId = 41L;
+        long publicVlanId = 73L;
+        NsxVrfGatewayVO gateway = vrfGateway("CS-VRF-001", "v5-EdgeCluster-HOSTED");
+        gateway.setPublicVlanDbId(publicVlanId);
+        Mockito.doReturn("ACCOUNT").when(nsxService).getVrfScope(zoneId);
+        when(nsxVrfGatewayDao.findByAccount(zoneId, accountId)).thenReturn(gateway);
+        ArgumentCaptor<NsxVrfGatewayPlacementVO> placementCaptor =
+                ArgumentCaptor.forClass(NsxVrfGatewayPlacementVO.class);
+
+        assertEquals(Long.valueOf(publicVlanId), nsxService.reserveTier1PlacementAndGetPublicVlanId(
+                zoneId, accountId, domainId, vpcId, null));
+
+        verify(nsxVrfGatewayPlacementDao).persist(placementCaptor.capture());
+        NsxVrfGatewayPlacementVO persisted = placementCaptor.getValue();
+        assertEquals(Long.valueOf(vpcId), persisted.getVpcId());
+        assertNull(persisted.getNetworkId());
+        assertEquals("CS-VRF-001", persisted.getTier0Name());
+        assertEquals(NsxVrfGatewayPlacementVO.State.PENDING_CREATE.name(), persisted.getState());
+    }
+
+    @Test
+    public void testReserveTier1PlacementReusesExistingPlacementWithoutResolvingAgain() {
+        long networkId = 42L;
+        NsxVrfGatewayPlacementVO existing = placement(null, null, networkId, "v5-T0",
+                NsxVrfGatewayPlacementVO.State.ACTIVE);
+        when(nsxVrfGatewayPlacementDao.findByNetworkId(networkId)).thenReturn(existing);
+
+        assertNull(nsxService.reserveTier1PlacementAndGetPublicVlanId(
+                zoneId, accountId, domainId, null, networkId));
+
+        verify(nsxVrfGatewayPlacementDao, never()).persist(any(NsxVrfGatewayPlacementVO.class));
+        verify(nsxService, never()).getVrfScope(anyLong());
+    }
+
+    @Test
+    public void testReserveTier1PlacementAllowsRetryAfterFailedCreation() {
+        long vpcId = 43L;
+        long gatewayId = 17L;
+        long publicVlanId = 91L;
+        NsxVrfGatewayPlacementVO existing = placement(gatewayId, vpcId, null, "CS-VRF-017",
+                NsxVrfGatewayPlacementVO.State.FAILED);
+        NsxVrfGatewayVO gateway = vrfGateway("CS-VRF-017", "v5-EdgeCluster-HOSTED");
+        gateway.setPublicVlanDbId(publicVlanId);
+        when(nsxVrfGatewayPlacementDao.findByVpcId(vpcId)).thenReturn(existing);
+        when(nsxVrfGatewayDao.findById(gatewayId)).thenReturn(gateway);
+
+        assertEquals(Long.valueOf(publicVlanId), nsxService.reserveTier1PlacementAndGetPublicVlanId(
+                zoneId, accountId, domainId, vpcId, null));
+
+        verify(nsxVrfGatewayPlacementDao, never()).persist(any(NsxVrfGatewayPlacementVO.class));
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void testReadOnlyPublicVlanLookupRejectsMissingLegacyPlacement() {
+        long vpcId = 46L;
+        try {
+            nsxService.getPublicVlanId(zoneId, accountId, domainId, vpcId, null);
+        } finally {
+            verify(nsxVrfGatewayPlacementDao, never()).persist(any(NsxVrfGatewayPlacementVO.class));
+            verify(nsxService, never()).getVrfScope(anyLong());
+        }
+    }
+
+    @Test(expected = CloudRuntimeException.class)
+    public void testReadOnlyPublicVlanLookupRejectsFailedPlacement() {
+        long vpcId = 44L;
+        when(nsxVrfGatewayPlacementDao.findByVpcId(vpcId)).thenReturn(placement(null, vpcId, null,
+                "v5-T0", NsxVrfGatewayPlacementVO.State.FAILED));
+
+        nsxService.getPublicVlanId(zoneId, accountId, domainId, vpcId, null);
+    }
+
+    @Test
+    public void testReadOnlyPublicVlanLookupUsesRecordedVrfGateway() {
+        long vpcId = 45L;
+        long gatewayId = 17L;
+        long publicVlanId = 91L;
+        NsxVrfGatewayPlacementVO existing = placement(gatewayId, vpcId, null, "CS-VRF-017",
+                NsxVrfGatewayPlacementVO.State.ACTIVE);
+        NsxVrfGatewayVO gateway = vrfGateway("CS-VRF-017", "v5-EdgeCluster-HOSTED");
+        gateway.setPublicVlanDbId(publicVlanId);
+        when(nsxVrfGatewayPlacementDao.findByVpcId(vpcId)).thenReturn(existing);
+        when(nsxVrfGatewayDao.findById(gatewayId)).thenReturn(gateway);
+
+        assertEquals(Long.valueOf(publicVlanId),
+                nsxService.getPublicVlanId(zoneId, accountId, domainId, vpcId, null));
+        verify(nsxService, never()).getVrfScope(anyLong());
     }
 
     @Test
@@ -267,6 +395,48 @@ public class NsxServiceImplTest {
         when(deleteNsxTier1GatewayAnswer.getResult()).thenReturn(true);
 
         assertTrue(nsxService.deleteVpcNetwork(1L, 2L, 3L, 10L, "VPC01"));
+    }
+
+    @Test
+    public void testDeleteVpcNetworkRemovesPlacementAfterBackendDeletion() {
+        long vpcId = 10L;
+        NsxVrfGatewayPlacementVO existing = placement(null, vpcId, null, "v5-T0",
+                NsxVrfGatewayPlacementVO.State.ACTIVE);
+        when(nsxVrfGatewayPlacementDao.findByVpcId(vpcId)).thenReturn(existing);
+        when(nsxVrfGatewayPlacementDao.expunge(existing.getId())).thenReturn(true);
+        NsxAnswer answer = mock(NsxAnswer.class);
+        when(answer.getResult()).thenReturn(true);
+        when(nsxControllerUtils.sendNsxCommand(any(DeleteNsxTier1GatewayCommand.class), eq(zoneId)))
+                .thenAnswer(invocation -> {
+                    assertEquals(NsxVrfGatewayPlacementVO.State.PENDING_DELETE.name(), existing.getState());
+                    return answer;
+                });
+
+        assertTrue(nsxService.deleteVpcNetwork(zoneId, accountId, domainId, vpcId, "VPC01"));
+
+        verify(nsxVrfGatewayPlacementDao).update(existing.getId(), existing);
+        verify(nsxVrfGatewayPlacementDao).expunge(existing.getId());
+    }
+
+    @Test
+    public void testDeleteVpcNetworkMarksPlacementFailedWhenBackendDeletionFails() {
+        long vpcId = 10L;
+        NsxVrfGatewayPlacementVO existing = placement(null, vpcId, null, "v5-T0",
+                NsxVrfGatewayPlacementVO.State.ACTIVE);
+        when(nsxVrfGatewayPlacementDao.findByVpcId(vpcId)).thenReturn(existing);
+        NsxAnswer answer = mock(NsxAnswer.class);
+        when(answer.getResult()).thenReturn(false);
+        when(answer.getDetails()).thenReturn("backend deletion failed");
+        when(nsxControllerUtils.sendNsxCommand(any(DeleteNsxTier1GatewayCommand.class), eq(zoneId)))
+                .thenReturn(answer);
+
+        CloudRuntimeException exception = assertThrows(CloudRuntimeException.class,
+                () -> nsxService.deleteVpcNetwork(zoneId, accountId, domainId, vpcId, "VPC01"));
+
+        assertTrue(exception.getMessage().contains("backend deletion failed"));
+        assertEquals(NsxVrfGatewayPlacementVO.State.FAILED.name(), existing.getState());
+        verify(nsxVrfGatewayPlacementDao, times(2)).update(existing.getId(), existing);
+        verify(nsxVrfGatewayPlacementDao, never()).expunge(anyLong());
     }
 
     @Test
@@ -306,6 +476,8 @@ public class NsxServiceImplTest {
         when(vpc.getDomainId()).thenReturn(domainId);
         when(vpc.getZoneId()).thenReturn(zoneId);
         when(vpc.getId()).thenReturn(vpcId);
+        when(nsxVrfGatewayPlacementDao.findByVpcId(vpcId)).thenReturn(placement(null, vpcId, null,
+                "v5-T0", NsxVrfGatewayPlacementVO.State.ACTIVE));
         NsxAnswer answer = mock(NsxAnswer.class);
         when(answer.getResult()).thenReturn(true);
         when(nsxControllerUtils.sendNsxCommand(any(CreateOrUpdateNsxTier1NatRuleCommand.class), eq(zoneId))).thenReturn(answer);

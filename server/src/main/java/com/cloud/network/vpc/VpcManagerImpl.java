@@ -152,6 +152,7 @@ import com.cloud.network.element.NetworkElement;
 import com.cloud.network.element.NsxProviderVO;
 import com.cloud.network.element.StaticNatServiceProvider;
 import com.cloud.network.element.VpcProvider;
+import com.cloud.network.nsx.NsxService;
 import com.cloud.network.router.CommandSetupHelper;
 import com.cloud.network.router.NetworkHelper;
 import com.cloud.network.router.VpcVirtualNetworkApplianceManager;
@@ -188,6 +189,7 @@ import com.cloud.utils.NumbersUtil;
 import com.cloud.utils.Pair;
 import com.cloud.utils.StringUtils;
 import com.cloud.utils.Ternary;
+import com.cloud.utils.component.ComponentContext;
 import com.cloud.utils.component.ManagerBase;
 import com.cloud.utils.concurrency.NamedThreadFactory;
 import com.cloud.utils.db.DB;
@@ -1748,8 +1750,8 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
             cmd.getUseVrIpResolver(), cmd.getKeepMacAddressOnPublicNic());
 
         String sourceNatIP = cmd.getSourceNatIP();
-        boolean forNsx = isVpcForProvider(Provider.Nsx, vpc);
-        boolean forNetris = isVpcForProvider(Provider.Netris, vpc);
+        boolean forNsx = isVpcTier1ForProvider(Provider.Nsx, vpc);
+        boolean forNetris = isVpcTier1ForProvider(Provider.Netris, vpc);
         try {
             if (sourceNatIP != null || forNsx || forNetris) {
                 if (forNsx || forNetris) {
@@ -1789,15 +1791,32 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
         return _vpcOffSvcMapDao.isProviderForVpcOffering(provider, vpc.getVpcOfferingId());
     }
 
+    private boolean isVpcTier1ForProvider(Provider provider, Vpc vpc) {
+        if (vpc == null) {
+            return false;
+        }
+        Map<Service, Set<Provider>> serviceProviders = getVpcOffSvcProvidersMap(vpc.getVpcOfferingId());
+        Set<Provider> sourceNatProviders = serviceProviders.get(Service.SourceNat);
+        Set<Provider> gatewayProviders = serviceProviders.get(Service.Gateway);
+        return (sourceNatProviders != null && sourceNatProviders.contains(provider))
+                || (gatewayProviders != null && gatewayProviders.contains(provider));
+    }
+
     private void allocateSourceNatIp(Vpc vpc, String sourceNatIP) {
         Account account = _accountMgr.getAccount(vpc.getAccountId());
         DataCenter zone = _dcDao.findById(vpc.getZoneId());
         // reserve this ip and then
         try {
-            if (isVpcForProvider(Provider.Nsx, vpc) && org.apache.commons.lang3.StringUtils.isBlank(sourceNatIP)) {
-                logger.debug(String.format("Reserving a source NAT IP for NSX VPC %s", vpc.getName()));
+            if (isVpcTier1ForProvider(Provider.Nsx, vpc) && org.apache.commons.lang3.StringUtils.isBlank(sourceNatIP)) {
+                Long vrfPublicVlanId = getNsxPublicVlanId(vpc);
+                if (vrfPublicVlanId != null) {
+                    _ipAddrMgr.assignDedicateIpAddressFromNsxVrfPublicRange(account, null, vpc.getId(),
+                            zone.getId(), true, vrfPublicVlanId);
+                    return;
+                }
+                logger.debug("Reserving a source NAT IP for NSX VPC {}", vpc.getName());
                 sourceNatIP = reserveSourceNatIpForProviderVpc(account, zone, Provider.Nsx);
-            } else if (isVpcForProvider(Provider.Netris, vpc) && org.apache.commons.lang3.StringUtils.isBlank(sourceNatIP)) {
+            } else if (isVpcTier1ForProvider(Provider.Netris, vpc) && org.apache.commons.lang3.StringUtils.isBlank(sourceNatIP)) {
                 logger.debug(String.format("Reserving a source NAT IP for Netris VPC %s", vpc.getName()));
                 sourceNatIP = reserveSourceNatIpForProviderVpc(account, zone, Provider.Netris);
             }
@@ -1806,6 +1825,15 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
         } catch (ResourceAllocationException | ResourceUnavailableException | InsufficientAddressCapacityException e){
             throw new CloudRuntimeException("new source NAT address cannot be acquired", e);
         }
+    }
+
+    private Long getNsxPublicVlanId(Vpc vpc) {
+        NsxService nsxService = ComponentContext.getDelegateComponentOfType(NsxService.class);
+        if (nsxService == null) {
+            throw new CloudRuntimeException("The NSX service is unavailable");
+        }
+        return nsxService.reserveTier1PlacementAndGetPublicVlanId(vpc.getZoneId(), vpc.getAccountId(), vpc.getDomainId(),
+                vpc.getId(), null);
     }
 
     private String reserveSourceNatIpForProviderVpc(Account account, DataCenter zone, Provider provider) throws ResourceAllocationException {
@@ -2057,13 +2085,11 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
                 .collect(Collectors.toList());
         if (! userIps.isEmpty()) {
             try {
+                validateNsxPublicIpVlan(vpc, requestedIp);
                 _ipAddrMgr.updateSourceNatIpAddress(requestedIp, userIps);
-                if (isVpcForProvider(Provider.Nsx, vpc) || isVpcForProvider(Provider.Netris, vpc)
-                        || isVpcForProvider(Provider.NetworkExtension, vpc)) {
-                    boolean isForNsx = _vpcOffSvcMapDao.isProviderForVpcOffering(Provider.Nsx, vpc.getVpcOfferingId());
-                    boolean isForNetris = _vpcOffSvcMapDao.isProviderForVpcOffering(Provider.Netris, vpc.getVpcOfferingId());
-                    String providerName = isForNsx ? Provider.Nsx.getName()
-                            : (isForNetris ? Provider.Netris.getName() : Provider.NetworkExtension.getName());
+                String providerName = getVpcTier1ProviderName(vpc);
+                if (List.of(Provider.Nsx.getName(), Provider.Netris.getName(), Provider.NetworkExtension.getName())
+                        .contains(providerName)) {
                     VpcProvider providerElement = (VpcProvider) _ntwkModel.getElementImplementingProvider(providerName);
                     if (Objects.nonNull(providerElement)) {
                         providerElement.updateVpcSourceNatIp(vpc, requestedIp);
@@ -2079,6 +2105,22 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
             }
         }
         return true;
+    }
+
+    private String getVpcTier1ProviderName(Vpc vpc) {
+        String provider = _vpcSrvcDao.getProviderForServiceInVpc(vpc.getId(), Service.SourceNat);
+        return provider == null ? _vpcSrvcDao.getProviderForServiceInVpc(vpc.getId(), Service.Gateway) : provider;
+    }
+
+    private void validateNsxPublicIpVlan(Vpc vpc, IpAddress address) {
+        if (!isVpcTier1ForProvider(Provider.Nsx, vpc)) {
+            return;
+        }
+        Long expectedVlanId = getNsxPublicVlanId(vpc);
+        if (expectedVlanId != null && !Objects.equals(expectedVlanId, address.getVlanId())) {
+            throw new InvalidParameterValueException(
+                    "The public IP is not from the range registered to the VPC's NSX VRF gateway");
+        }
     }
 
     @Nullable
@@ -3793,6 +3835,8 @@ public class VpcManagerImpl extends ManagerBase implements VpcManager, VpcProvis
 
         // check permissions
         _accountMgr.checkAccess(caller, null, false, owner, vpc);
+
+        validateNsxPublicIpVlan(vpc, ipToAssoc);
 
         logger.debug(String.format("Associating IP [%s] to VPC [%s]", ipToAssoc, vpc));
 

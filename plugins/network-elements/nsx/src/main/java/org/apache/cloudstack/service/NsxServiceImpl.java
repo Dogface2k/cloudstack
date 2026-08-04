@@ -16,6 +16,7 @@
 // under the License.
 package org.apache.cloudstack.service;
 
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +31,7 @@ import javax.inject.Inject;
 import javax.naming.ConfigurationException;
 
 import org.apache.cloudstack.NsxAnswer;
+import org.apache.cloudstack.NsxVrfGatewayValidationAnswer;
 import org.apache.cloudstack.agent.api.CreateNsxDistributedFirewallRulesCommand;
 import org.apache.cloudstack.agent.api.CreateNsxLoadBalancerRuleCommand;
 import org.apache.cloudstack.agent.api.CreateNsxPortForwardRuleCommand;
@@ -47,6 +49,7 @@ import org.apache.cloudstack.agent.api.DeleteNsxVpnConnectionCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxVpnGatewayCommand;
 import org.apache.cloudstack.agent.api.GetNsxVpnSessionStatusCommand;
 import org.apache.cloudstack.agent.api.UpdateNsxVpnConnectionStateCommand;
+import org.apache.cloudstack.agent.api.ValidateNsxVrfGatewayCommand;
 import org.apache.cloudstack.framework.config.ConfigKey;
 import org.apache.cloudstack.framework.config.Configurable;
 import org.apache.cloudstack.managed.context.ManagedContextRunnable;
@@ -66,11 +69,15 @@ import com.cloud.network.SDNProviderNetworkRule;
 import com.cloud.network.Site2SiteVpnConnection;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.NsxVrfGatewayDao;
+import com.cloud.network.dao.NsxProviderDao;
+import com.cloud.network.dao.NsxVrfGatewayPlacementDao;
 import com.cloud.network.dao.Site2SiteVpnConnectionDao;
 import com.cloud.network.dao.Site2SiteVpnConnectionVO;
 import com.cloud.network.dao.Site2SiteVpnGatewayDao;
 import com.cloud.network.dao.Site2SiteVpnGatewayVO;
 import com.cloud.network.element.NsxVrfGatewayVO;
+import com.cloud.network.element.NsxVrfGatewayPlacementVO;
+import com.cloud.network.element.NsxProviderVO;
 import com.cloud.network.nsx.NsxService;
 import com.cloud.network.nsx.NsxVpnGatewayResult;
 import com.cloud.network.vpc.Vpc;
@@ -125,6 +132,12 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
     Site2SiteVpnGatewayDao site2SiteVpnGatewayDao;
     @Inject
     NsxVrfGatewayDao nsxVrfGatewayDao;
+    @Inject
+    NsxVrfGatewayPlacementDao nsxVrfGatewayPlacementDao;
+    @Inject
+    NsxProviderDao nsxProviderDao;
+    @Inject
+    NsxVrfGatewayLockManager nsxVrfGatewayLockManager;
     @Inject
     DomainDao domainDao;
     @Inject
@@ -181,21 +194,182 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         return super.stop();
     }
 
-    public boolean createVpcNetwork(Long zoneId, long accountId, long domainId, Long vpcId, String vpcName, boolean sourceNatEnabled) {
+    public boolean createVpcNetwork(Long zoneId, long accountId, long domainId, Long vpcId, String vpcName,
+            boolean sourceNatEnabled, Long sourceNatVlanId) {
         CreateNsxTier1GatewayCommand createNsxTier1GatewayCommand =
                 new CreateNsxTier1GatewayCommand(domainId, accountId, zoneId, vpcId, vpcName, true, sourceNatEnabled);
-        applyVrfGateway(createNsxTier1GatewayCommand, zoneId, accountId, domainId);
-        NsxAnswer result = nsxControllerUtils.sendNsxCommand(createNsxTier1GatewayCommand, zoneId);
-        return result.getResult();
+        return createTier1GatewayWithPlacement(createNsxTier1GatewayCommand, sourceNatVlanId);
     }
 
-    protected void applyVrfGateway(CreateNsxTier1GatewayCommand cmd, Long zoneId, long accountId, long domainId) {
-        NsxVrfGatewayVO gateway = resolveVrfGateway(zoneId, accountId, domainId);
-        if (gateway == null) {
-            return;
+    private boolean createTier1GatewayWithPlacement(CreateNsxTier1GatewayCommand cmd, Long sourceNatVlanId) {
+        return nsxVrfGatewayLockManager.withPlacementLock(cmd.isResourceVpc(), cmd.getNetworkResourceId(), () -> {
+            PlacementPlan plan = nsxVrfGatewayLockManager.withZoneLock(cmd.getZoneId(),
+                    () -> preparePlacement(cmd, sourceNatVlanId));
+            try {
+                if (plan.gateway != null) {
+                    validateVrfGatewayForPlacement(plan.gateway);
+                }
+                NsxAnswer result = nsxControllerUtils.sendNsxCommand(cmd, cmd.getZoneId());
+                if (!result.getResult()) {
+                    throw new CloudRuntimeException(String.format(
+                            "Failed to create NSX Tier-1 gateway for %s: %s",
+                            cmd.getNetworkResourceName(), result.getDetails()));
+                }
+                plan.placement.setState(NsxVrfGatewayPlacementVO.State.ACTIVE);
+                updatePlacement(plan.placement);
+                return true;
+            } catch (RuntimeException e) {
+                markPlacementFailed(plan.placement);
+                throw e;
+            }
+        });
+    }
+
+    private PlacementPlan preparePlacement(CreateNsxTier1GatewayCommand cmd, Long sourceNatVlanId) {
+        PlacementPlan plan = reservePlacement(cmd.getZoneId(), cmd.getAccountId(), cmd.getDomainId(),
+                cmd.isResourceVpc() ? cmd.getNetworkResourceId() : null,
+                cmd.isResourceVpc() ? null : cmd.getNetworkResourceId());
+        NsxVrfGatewayVO gateway = plan.gateway;
+        if (gateway != null) {
+            cmd.setTier0Gateway(gateway.getNsxTier0Name());
+            cmd.setEdgeCluster(gateway.getEdgeCluster());
+            if (cmd.isSourceNatEnabled() && sourceNatVlanId != null
+                    && !Objects.equals(gateway.getPublicVlanDbId(), sourceNatVlanId)) {
+                throw new CloudRuntimeException(String.format(
+                        "The source NAT IP for %s must come from public IP range %s assigned to NSX VRF gateway %s",
+                        cmd.getNetworkResourceName(), gateway.getPublicVlanDbId(), gateway.getNsxTier0Name()));
+            }
+        } else {
+            cmd.setTier0Gateway(plan.placement.getTier0Name());
         }
-        cmd.setTier0Gateway(gateway.getNsxTier0Name());
-        cmd.setEdgeCluster(gateway.getEdgeCluster());
+        plan.placement.setState(NsxVrfGatewayPlacementVO.State.PENDING_CREATE);
+        updatePlacement(plan.placement);
+        return plan;
+    }
+
+    private PlacementPlan reservePlacement(long zoneId, long accountId, long domainId, Long vpcId, Long networkId) {
+        NsxVrfGatewayPlacementVO placement = vpcId != null
+                ? nsxVrfGatewayPlacementDao.findByVpcId(vpcId)
+                : nsxVrfGatewayPlacementDao.findByNetworkId(networkId);
+        if (placement != null) {
+            validatePlacementOwner(placement, zoneId, accountId, domainId);
+            if (NsxVrfGatewayPlacementVO.State.PENDING_DELETE.name().equals(placement.getState())) {
+                throw new CloudRuntimeException("The NSX Tier-1 placement is pending deletion");
+            }
+            NsxVrfGatewayVO gateway = placement.getGatewayId() == null
+                    ? null : nsxVrfGatewayDao.findById(placement.getGatewayId());
+            if (placement.getGatewayId() != null && gateway == null) {
+                throw new CloudRuntimeException("The NSX VRF gateway recorded for this Tier-1 placement is unavailable");
+            }
+            return new PlacementPlan(gateway, placement);
+        }
+
+        NsxVrfGatewayVO gateway = resolveVrfGateway(zoneId, accountId, domainId);
+        String tier0Name = gateway == null ? getSharedTier0(zoneId) : gateway.getNsxTier0Name();
+        placement = new NsxVrfGatewayPlacementVO(gateway == null ? null : gateway.getId(), zoneId, domainId,
+                accountId, vpcId, networkId, tier0Name);
+        placement = nsxVrfGatewayPlacementDao.persist(placement);
+        if (placement == null) {
+            throw new CloudRuntimeException("Failed to persist the NSX Tier-1 placement");
+        }
+        return new PlacementPlan(gateway, placement);
+    }
+
+    private void validatePlacementOwner(NsxVrfGatewayPlacementVO placement, long zoneId, long accountId,
+            long domainId) {
+        if (placement.getZoneId() != zoneId || placement.getDomainId() != domainId
+                || placement.getAccountId() != accountId) {
+            throw new CloudRuntimeException("The NSX Tier-1 placement does not belong to the requested tenant");
+        }
+    }
+
+    private String getSharedTier0(long zoneId) {
+        NsxProviderVO provider = nsxProviderDao.findByZoneId(zoneId);
+        if (provider == null || StringUtils.isBlank(provider.getTier0Gateway())) {
+            throw new CloudRuntimeException(String.format("Zone %s has no configured NSX Tier-0 gateway", zoneId));
+        }
+        return provider.getTier0Gateway();
+    }
+
+    private void validateVrfGatewayForPlacement(NsxVrfGatewayVO gateway) {
+        ValidateNsxVrfGatewayCommand command = new ValidateNsxVrfGatewayCommand(gateway.getZoneId(),
+                gateway.getNsxTier0Name(), gateway.getParentTier0(), gateway.getEdgeCluster());
+        NsxAnswer answer = nsxControllerUtils.sendNsxCommandForResult(command, gateway.getZoneId());
+        if (!(answer instanceof NsxVrfGatewayValidationAnswer) || !answer.getResult()) {
+            String details = answer == null ? "no answer was returned" : answer.getDetails();
+            throw new CloudRuntimeException(String.format(
+                    "NSX VRF gateway %s failed placement validation: %s",
+                    gateway.getNsxTier0Name(), details));
+        }
+    }
+
+    private boolean deleteTier1GatewayWithPlacement(DeleteNsxTier1GatewayCommand command, Long vpcId, Long networkId) {
+        boolean isVpc = vpcId != null;
+        long resourceId = isVpc ? vpcId : networkId;
+        return nsxVrfGatewayLockManager.withPlacementLock(isVpc, resourceId, () -> {
+            NsxVrfGatewayPlacementVO placement = nsxVrfGatewayLockManager.withZoneLock(command.getZoneId(),
+                    () -> preparePlacementForDeletion(command, vpcId, networkId));
+            try {
+                NsxAnswer result = nsxControllerUtils.sendNsxCommand(command, command.getZoneId());
+                if (!result.getResult()) {
+                    throw new CloudRuntimeException(String.format(
+                            "Failed to delete NSX Tier-1 gateway: %s", result.getDetails()));
+                }
+                if (placement != null && !nsxVrfGatewayPlacementDao.expunge(placement.getId())) {
+                    throw new CloudRuntimeException(String.format(
+                            "Failed to remove NSX Tier-1 placement %s after backend deletion", placement.getId()));
+                }
+                return true;
+            } catch (RuntimeException e) {
+                if (placement != null) {
+                    markPlacementFailed(placement);
+                }
+                throw e;
+            }
+        });
+    }
+
+    private NsxVrfGatewayPlacementVO preparePlacementForDeletion(DeleteNsxTier1GatewayCommand command,
+            Long vpcId, Long networkId) {
+        NsxVrfGatewayPlacementVO placement = vpcId != null
+                ? nsxVrfGatewayPlacementDao.findByVpcId(vpcId)
+                : nsxVrfGatewayPlacementDao.findByNetworkId(networkId);
+        if (placement != null) {
+            if (placement.getZoneId() != command.getZoneId()
+                    || placement.getAccountId() != command.getAccountId()
+                    || placement.getDomainId() != command.getDomainId()) {
+                throw new CloudRuntimeException("The NSX Tier-1 placement does not belong to the requested tenant");
+            }
+            placement.setState(NsxVrfGatewayPlacementVO.State.PENDING_DELETE);
+            updatePlacement(placement);
+        }
+        return placement;
+    }
+
+    private void updatePlacement(NsxVrfGatewayPlacementVO placement) {
+        placement.setUpdated(new Date());
+        if (!nsxVrfGatewayPlacementDao.update(placement.getId(), placement)) {
+            throw new CloudRuntimeException(String.format(
+                    "Failed to update NSX Tier-1 placement %s", placement.getId()));
+        }
+    }
+
+    private void markPlacementFailed(NsxVrfGatewayPlacementVO placement) {
+        placement.setState(NsxVrfGatewayPlacementVO.State.FAILED);
+        placement.setUpdated(new Date());
+        if (!nsxVrfGatewayPlacementDao.update(placement.getId(), placement)) {
+            logger.error("Failed to mark NSX Tier-1 placement {} as failed", placement.getId());
+        }
+    }
+
+    private static class PlacementPlan {
+        private final NsxVrfGatewayVO gateway;
+        private final NsxVrfGatewayPlacementVO placement;
+
+        PlacementPlan(NsxVrfGatewayVO gateway, NsxVrfGatewayPlacementVO placement) {
+            this.gateway = gateway;
+            this.placement = placement;
+        }
     }
 
     protected NsxVrfGatewayVO resolveVrfGateway(Long zoneId, long accountId, long domainId) {
@@ -259,6 +433,8 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
         long zoneId = vpc.getZoneId();
         long vpcId = vpc.getId();
 
+        validatePublicIpVlan(zoneId, accountId, domainId, vpcId, null, address.getVlanId());
+
         logger.debug("Updating the source NAT IP for NSX VPC {} to IP: {}", vpc, address.getAddress().addr());
         String tier1GatewayName = NsxControllerUtils.getTier1GatewayName(domainId, accountId, zoneId, vpcId, true);
         String sourceNatRuleId = NsxControllerUtils.getNsxNatRuleId(domainId, accountId, zoneId, vpcId, true);
@@ -272,20 +448,77 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
     }
 
     @Override
+    public Long reserveTier1PlacementAndGetPublicVlanId(long zoneId, long accountId, long domainId, Long vpcId,
+            Long networkId) {
+        if ((vpcId == null) == (networkId == null)) {
+            throw new IllegalArgumentException("Exactly one of vpcId or networkId is required");
+        }
+        long resourceId = vpcId != null ? vpcId : networkId;
+        return nsxVrfGatewayLockManager.withPlacementLock(vpcId != null, resourceId,
+                () -> nsxVrfGatewayLockManager.withZoneLock(zoneId, () -> {
+                    PlacementPlan plan = reservePlacement(zoneId, accountId, domainId, vpcId, networkId);
+                    return plan.gateway == null ? null : plan.gateway.getPublicVlanDbId();
+                }));
+    }
+
+    @Override
+    public Long getPublicVlanId(long zoneId, long accountId, long domainId, Long vpcId, Long networkId) {
+        if ((vpcId == null) == (networkId == null)) {
+            throw new IllegalArgumentException("Exactly one of vpcId or networkId is required");
+        }
+        long resourceId = vpcId != null ? vpcId : networkId;
+        return nsxVrfGatewayLockManager.withPlacementLock(vpcId != null, resourceId, () -> {
+            PlacementPlan plan = getRecordedPlacement(zoneId, accountId, domainId, vpcId, networkId);
+            return plan.gateway == null ? null : plan.gateway.getPublicVlanDbId();
+        });
+    }
+
+    private PlacementPlan getRecordedPlacement(long zoneId, long accountId, long domainId, Long vpcId,
+            Long networkId) {
+        NsxVrfGatewayPlacementVO placement = vpcId != null
+                ? nsxVrfGatewayPlacementDao.findByVpcId(vpcId)
+                : nsxVrfGatewayPlacementDao.findByNetworkId(networkId);
+        if (placement == null) {
+            throw new CloudRuntimeException(
+                    "The NSX Tier-1 has no recorded placement; backfill its current Tier-0 placement before continuing");
+        }
+        validatePlacementOwner(placement, zoneId, accountId, domainId);
+        if (NsxVrfGatewayPlacementVO.State.FAILED.name().equals(placement.getState())) {
+            throw new CloudRuntimeException("The NSX Tier-1 placement is in a failed state");
+        }
+        if (NsxVrfGatewayPlacementVO.State.PENDING_DELETE.name().equals(placement.getState())) {
+            throw new CloudRuntimeException("The NSX Tier-1 placement is pending deletion");
+        }
+        NsxVrfGatewayVO gateway = placement.getGatewayId() == null
+                ? null : nsxVrfGatewayDao.findById(placement.getGatewayId());
+        if (placement.getGatewayId() != null && gateway == null) {
+            throw new CloudRuntimeException("The NSX VRF gateway recorded for this Tier-1 placement is unavailable");
+        }
+        return new PlacementPlan(gateway, placement);
+    }
+
+    @Override
+    public void validatePublicIpVlan(long zoneId, long accountId, long domainId, Long vpcId, Long networkId,
+            long vlanId) {
+        Long expectedVlanId = getPublicVlanId(zoneId, accountId, domainId, vpcId, networkId);
+        if (expectedVlanId != null && expectedVlanId != vlanId) {
+            throw new CloudRuntimeException(String.format(
+                    "Public IP range %s does not belong to the NSX VRF gateway used by this Tier-1", vlanId));
+        }
+    }
+
+    @Override
     public boolean createNetwork(Long zoneId, long accountId, long domainId, Long networkId, String networkName,
                                  boolean sourceNatEnabled) {
         CreateNsxTier1GatewayCommand createNsxTier1GatewayCommand =
                 new CreateNsxTier1GatewayCommand(domainId, accountId, zoneId, networkId, networkName, false, sourceNatEnabled);
-        applyVrfGateway(createNsxTier1GatewayCommand, zoneId, accountId, domainId);
-        NsxAnswer result = nsxControllerUtils.sendNsxCommand(createNsxTier1GatewayCommand, zoneId);
-        return result.getResult();
+        return createTier1GatewayWithPlacement(createNsxTier1GatewayCommand, null);
     }
 
     public boolean deleteVpcNetwork(Long zoneId, long accountId, long domainId, Long vpcId, String vpcName) {
         DeleteNsxTier1GatewayCommand deleteNsxTier1GatewayCommand =
                 new DeleteNsxTier1GatewayCommand(domainId, accountId, zoneId, vpcId, vpcName, true);
-        NsxAnswer result = nsxControllerUtils.sendNsxCommand(deleteNsxTier1GatewayCommand, zoneId);
-        return result.getResult();
+        return deleteTier1GatewayWithPlacement(deleteNsxTier1GatewayCommand, vpcId, null);
     }
 
     public boolean deleteNetwork(long zoneId, long accountId, long domainId, NetworkVO network) {
@@ -305,7 +538,7 @@ public class NsxServiceImpl extends ManagerBase implements NsxService, Configura
 
         if (Objects.isNull(network.getVpcId())) {
             DeleteNsxTier1GatewayCommand deleteNsxTier1GatewayCommand = new DeleteNsxTier1GatewayCommand(domainId, accountId, zoneId, network.getId(), network.getName(), false);
-            result = nsxControllerUtils.sendNsxCommand(deleteNsxTier1GatewayCommand, zoneId);
+            return deleteTier1GatewayWithPlacement(deleteNsxTier1GatewayCommand, null, network.getId());
         }
         return result.getResult();
     }

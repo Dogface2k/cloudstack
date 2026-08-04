@@ -35,6 +35,7 @@ import com.vmware.nsx.model.TransportZone;
 import com.vmware.nsx.model.TransportZoneListResult;
 import com.vmware.nsx_policy.model.Segment;
 import org.apache.cloudstack.NsxAnswer;
+import org.apache.cloudstack.NsxVrfGatewayValidationAnswer;
 import org.apache.cloudstack.StartupNsxCommand;
 import org.apache.cloudstack.agent.api.CreateNsxDhcpRelayConfigCommand;
 import org.apache.cloudstack.agent.api.CreateNsxDistributedFirewallRulesCommand;
@@ -55,6 +56,7 @@ import org.apache.cloudstack.agent.api.DeleteNsxVpnConnectionCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxVpnGatewayCommand;
 import org.apache.cloudstack.agent.api.GetNsxVpnSessionStatusCommand;
 import org.apache.cloudstack.agent.api.UpdateNsxVpnConnectionStateCommand;
+import org.apache.cloudstack.agent.api.ValidateNsxVrfGatewayCommand;
 import org.apache.cloudstack.service.NsxApiClient;
 import org.apache.cloudstack.utils.NsxControllerUtils;
 import org.apache.commons.collections.CollectionUtils;
@@ -126,6 +128,8 @@ public class NsxResource implements ServerResource {
             return executeRequest((ReadyCommand) cmd);
         } else if (cmd instanceof CheckHealthCommand) {
             return executeRequest((CheckHealthCommand) cmd);
+        } else if (cmd instanceof ValidateNsxVrfGatewayCommand) {
+            return executeRequest((ValidateNsxVrfGatewayCommand) cmd);
         } else if (cmd instanceof DeleteNsxTier1GatewayCommand) {
             return executeRequest((DeleteNsxTier1GatewayCommand) cmd);
         } else if (cmd instanceof DeleteNsxSegmentCommand) {
@@ -331,6 +335,17 @@ public class NsxResource implements ServerResource {
 
     private Answer executeRequest(CheckHealthCommand cmd) {
         return new CheckHealthAnswer(cmd, nsxApiClient.isNsxControllerActive());
+    }
+
+    private Answer executeRequest(ValidateNsxVrfGatewayCommand cmd) {
+        try {
+            NsxApiClient.VrfGatewayValidation validation = nsxApiClient.validateVrfGateway(
+                    cmd.getTier0Gateway(), cmd.getExpectedParentTier0(), cmd.getExpectedEdgeCluster());
+            return new NsxVrfGatewayValidationAnswer(cmd, true, null,
+                    validation.getEdgeClusterPath(), validation.getParentTier0Path());
+        } catch (CloudRuntimeException e) {
+            return new NsxVrfGatewayValidationAnswer(cmd, e);
+        }
     }
 
     private Answer executeRequest(CreateNsxTier1GatewayCommand cmd) {

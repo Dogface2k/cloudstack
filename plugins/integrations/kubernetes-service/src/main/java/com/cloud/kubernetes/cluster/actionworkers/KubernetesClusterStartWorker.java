@@ -62,6 +62,7 @@ import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterDetailsVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
 import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleAdoptionSpec;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleOwnershipState;
 import com.cloud.kubernetes.cluster.KubernetesClusterService;
 import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
@@ -740,7 +741,7 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         return new KubernetesClusterNetworkRuleOwnershipValidator(this).adopt(specs);
     }
 
-    private void startKubernetesClusterVMs(Long domainId, Long accountId) {
+    protected void startKubernetesClusterVMs(Long domainId, Long accountId) {
         List <UserVm> clusterVms = getKubernetesClusterVMs();
         for (final UserVm vm : clusterVms) {
             if (vm == null) {
@@ -762,6 +763,18 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
                 logTransitStateAndThrow(Level.ERROR, String.format("Failed to start all VMs in Kubernetes cluster : %s", kubernetesCluster.getName()), kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed);
             }
         }
+    }
+
+    protected boolean reconcileManagedNetworkRulesBeforeReadiness() {
+        KubernetesClusterVO currentCluster = kubernetesClusterDao.findById(kubernetesCluster.getId());
+        if (currentCluster == null) {
+            throw new CloudRuntimeException(String.format("Kubernetes cluster %s cannot be found", kubernetesCluster.getName()));
+        }
+        if (!KubernetesCluster.ClusterType.CloudManaged.equals(currentCluster.getClusterType())
+                || !KubernetesClusterNetworkRuleOwnershipState.MANAGED.equals(currentCluster.getNetworkRuleOwnershipState())) {
+            return true;
+        }
+        return reconcileKubernetesClusterNetworkRules();
     }
 
     private KubernetesServiceHelper.KubernetesClusterNodeType getNodeTypeFromClusterVMMapRecord(KubernetesClusterVmMapVO map) {
@@ -957,6 +970,14 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         stateTransitTo(kubernetesCluster.getId(), KubernetesCluster.Event.StartRequested);
         startKubernetesClusterVMs(domainId, accountId);
         try {
+            if (!reconcileManagedNetworkRulesBeforeReadiness()) {
+                throw new CloudRuntimeException("Managed network-rule reconciliation did not complete");
+            }
+        } catch (CloudRuntimeException e) {
+            logTransitStateAndThrow(Level.ERROR, String.format("Failed to start Kubernetes cluster : %s, unable to reconcile managed network rules",
+                    kubernetesCluster.getName()), kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed, e);
+        }
+        try {
             InetAddress address = InetAddress.getByName(new URL(kubernetesCluster.getEndpoint()).getHost());
         } catch (MalformedURLException | UnknownHostException ex) {
             logTransitStateAndThrow(Level.ERROR, String.format("Kubernetes cluster : %s has invalid API endpoint. Can not verify if cluster is in ready state", kubernetesCluster.getName()), kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed);
@@ -986,6 +1007,14 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
     public boolean reconcileAlertCluster() {
         init();
         final long startTimeoutTime = System.currentTimeMillis() + 3 * 60 * 1000;
+        try {
+            if (!reconcileManagedNetworkRulesBeforeReadiness()) {
+                return false;
+            }
+        } catch (CloudRuntimeException e) {
+            logger.warn("Failed to reconcile managed network rules while recovering Kubernetes cluster {}", kubernetesCluster, e);
+            return false;
+        }
         List<KubernetesClusterVmMapVO> vmMapVOList = getKubernetesClusterVMMaps();
         if (CollectionUtils.isEmpty(vmMapVOList) || vmMapVOList.size() != kubernetesCluster.getTotalNodeCount()) {
             return false;
@@ -1019,8 +1048,7 @@ public class KubernetesClusterStartWorker extends KubernetesClusterResourceModif
         if (!isKubernetesClusterDashboardServiceRunning(false, startTimeoutTime)) {
             return false;
         }
-        // mark the cluster to be running
-        stateTransitTo(kubernetesCluster.getId(), KubernetesCluster.Event.RecoveryRequested);
+        // Alert recovery is reserved by the scanner before this queued worker starts.
         stateTransitTo(kubernetesCluster.getId(), KubernetesCluster.Event.OperationSucceeded);
         return true;
     }

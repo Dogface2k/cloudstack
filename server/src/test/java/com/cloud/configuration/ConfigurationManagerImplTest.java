@@ -18,11 +18,14 @@ package com.cloud.configuration;
 
 import com.cloud.alert.AlertManager;
 import com.cloud.capacity.dao.CapacityDao;
+import com.cloud.dc.AccountVlanMapVO;
 import com.cloud.dc.DataCenterVO;
 import com.cloud.dc.VlanVO;
+import com.cloud.dc.dao.AccountVlanMapDao;
 import com.cloud.dc.dao.DataCenterDao;
 import com.cloud.dc.dao.DataCenterIpAddressDao;
 import com.cloud.dc.dao.DedicatedResourceDao;
+import com.cloud.dc.dao.DomainVlanMapDao;
 import com.cloud.dc.dao.HostPodDao;
 import com.cloud.dc.dao.VlanDao;
 import com.cloud.domain.Domain;
@@ -34,10 +37,15 @@ import com.cloud.network.NetworkModel;
 import com.cloud.network.NetworkService;
 import com.cloud.network.Networks;
 import com.cloud.network.dao.IPAddressDao;
+import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.NetrisProviderDao;
 import com.cloud.network.dao.NsxProviderDao;
+import com.cloud.network.dao.NsxVrfGatewayDao;
+import com.cloud.network.dao.NsxVrfGatewayPlacementDao;
 import com.cloud.network.dao.PhysicalNetworkDao;
 import com.cloud.network.element.NsxProviderVO;
+import com.cloud.network.element.NsxVrfGatewayVO;
+import com.cloud.network.nsx.NsxService;
 import com.cloud.offering.DiskOffering;
 import com.cloud.offering.NetworkOffering;
 import com.cloud.offerings.NetworkOfferingVO;
@@ -49,10 +57,12 @@ import com.cloud.storage.dao.VMTemplateZoneDao;
 import com.cloud.storage.dao.VolumeDao;
 import com.cloud.user.Account;
 import com.cloud.user.AccountManagerImpl;
+import com.cloud.user.ResourceLimitService;
 import com.cloud.user.User;
 import com.cloud.utils.DomainHelper;
 import com.cloud.utils.Pair;
 import com.cloud.utils.db.EntityManager;
+import com.cloud.utils.db.GlobalLock;
 import com.cloud.utils.db.SearchCriteria;
 import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.net.NetUtils;
@@ -147,6 +157,10 @@ public class ConfigurationManagerImplTest {
     @Mock
     NsxProviderDao nsxProviderDao;
     @Mock
+    NsxVrfGatewayDao nsxVrfGatewayDao;
+    @Mock
+    NsxVrfGatewayPlacementDao nsxVrfGatewayPlacementDao;
+    @Mock
     NetrisProviderDao netrisProviderDao;
     @Mock
     DataCenterDao zoneDao;
@@ -169,6 +183,10 @@ public class ConfigurationManagerImplTest {
     @Mock
     VlanDao vlanDao;
     @Mock
+    AccountVlanMapDao accountVlanMapDao;
+    @Mock
+    DomainVlanMapDao domainVlanMapDao;
+    @Mock
     VMTemplateZoneDao vmTemplateZoneDao;
     @Mock
     CapacityDao capacityDao;
@@ -190,6 +208,8 @@ public class ConfigurationManagerImplTest {
     StoragePoolDetailsDao storagePoolDetailsDao;
     @Mock
     DomainHelper domainHelper;
+    @Mock
+    ResourceLimitService resourceLimitService;
 
     DeleteZoneCmd deleteZoneCmd;
     CreateNetworkOfferingCmd createNetworkOfferingCmd;
@@ -1443,6 +1463,155 @@ public class ConfigurationManagerImplTest {
 
         Assert.assertThrows(InvalidParameterValueException.class,
                 () -> configurationManagerImplSpy.validateNtwkOffDetails(details, serviceProviderMap));
+    }
+
+    @Test
+    public void testValidateNetworkOfferingDetailsRejectsNsxSegmentProfileWhenOnlyAnotherServiceUsesNsx() {
+        Map<NetworkOffering.Detail, String> details = Map.of(
+                NetworkOffering.Detail.NsxIpDiscoveryProfileId, "cloudstack-ip-discovery");
+        Map<Network.Service, Set<Network.Provider>> serviceProviderMap = Map.of(
+                Network.Service.Connectivity, Set.of(Network.Provider.VPCVirtualRouter),
+                Network.Service.Lb, Set.of(Network.Provider.Nsx));
+
+        Assert.assertThrows(InvalidParameterValueException.class,
+                () -> configurationManagerImplSpy.validateNtwkOffDetails(details, serviceProviderMap));
+    }
+
+    @Test
+    public void testUpdateVlanRejectsSubnetMetadataChangeForRegisteredVrfRange() throws Exception {
+        VlanVO vlan = mock(VlanVO.class);
+        when(vlan.getId()).thenReturn(1L);
+        when(vlan.getDataCenterId()).thenReturn(2L);
+        when(vlan.getVlanGateway()).thenReturn("192.0.2.1");
+        when(vlanDao.findById(1L)).thenReturn(vlan);
+        NsxVrfGatewayVO gateway = mock(NsxVrfGatewayVO.class);
+        when(gateway.getNsxTier0Name()).thenReturn("CS-VRF-001");
+        when(nsxVrfGatewayDao.findByPublicVlan(1L)).thenReturn(gateway);
+        GlobalLock lock = mock(GlobalLock.class);
+        when(lock.lock(30)).thenReturn(true);
+
+        try (MockedStatic<GlobalLock> globalLock = Mockito.mockStatic(GlobalLock.class)) {
+            globalLock.when(() -> GlobalLock.getInternLock(NsxService.getVrfZoneLockName(2L))).thenReturn(lock);
+
+            Assert.assertThrows(InvalidParameterValueException.class,
+                    () -> configurationManagerImplSpy.updateVlanAndPublicIpRange(1L, null, null,
+                            "192.0.2.254", null, null, null, null, null, null));
+        }
+
+        verify(lock).unlock();
+        verify(lock).releaseRef();
+    }
+
+    @Test
+    public void testUpdateVlanRejectsSystemVmFlagChangeForRegisteredVrfRange() throws Exception {
+        VlanVO vlan = mock(VlanVO.class);
+        when(vlan.getId()).thenReturn(1L);
+        when(vlan.getDataCenterId()).thenReturn(2L);
+        when(vlan.getVlanGateway()).thenReturn("192.0.2.1");
+        when(vlanDao.findById(1L)).thenReturn(vlan);
+        IPAddressVO address = mock(IPAddressVO.class);
+        when(address.isForSystemVms()).thenReturn(false);
+        when(publicIpAddressDao.listByVlanId(1L)).thenReturn(List.of(address));
+        NsxVrfGatewayVO gateway = mock(NsxVrfGatewayVO.class);
+        when(gateway.getNsxTier0Name()).thenReturn("CS-VRF-001");
+        when(nsxVrfGatewayDao.findByPublicVlan(1L)).thenReturn(gateway);
+        GlobalLock lock = mock(GlobalLock.class);
+        when(lock.lock(30)).thenReturn(true);
+
+        try (MockedStatic<GlobalLock> globalLock = Mockito.mockStatic(GlobalLock.class)) {
+            globalLock.when(() -> GlobalLock.getInternLock(NsxService.getVrfZoneLockName(2L))).thenReturn(lock);
+
+            Assert.assertThrows(InvalidParameterValueException.class,
+                    () -> configurationManagerImplSpy.updateVlanAndPublicIpRange(1L, null, null,
+                            null, null, null, null, null, null, true));
+        }
+
+        verify(lock).unlock();
+        verify(lock).releaseRef();
+    }
+
+    @Test
+    public void testDeleteVlanRejectsRegisteredVrfRange() {
+        VlanVO vlan = mock(VlanVO.class);
+        when(vlan.getId()).thenReturn(1L);
+        when(vlan.getDataCenterId()).thenReturn(2L);
+        when(vlanDao.findById(1L)).thenReturn(vlan);
+        NsxVrfGatewayVO gateway = mock(NsxVrfGatewayVO.class);
+        when(gateway.getNsxTier0Name()).thenReturn("CS-VRF-001");
+        when(nsxVrfGatewayDao.findByPublicVlan(1L)).thenReturn(gateway);
+        GlobalLock lock = mock(GlobalLock.class);
+        when(lock.lock(30)).thenReturn(true);
+
+        try (MockedStatic<GlobalLock> globalLock = Mockito.mockStatic(GlobalLock.class)) {
+            globalLock.when(() -> GlobalLock.getInternLock(NsxService.getVrfZoneLockName(2L))).thenReturn(lock);
+
+            Assert.assertThrows(InvalidParameterValueException.class,
+                    () -> configurationManagerImplSpy.deleteVlanAndPublicIpRange(1L, 1L, accountMock));
+        }
+
+        verify(lock).unlock();
+        verify(lock).releaseRef();
+    }
+
+    @Test
+    public void testOwnerRangeCleanupReleasesVrfAssignmentWhenNoPlacementsRemain() {
+        VlanVO vlan = mock(VlanVO.class);
+        when(vlan.getId()).thenReturn(1L);
+        when(vlan.getDataCenterId()).thenReturn(2L);
+        when(vlanDao.findById(1L)).thenReturn(vlan);
+        NsxVrfGatewayVO gateway = mock(NsxVrfGatewayVO.class);
+        when(gateway.getId()).thenReturn(3L);
+        when(gateway.getAccountId()).thenReturn(42L);
+        when(gateway.getNsxTier0Name()).thenReturn("CS-VRF-001");
+        when(nsxVrfGatewayDao.findByPublicVlan(1L)).thenReturn(gateway);
+        when(nsxVrfGatewayDao.update(3L, gateway)).thenReturn(true);
+        AccountVlanMapVO accountVlanMap = mock(AccountVlanMapVO.class);
+        when(accountVlanMap.getId()).thenReturn(4L);
+        when(accountVlanMap.getAccountId()).thenReturn(42L);
+        when(accountVlanMapDao.listAccountVlanMapsByVlan(1L)).thenReturn(List.of(accountVlanMap));
+        when(accountVlanMapDao.remove(4L)).thenReturn(true);
+        when(publicIpAddressDao.listByVlanId(1L)).thenReturn(List.of());
+        GlobalLock lock = mock(GlobalLock.class);
+        when(lock.lock(30)).thenReturn(true);
+
+        try (MockedStatic<GlobalLock> globalLock = Mockito.mockStatic(GlobalLock.class)) {
+            globalLock.when(() -> GlobalLock.getInternLock(NsxService.getVrfZoneLockName(2L))).thenReturn(lock);
+
+            Boolean released = ReflectionTestUtils.invokeMethod(configurationManagerImplSpy,
+                    "releaseOwnerPublicIpRange", 1L, userMock, accountMock, 42L, null);
+            Assert.assertTrue(released);
+        }
+
+        verify(gateway).setScope(null);
+        verify(gateway).setAccountId(null);
+        verify(gateway).setDomainId(null);
+        verify(nsxVrfGatewayDao).update(3L, gateway);
+    }
+
+    @Test
+    public void testOwnerRangeCleanupRejectsVrfAssignmentWithPlacements() {
+        VlanVO vlan = mock(VlanVO.class);
+        when(vlan.getId()).thenReturn(1L);
+        when(vlan.getDataCenterId()).thenReturn(2L);
+        when(vlanDao.findById(1L)).thenReturn(vlan);
+        NsxVrfGatewayVO gateway = mock(NsxVrfGatewayVO.class);
+        when(gateway.getId()).thenReturn(3L);
+        when(gateway.getAccountId()).thenReturn(42L);
+        when(gateway.getNsxTier0Name()).thenReturn("CS-VRF-001");
+        when(nsxVrfGatewayDao.findByPublicVlan(1L)).thenReturn(gateway);
+        when(nsxVrfGatewayPlacementDao.countByGatewayId(3L)).thenReturn(1L);
+        GlobalLock lock = mock(GlobalLock.class);
+        when(lock.lock(30)).thenReturn(true);
+
+        try (MockedStatic<GlobalLock> globalLock = Mockito.mockStatic(GlobalLock.class)) {
+            globalLock.when(() -> GlobalLock.getInternLock(NsxService.getVrfZoneLockName(2L))).thenReturn(lock);
+
+            Assert.assertThrows(InvalidParameterValueException.class,
+                    () -> ReflectionTestUtils.invokeMethod(configurationManagerImplSpy,
+                            "releaseOwnerPublicIpRange", 1L, userMock, accountMock, 42L, null));
+        }
+
+        verify(nsxVrfGatewayDao, Mockito.never()).update(anyLong(), any());
     }
 
     @Test

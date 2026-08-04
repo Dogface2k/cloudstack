@@ -22,6 +22,8 @@ import java.util.Set;
 
 import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterManagerImpl;
+import com.cloud.kubernetes.cluster.KubernetesClusterNetworkRuleOwnershipState;
+import com.cloud.kubernetes.cluster.KubernetesClusterVO;
 import com.cloud.kubernetes.cluster.KubernetesClusterVmMapVO;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDao;
 import com.cloud.kubernetes.cluster.dao.KubernetesClusterDetailsDao;
@@ -36,6 +38,7 @@ import com.cloud.user.AccountVO;
 import com.cloud.user.dao.AccountDao;
 import com.cloud.uservm.UserVm;
 import com.cloud.vm.UserVmVO;
+import com.cloud.utils.exception.CloudRuntimeException;
 import com.cloud.utils.net.Ip;
 import com.cloud.vm.dao.UserVmDao;
 
@@ -173,5 +176,111 @@ public class KubernetesClusterStartWorkerTest {
         Mockito.verify(worker).deleteManagedNetworkRulesNotIn(desiredRoles.capture(), Mockito.eq(network));
         Assert.assertEquals(Set.of("API_FIREWALL", "SSH_FIREWALL", "ETCD_SSH_FIREWALL:11", "API_LOAD_BALANCER",
                 "SSH_PORT_FORWARD:10", "SSH_PORT_FORWARD:11", "SSH_PORT_FORWARD:12"), desiredRoles.getValue());
+    }
+
+    @Test
+    public void managedClusterReconcilesRulesBeforeReadiness() {
+        KubernetesClusterVO currentCluster = mockManagedCluster();
+        Mockito.when(clusterDao.findById(1L)).thenReturn(currentCluster);
+        Mockito.doReturn(true).when(worker).reconcileKubernetesClusterNetworkRules();
+
+        Assert.assertTrue(worker.reconcileManagedNetworkRulesBeforeReadiness());
+
+        Mockito.verify(worker).reconcileKubernetesClusterNetworkRules();
+    }
+
+    @Test
+    public void legacyClusterDoesNotClaimRulesDuringReadiness() {
+        KubernetesClusterVO currentCluster = Mockito.mock(KubernetesClusterVO.class);
+        Mockito.when(cluster.getId()).thenReturn(1L);
+        Mockito.when(currentCluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(currentCluster.getNetworkRuleOwnershipState()).thenReturn(KubernetesClusterNetworkRuleOwnershipState.LEGACY_UNMANAGED);
+        Mockito.when(clusterDao.findById(1L)).thenReturn(currentCluster);
+
+        Assert.assertTrue(worker.reconcileManagedNetworkRulesBeforeReadiness());
+
+        Mockito.verify(worker, Mockito.never()).reconcileKubernetesClusterNetworkRules();
+    }
+
+    @Test
+    public void stoppedClusterStartsVmsThenReconcilesBeforeEndpointReadiness() {
+        KubernetesClusterVO currentCluster = mockManagedCluster();
+        Mockito.when(cluster.getName()).thenReturn("cluster");
+        Mockito.when(cluster.getEndpoint()).thenReturn("not-a-url");
+        Mockito.when(clusterDao.findById(1L)).thenReturn(currentCluster);
+        Mockito.doNothing().when(worker).init();
+        Mockito.doReturn(true).when(worker).stateTransitTo(Mockito.anyLong(), Mockito.any());
+        Mockito.doNothing().when(worker).startKubernetesClusterVMs(4L, 5L);
+        Mockito.doReturn(true).when(worker).reconcileKubernetesClusterNetworkRules();
+        Mockito.doThrow(new CloudRuntimeException("expected endpoint failure")).when(worker).logTransitStateAndThrow(
+                Mockito.any(), Mockito.anyString(), Mockito.anyLong(), Mockito.any());
+
+        try {
+            worker.startStoppedKubernetesCluster(4L, 5L);
+            Assert.fail("Expected endpoint validation to fail");
+        } catch (CloudRuntimeException expected) {
+            Assert.assertEquals("expected endpoint failure", expected.getMessage());
+        }
+
+        org.mockito.InOrder ordering = Mockito.inOrder(worker);
+        ordering.verify(worker).startKubernetesClusterVMs(4L, 5L);
+        ordering.verify(worker).reconcileKubernetesClusterNetworkRules();
+    }
+
+    @Test
+    public void stoppedClusterDoesNotProbeReadinessWhenManagedRuleReconciliationFails() {
+        KubernetesClusterVO currentCluster = mockManagedCluster();
+        Mockito.when(cluster.getName()).thenReturn("cluster");
+        Mockito.when(clusterDao.findById(1L)).thenReturn(currentCluster);
+        Mockito.doNothing().when(worker).init();
+        Mockito.doReturn(true).when(worker).stateTransitTo(Mockito.anyLong(), Mockito.any());
+        Mockito.doNothing().when(worker).startKubernetesClusterVMs(4L, 5L);
+        Mockito.doReturn(false).when(worker).reconcileKubernetesClusterNetworkRules();
+        Mockito.doThrow(new CloudRuntimeException("expected reconciliation failure")).when(worker).logTransitStateAndThrow(
+                Mockito.any(), Mockito.anyString(), Mockito.anyLong(), Mockito.any(), Mockito.any());
+
+        try {
+            worker.startStoppedKubernetesCluster(4L, 5L);
+            Assert.fail("Expected reconciliation failure");
+        } catch (CloudRuntimeException expected) {
+            Assert.assertEquals("expected reconciliation failure", expected.getMessage());
+        }
+
+        Mockito.verify(worker, Mockito.never()).getKubernetesClusterServerIpSshPort(Mockito.any());
+    }
+
+    @Test
+    public void alertRecoveryReconcilesManagedRulesBeforeInspectingNodes() {
+        KubernetesClusterVO currentCluster = mockManagedCluster();
+        Mockito.when(clusterDao.findById(1L)).thenReturn(currentCluster);
+        Mockito.doNothing().when(worker).init();
+        Mockito.doReturn(true).when(worker).reconcileKubernetesClusterNetworkRules();
+        Mockito.doReturn(java.util.Collections.emptyList()).when(worker).getKubernetesClusterVMMaps();
+
+        Assert.assertFalse(worker.reconcileAlertCluster());
+
+        org.mockito.InOrder ordering = Mockito.inOrder(worker);
+        ordering.verify(worker).reconcileKubernetesClusterNetworkRules();
+        ordering.verify(worker).getKubernetesClusterVMMaps();
+    }
+
+    @Test
+    public void alertRecoveryStopsBeforeNodeChecksWhenManagedRuleReconciliationFails() {
+        KubernetesClusterVO currentCluster = mockManagedCluster();
+        Mockito.when(clusterDao.findById(1L)).thenReturn(currentCluster);
+        Mockito.doNothing().when(worker).init();
+        Mockito.doReturn(false).when(worker).reconcileKubernetesClusterNetworkRules();
+
+        Assert.assertFalse(worker.reconcileAlertCluster());
+
+        Mockito.verify(worker, Mockito.never()).getKubernetesClusterVMMaps();
+    }
+
+    private KubernetesClusterVO mockManagedCluster() {
+        KubernetesClusterVO currentCluster = Mockito.mock(KubernetesClusterVO.class);
+        Mockito.when(cluster.getId()).thenReturn(1L);
+        Mockito.when(currentCluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(currentCluster.getNetworkRuleOwnershipState()).thenReturn(KubernetesClusterNetworkRuleOwnershipState.MANAGED);
+        return currentCluster;
     }
 }

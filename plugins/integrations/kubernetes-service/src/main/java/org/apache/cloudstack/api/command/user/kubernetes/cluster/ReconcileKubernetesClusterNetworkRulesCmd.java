@@ -19,6 +19,8 @@ package org.apache.cloudstack.api.command.user.kubernetes.cluster;
 import javax.inject.Inject;
 
 import org.apache.cloudstack.acl.RoleType;
+import org.apache.cloudstack.acl.SecurityChecker;
+import org.apache.cloudstack.api.ACL;
 import org.apache.cloudstack.api.APICommand;
 import org.apache.cloudstack.api.ApiCommandResourceType;
 import org.apache.cloudstack.api.ApiConstants;
@@ -49,6 +51,7 @@ public class ReconcileKubernetesClusterNetworkRulesCmd extends BaseAsyncCmd {
     @Inject
     public KubernetesClusterService kubernetesClusterService;
 
+    @ACL(accessType = SecurityChecker.AccessType.OperateEntry)
     @Parameter(name = ApiConstants.ID, type = CommandType.UUID, required = true,
             entityType = KubernetesClusterResponse.class,
             description = "The ID of the Kubernetes cluster")

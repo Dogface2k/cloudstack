@@ -251,6 +251,8 @@ import com.cloud.network.dao.NetrisProviderDao;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.NsxProviderDao;
+import com.cloud.network.dao.NsxVrfGatewayDao;
+import com.cloud.network.dao.NsxVrfGatewayPlacementDao;
 import com.cloud.network.dao.PhysicalNetworkDao;
 import com.cloud.network.dao.PhysicalNetworkTrafficTypeDao;
 import com.cloud.network.dao.PhysicalNetworkTrafficTypeVO;
@@ -258,6 +260,8 @@ import com.cloud.network.dao.PhysicalNetworkVO;
 import com.cloud.network.dao.UserIpv6AddressDao;
 import com.cloud.network.element.NetrisProviderVO;
 import com.cloud.network.element.NsxProviderVO;
+import com.cloud.network.element.NsxVrfGatewayVO;
+import com.cloud.network.nsx.NsxService;
 import com.cloud.network.netris.NetrisService;
 import com.cloud.network.rules.LoadBalancerContainer.Scheme;
 import com.cloud.network.vpc.VpcManager;
@@ -391,6 +395,10 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
     VlanDao _vlanDao;
     @Inject
     VlanDetailsDao vlanDetailsDao;
+    @Inject
+    NsxVrfGatewayDao nsxVrfGatewayDao;
+    @Inject
+    NsxVrfGatewayPlacementDao nsxVrfGatewayPlacementDao;
     @Inject
     IPAddressDao _publicIpAddressDao;
     @Inject
@@ -6158,6 +6166,23 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
             throw new InvalidParameterValueException("Please specify a valid IP range id.");
         }
 
+        return withNsxVrfZoneLock(vlanRange, lockedVlan -> updateVlanAndPublicIpRangeLocked(id, lockedVlan,
+                startIp, endIp, gateway, netmask, startIpv6, endIpv6, ip6Gateway, ip6Cidr, forSystemVms));
+    }
+
+    private Vlan updateVlanAndPublicIpRangeLocked(final long id, VlanVO vlanRange, String startIp,
+            String endIp, String gateway, String netmask, String startIpv6, String endIpv6,
+            String ip6Gateway, String ip6Cidr, Boolean forSystemVms) throws ResourceAllocationException {
+        NsxVrfGatewayVO vrfGateway = nsxVrfGatewayDao.findByPublicVlan(id);
+        if (vrfGateway != null && ((!Objects.isNull(gateway) && !Objects.equals(gateway, vlanRange.getVlanGateway()))
+                || (!Objects.isNull(netmask) && !Objects.equals(netmask, vlanRange.getVlanNetmask()))
+                || (!Objects.isNull(ip6Gateway) && !Objects.equals(ip6Gateway, vlanRange.getIp6Gateway()))
+                || (!Objects.isNull(ip6Cidr) && !Objects.equals(ip6Cidr, vlanRange.getIp6Cidr())))) {
+            throw new InvalidParameterValueException(String.format(
+                    "Cannot change subnet metadata for public IP range %s while it is registered to NSX VRF gateway %s",
+                    id, vrfGateway.getNsxTier0Name()));
+        }
+
         final boolean ipv4 = vlanRange.getVlanGateway() != null;
         final boolean ipv6 = vlanRange.getIp6Gateway() != null;
         if (!ipv4) {
@@ -6178,6 +6203,11 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         Long domainId = domainMap != null ? domainMap.getDomainId() : null;
 
         final Boolean isRangeForSystemVM = checkIfVlanRangeIsForSystemVM(id);
+        if (vrfGateway != null && forSystemVms != null && !Objects.equals(isRangeForSystemVM, forSystemVms)) {
+            throw new InvalidParameterValueException(String.format(
+                    "Cannot change forSystemVms for public IP range %s while it is registered to NSX VRF gateway %s",
+                    id, vrfGateway.getNsxTier0Name()));
+        }
         if (forSystemVms != null && isRangeForSystemVM != forSystemVms) {
             if (VlanType.DirectAttached.equals(vlanRange.getVlanType())) {
                 throw new InvalidParameterValueException("forSystemVms is not available for this IP range with vlan type: " + VlanType.DirectAttached);
@@ -6434,6 +6464,19 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
             throw new InvalidParameterValueException("Please specify a valid IP range id.");
         }
 
+        return withNsxVrfZoneLock(vlanRange,
+                lockedVlan -> deleteVlanAndPublicIpRangeLocked(userId, vlanDbId, caller, lockedVlan));
+    }
+
+    private VlanVO deleteVlanAndPublicIpRangeLocked(final long userId, final long vlanDbId,
+            final Account caller, VlanVO vlanRange) {
+        NsxVrfGatewayVO vrfGateway = nsxVrfGatewayDao.findByPublicVlan(vlanDbId);
+        if (vrfGateway != null) {
+            throw new InvalidParameterValueException(String.format(
+                    "Public IP range %s is registered to NSX VRF gateway %s; delete the gateway registration first",
+                    vlanDbId, vrfGateway.getNsxTier0Name()));
+        }
+
         boolean isAccountSpecific = false;
         final List<AccountVlanMapVO> acctVln = _accountVlanMapDao.listAccountVlanMapsByVlan(vlanRange.getId());
         // Check for account wide pool. It will have an entry for
@@ -6531,6 +6574,33 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         });
 
         return vlanRange;
+    }
+
+    @FunctionalInterface
+    private interface VlanOperation<T, E extends Exception> {
+        T apply(VlanVO vlan) throws E;
+    }
+
+    private <T, E extends Exception> T withNsxVrfZoneLock(VlanVO vlan, VlanOperation<T, E> operation) throws E {
+        GlobalLock lock = GlobalLock.getInternLock(NsxService.getVrfZoneLockName(vlan.getDataCenterId()));
+        boolean locked = false;
+        try {
+            if (!lock.lock(30)) {
+                throw new CloudRuntimeException(String.format(
+                        "Timed out waiting to modify public IP range %s", vlan.getId()));
+            }
+            locked = true;
+            VlanVO currentVlan = _vlanDao.findById(vlan.getId());
+            if (currentVlan == null) {
+                throw new InvalidParameterValueException("Please specify a valid IP range id.");
+            }
+            return operation.apply(currentVlan);
+        } finally {
+            if (locked) {
+                lock.unlock();
+            }
+            lock.releaseRef();
+        }
     }
 
     @Override
@@ -6674,6 +6744,37 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
             return true;
         }
 
+        GlobalLock vrfZoneLock = GlobalLock.getInternLock(NsxService.getVrfZoneLockName(vlan.getDataCenterId()));
+        boolean vrfZoneLocked = false;
+        try {
+            if (!vrfZoneLock.lock(30)) {
+                throw new CloudRuntimeException("Timed out waiting to release the public IP range");
+            }
+            vrfZoneLocked = true;
+            vlan = _vlanDao.findById(vlanDbId);
+            if (vlan == null) {
+                logger.warn("Skipping release of public IP range {} because it was removed while waiting for the zone lock",
+                        vlanDbId);
+                return true;
+            }
+            NsxVrfGatewayVO vrfGateway = nsxVrfGatewayDao.findByPublicVlan(vlanDbId);
+            if (vrfGateway != null && !vrfGateway.isUnclaimed()) {
+                throw new InvalidParameterValueException(String.format(
+                        "Public IP range %s is registered to assigned NSX VRF gateway %s; release the gateway first",
+                        vlanDbId, vrfGateway.getNsxTier0Name()));
+            }
+            return releasePublicIpRangeLocked(vlanDbId, user, caller, vlan);
+        } finally {
+            if (vrfZoneLocked) {
+                vrfZoneLock.unlock();
+            }
+            vrfZoneLock.releaseRef();
+        }
+    }
+
+    private boolean releasePublicIpRangeLocked(final long vlanDbId, final User user, final Account caller,
+            VlanVO vlan) {
+
         // Verify range is dedicated
         boolean isAccountSpecific = false;
         final List<AccountVlanMapVO> acctVln = _accountVlanMapDao.listAccountVlanMapsByVlan(vlanDbId);
@@ -6747,6 +6848,41 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
         }
 
         return success;
+    }
+
+    private boolean releaseOwnerPublicIpRange(final long vlanDbId, final User user, final Account caller,
+            final Long accountId, final Long domainId) {
+        VlanVO vlan = _vlanDao.findById(vlanDbId);
+        if (vlan == null) {
+            return true;
+        }
+        return withNsxVrfZoneLock(vlan, lockedVlan -> {
+            NsxVrfGatewayVO gateway = nsxVrfGatewayDao.findByPublicVlan(vlanDbId);
+            if (gateway != null && !gateway.isUnclaimed()) {
+                boolean ownerMatches = accountId != null
+                        ? Objects.equals(gateway.getAccountId(), accountId)
+                        : Objects.equals(gateway.getDomainId(), domainId);
+                if (!ownerMatches) {
+                    throw new InvalidParameterValueException(String.format(
+                            "Public IP range %s is assigned to a different NSX VRF gateway owner", vlanDbId));
+                }
+                long placements = nsxVrfGatewayPlacementDao.countByGatewayId(gateway.getId());
+                if (placements > 0) {
+                    throw new InvalidParameterValueException(String.format(
+                            "NSX VRF gateway %s still has %d Tier-1 placement(s)",
+                            gateway.getNsxTier0Name(), placements));
+                }
+                gateway.setScope(null);
+                gateway.setAccountId(null);
+                gateway.setDomainId(null);
+                if (!nsxVrfGatewayDao.update(gateway.getId(), gateway)) {
+                    throw new CloudRuntimeException(String.format(
+                            "Failed to release NSX VRF gateway %s during owner cleanup",
+                            gateway.getNsxTier0Name()));
+                }
+            }
+            return releasePublicIpRangeLocked(vlanDbId, user, caller, lockedVlan);
+        });
     }
 
     @DB
@@ -7990,15 +8126,14 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
     }
 
     protected void validateNtwkOffDetails(final Map<Detail, String> details, final Map<Service, Set<Provider>> serviceProviderMap) {
-        boolean nsxProviderConfigured = serviceProviderMap != null && serviceProviderMap.values().stream()
-                .filter(Objects::nonNull)
-                .anyMatch(providers -> providers.contains(Provider.Nsx));
+        Set<Provider> connectivityProviders = serviceProviderMap == null ? null : serviceProviderMap.get(Service.Connectivity);
+        boolean nsxConnectivityConfigured = connectivityProviders != null && connectivityProviders.contains(Provider.Nsx);
         for (final Detail detail : details.keySet()) {
 
             if (NSX_SEGMENT_PROFILE_DETAILS.contains(detail)) {
                 String profileId = details.get(detail);
-                if (!nsxProviderConfigured) {
-                    throw new InvalidParameterValueException(String.format("Detail %s is supported only by NSX network offerings", detail));
+                if (!nsxConnectivityConfigured) {
+                    throw new InvalidParameterValueException(String.format("Detail %s is supported only by network offerings with NSX connectivity", detail));
                 }
                 if (StringUtils.isBlank(profileId)) {
                     throw new InvalidParameterValueException(String.format("A non-empty NSX profile ID is required for detail %s", detail));
@@ -9143,7 +9278,8 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
                     @Override
                     public void doInTransactionWithoutResult(final TransactionStatus status) {
                         for (DomainVlanMapVO map : maps) {
-                            if (!releasePublicIpRange(map.getVlanDbId(), _accountMgr.getSystemUser(), _accountMgr.getAccount(Account.ACCOUNT_ID_SYSTEM))) {
+                            if (!releaseOwnerPublicIpRange(map.getVlanDbId(), _accountMgr.getSystemUser(),
+                                    _accountMgr.getAccount(Account.ACCOUNT_ID_SYSTEM), null, domain.getId())) {
                                 throw new CloudRuntimeException(String.format("Failed to release domain specific virtual ip ranges for domain %s", domain));
                             }
                         }
@@ -9169,7 +9305,8 @@ public class ConfigurationManagerImpl extends ManagerBase implements Configurati
                     @Override
                     public void doInTransactionWithoutResult(final TransactionStatus status) {
                         for (final AccountVlanMapVO map : maps) {
-                            if (!releasePublicIpRange(map.getVlanDbId(), _accountMgr.getSystemUser(), _accountMgr.getAccount(Account.ACCOUNT_ID_SYSTEM))) {
+                            if (!releaseOwnerPublicIpRange(map.getVlanDbId(), _accountMgr.getSystemUser(),
+                                    _accountMgr.getAccount(Account.ACCOUNT_ID_SYSTEM), account.getId(), null)) {
                                 throw new CloudRuntimeException(String.format("Failed to release account specific virtual ip ranges for account %s", account));
                             }
                         }

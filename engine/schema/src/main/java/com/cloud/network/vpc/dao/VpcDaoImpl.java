@@ -63,6 +63,7 @@ public class VpcDaoImpl extends GenericDaoBase<VpcVO, Long> implements VpcDao {
         AllFieldsSearch.and("id", AllFieldsSearch.entity().getId(), Op.EQ);
         AllFieldsSearch.and("state", AllFieldsSearch.entity().getState(), Op.EQ);
         AllFieldsSearch.and("accountId", AllFieldsSearch.entity().getAccountId(), Op.EQ);
+        AllFieldsSearch.and("zoneId", AllFieldsSearch.entity().getZoneId(), Op.EQ);
         AllFieldsSearch.done();
 
         CountByAccountId = createSearchBuilder(Long.class);
@@ -92,6 +93,13 @@ public class VpcDaoImpl extends GenericDaoBase<VpcVO, Long> implements VpcDao {
     public List<? extends Vpc> listByAccountId(long accountId) {
         SearchCriteria<VpcVO> sc = AllFieldsSearch.create();
         sc.setParameters("accountId", accountId);
+        return listBy(sc, null);
+    }
+
+    @Override
+    public List<VpcVO> listByZone(long zoneId) {
+        SearchCriteria<VpcVO> sc = AllFieldsSearch.create();
+        sc.setParameters("zoneId", zoneId);
         return listBy(sc, null);
     }
 

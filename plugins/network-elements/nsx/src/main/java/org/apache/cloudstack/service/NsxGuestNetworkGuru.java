@@ -231,6 +231,8 @@ public class NsxGuestNetworkGuru extends GuestNetworkGuru implements NetworkMigr
             long dataCenterId = zone.getId();
             long resourceId = network.getId();
             PublicIpAddress ipAddress = networkModel.getSourceNatIpAddressForGuestNetwork(account, network);
+            nsxService.validatePublicIpVlan(dataCenterId, accountId, domainId, null, resourceId,
+                    ipAddress.getVlanId());
             String translatedIp = ipAddress.getAddress().addr();
             String tier1GatewayName = NsxControllerUtils.getTier1GatewayName(domainId, accountId, dataCenterId, resourceId, false);
             logger.debug("Creating NSX NAT Rule for Tier1 GW {} for translated IP {} for Isolated network {}", tier1GatewayName, translatedIp, network);

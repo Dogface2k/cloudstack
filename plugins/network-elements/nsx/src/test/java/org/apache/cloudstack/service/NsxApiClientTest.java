@@ -36,6 +36,8 @@ import com.vmware.nsx_policy.infra.MacDiscoveryProfiles;
 import com.vmware.nsx_policy.infra.SegmentSecurityProfiles;
 import com.vmware.nsx_policy.infra.Segments;
 import com.vmware.nsx_policy.infra.Tier1s;
+import com.vmware.nsx_policy.infra.Tier0s;
+import com.vmware.nsx_policy.infra.tier_0s.locale_services.Interfaces;
 import com.vmware.nsx_policy.infra.tier_1s.IpsecVpnServices;
 import com.vmware.nsx_policy.infra.tier_1s.LocaleServices;
 import com.vmware.nsx_policy.infra.tier_1s.StaticRoutes;
@@ -61,10 +63,13 @@ import com.vmware.nsx_policy.model.LBTcpMonitorProfile;
 import com.vmware.nsx_policy.model.LBPool;
 import com.vmware.nsx_policy.model.LBPoolMember;
 import com.vmware.nsx_policy.model.LBVirtualServer;
+import com.vmware.nsx_policy.model.LocaleServicesListResult;
 import com.vmware.nsx_policy.model.MacDiscoveryProfile;
 import com.vmware.nsx_policy.model.PathExpression;
 import com.vmware.nsx_policy.model.PolicyNatRule;
 import com.vmware.nsx_policy.model.PolicyNatRuleListResult;
+import com.vmware.nsx_policy.model.PolicyBgpNeighborStatus;
+import com.vmware.nsx_policy.model.PolicyBgpNeighborsStatusListResult;
 import com.vmware.nsx_policy.model.RouteBasedIPSecVpnSession;
 import com.vmware.nsx_policy.model.Segment;
 import com.vmware.nsx_policy.model.SegmentDiscoveryProfileBindingMap;
@@ -72,6 +77,10 @@ import com.vmware.nsx_policy.model.SegmentSecurityProfile;
 import com.vmware.nsx_policy.model.StaticRoutesListResult;
 import com.vmware.nsx_policy.model.Tag;
 import com.vmware.nsx_policy.model.Tier1;
+import com.vmware.nsx_policy.model.Tier0;
+import com.vmware.nsx_policy.model.Tier0Interface;
+import com.vmware.nsx_policy.model.Tier0InterfaceListResult;
+import com.vmware.nsx_policy.model.Tier0VrfConfig;
 import com.vmware.nsx_policy.model.TunnelInterfaceIPSubnet;
 import com.vmware.vapi.bindings.Service;
 import com.vmware.vapi.bindings.Structure;
@@ -655,6 +664,122 @@ public class NsxApiClientTest {
         assertEquals(1, restoredRule.getTags().size());
         assertEquals("owner", restoredRule.getTags().get(0).getScope());
         assertEquals("cloudstack", restoredRule.getTags().get(0).getTag());
+    }
+
+    @Test
+    public void testCreateTier1GatewayReconcilesExistingGatewayAndLocaleService() {
+        Tier1s tier1s = Mockito.mock(Tier1s.class);
+        Tier1 existing = Mockito.mock(Tier1.class);
+        com.vmware.nsx_policy.infra.tier_0s.LocaleServices tier0LocaleServices =
+                Mockito.mock(com.vmware.nsx_policy.infra.tier_0s.LocaleServices.class);
+        LocaleServices tier1LocaleServices = Mockito.mock(LocaleServices.class);
+        LocaleServicesListResult localeServicesResult = Mockito.mock(LocaleServicesListResult.class);
+        com.vmware.nsx_policy.model.LocaleServices tier0Locale =
+                Mockito.mock(com.vmware.nsx_policy.model.LocaleServices.class);
+        when(nsxService.apply(Tier1s.class)).thenReturn(tier1s);
+        when(nsxService.apply(com.vmware.nsx_policy.infra.tier_0s.LocaleServices.class))
+                .thenReturn(tier0LocaleServices);
+        when(nsxService.apply(LocaleServices.class)).thenReturn(tier1LocaleServices);
+        when(tier1s.get(TIER_1_GATEWAY_NAME)).thenReturn(existing);
+        when(existing.getTier0Path()).thenReturn("/infra/tier-0s/t0");
+        when(tier0LocaleServices.list(eq("t0"), nullable(String.class), eq(false), nullable(String.class),
+                eq(1000L), nullable(Boolean.class), nullable(String.class))).thenReturn(localeServicesResult);
+        when(localeServicesResult.getResults()).thenReturn(List.of(tier0Locale));
+        when(tier0Locale.getEdgeClusterPath()).thenReturn(
+                "/infra/sites/default/enforcement-points/default/edge-clusters/ec1");
+        ArgumentCaptor<Tier1> tier1Captor = ArgumentCaptor.forClass(Tier1.class);
+
+        client.createTier1Gateway(TIER_1_GATEWAY_NAME, "t0", "ec1", true);
+
+        verify(tier1s).patch(eq(TIER_1_GATEWAY_NAME), tier1Captor.capture());
+        assertEquals("/infra/tier-0s/t0", tier1Captor.getValue().getTier0Path());
+        assertTrue(tier1Captor.getValue().getRouteAdvertisementTypes().contains("TIER1_NAT"));
+        verify(tier1LocaleServices).patch(eq(TIER_1_GATEWAY_NAME), eq("default"),
+                any(com.vmware.nsx_policy.model.LocaleServices.class));
+    }
+
+    @Test
+    public void testCreateTier1GatewayRejectsExistingGatewayOnDifferentParentWithoutMutation() {
+        Tier1s tier1s = Mockito.mock(Tier1s.class);
+        Tier1 existing = Mockito.mock(Tier1.class);
+        when(nsxService.apply(Tier1s.class)).thenReturn(tier1s);
+        when(tier1s.get(TIER_1_GATEWAY_NAME)).thenReturn(existing);
+        when(existing.getTier0Path()).thenReturn("/infra/tier-0s/other-t0");
+
+        CloudRuntimeException exception = assertThrows(CloudRuntimeException.class,
+                () -> client.createTier1Gateway(TIER_1_GATEWAY_NAME, "t0", "ec1", true));
+
+        assertTrue(exception.getMessage().contains("already exists under"));
+        verify(tier1s, never()).patch(anyString(), any(Tier1.class));
+        verify(nsxService, never()).apply(com.vmware.nsx_policy.infra.tier_0s.LocaleServices.class);
+    }
+
+    @Test
+    public void testValidateVrfGatewayReturnsCanonicalBackendPaths() {
+        Tier0s tier0s = Mockito.mock(Tier0s.class);
+        Tier0 tier0 = Mockito.mock(Tier0.class);
+        com.vmware.nsx_policy.infra.tier_0s.LocaleServices localeServices =
+                Mockito.mock(com.vmware.nsx_policy.infra.tier_0s.LocaleServices.class);
+        LocaleServicesListResult localeServicesResult = Mockito.mock(LocaleServicesListResult.class);
+        com.vmware.nsx_policy.model.LocaleServices localeService =
+                Mockito.mock(com.vmware.nsx_policy.model.LocaleServices.class);
+        Interfaces interfaces = Mockito.mock(Interfaces.class);
+        Tier0InterfaceListResult interfaceResult = Mockito.mock(Tier0InterfaceListResult.class);
+        com.vmware.nsx_policy.infra.tier_0s.locale_services.bgp.neighbors.Status statusService =
+                Mockito.mock(com.vmware.nsx_policy.infra.tier_0s.locale_services.bgp.neighbors.Status.class);
+        PolicyBgpNeighborsStatusListResult statuses = Mockito.mock(PolicyBgpNeighborsStatusListResult.class);
+        PolicyBgpNeighborStatus establishedStatus = Mockito.mock(PolicyBgpNeighborStatus.class);
+        Tier0VrfConfig vrfConfig = Mockito.mock(Tier0VrfConfig.class);
+        String parentPath = "/infra/tier-0s/parent-t0";
+        String edgeClusterPath = "/infra/sites/default/enforcement-points/default/edge-clusters/ec1";
+
+        when(nsxService.apply(Tier0s.class)).thenReturn(tier0s);
+        when(nsxService.apply(com.vmware.nsx_policy.infra.tier_0s.LocaleServices.class))
+                .thenReturn(localeServices);
+        when(nsxService.apply(Interfaces.class)).thenReturn(interfaces);
+        when(nsxService.apply(com.vmware.nsx_policy.infra.tier_0s.locale_services.bgp.neighbors.Status.class))
+                .thenReturn(statusService);
+        when(tier0s.get("vrf-t0")).thenReturn(tier0);
+        when(tier0.getVrfConfig()).thenReturn(vrfConfig);
+        when(vrfConfig.getTier0Path()).thenReturn(parentPath);
+        when(localeServices.list(eq("vrf-t0"), nullable(String.class), eq(false), nullable(String.class),
+                eq(1000L), nullable(Boolean.class), nullable(String.class))).thenReturn(localeServicesResult);
+        when(localeServicesResult.getResults()).thenReturn(List.of(localeService));
+        when(localeService.getId()).thenReturn("default");
+        when(localeService.getEdgeClusterPath()).thenReturn(edgeClusterPath);
+        when(interfaces.list(eq("vrf-t0"), eq("default"), nullable(String.class), eq(false),
+                nullable(String.class), eq(1L), nullable(Boolean.class), nullable(String.class)))
+                .thenReturn(interfaceResult);
+        when(interfaceResult.getResults()).thenReturn(List.of(Mockito.mock(Tier0Interface.class)));
+        when(statusService.list(eq("vrf-t0"), eq("default"), nullable(String.class), nullable(String.class),
+                nullable(String.class), eq(false), nullable(String.class), nullable(Long.class),
+                nullable(Boolean.class), nullable(String.class))).thenReturn(statuses);
+        when(statuses.getResults()).thenReturn(List.of(establishedStatus));
+        when(establishedStatus.getConnectionState())
+                .thenReturn(PolicyBgpNeighborStatus.CONNECTION_STATE_ESTABLISHED);
+
+        NsxApiClient.VrfGatewayValidation result = client.validateVrfGateway(
+                "vrf-t0", "parent-t0", "ec1");
+
+        assertEquals(parentPath, result.getParentTier0Path());
+        assertEquals(edgeClusterPath, result.getEdgeClusterPath());
+    }
+
+    @Test
+    public void testValidateVrfGatewayRejectsParentMismatchBeforePlacementChecks() {
+        Tier0s tier0s = Mockito.mock(Tier0s.class);
+        Tier0 tier0 = Mockito.mock(Tier0.class);
+        Tier0VrfConfig vrfConfig = Mockito.mock(Tier0VrfConfig.class);
+        when(nsxService.apply(Tier0s.class)).thenReturn(tier0s);
+        when(tier0s.get("vrf-t0")).thenReturn(tier0);
+        when(tier0.getVrfConfig()).thenReturn(vrfConfig);
+        when(vrfConfig.getTier0Path()).thenReturn("/infra/tier-0s/other-parent");
+
+        CloudRuntimeException exception = assertThrows(CloudRuntimeException.class,
+                () -> client.validateVrfGateway("vrf-t0", "parent-t0", "ec1"));
+
+        assertTrue(exception.getMessage().contains("has parent"));
+        verify(nsxService, never()).apply(com.vmware.nsx_policy.infra.tier_0s.LocaleServices.class);
     }
 
     @Test

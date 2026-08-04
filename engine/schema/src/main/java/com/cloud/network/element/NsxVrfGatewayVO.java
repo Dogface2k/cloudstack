@@ -186,14 +186,10 @@ public class NsxVrfGatewayVO implements InternalIdentity {
 
     /** True when no tenant has claimed this gateway yet. */
     public boolean isUnclaimed() {
-        return accountId == null && domainId == null;
+        return scope == null && accountId == null && domainId == null;
     }
 
-    // NOTE: do not add a helper here that clears the assignment by writing the fields
-    // directly. Entities are CGLIB-enhanced and GenericDaoBase builds its UPDATE from
-    // setter calls intercepted by UpdateBuilder, so direct field writes persist nothing
-    // and the update silently succeeds having changed no columns. Callers must use the
-    // setters (see NsxProviderServiceImpl.releaseNsxVrfGateway).
+    // GenericDao update tracking requires assignment changes to use these setters.
 
     @Override
     public String toString() {

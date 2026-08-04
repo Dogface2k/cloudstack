@@ -106,10 +106,18 @@ public class NsxPublicNetworkGuru extends PublicNetworkGuru {
             logger.error(err);
             throw new CloudRuntimeException(err);
         }
-        ips = ips.stream().filter(x -> !x.getAddress().addr().equals(nic.getIPv4Address())).collect(Collectors.toList());
+        ips = ips.stream()
+                .filter(IPAddressVO::isSourceNat)
+                .filter(x -> !x.isForSystemVms())
+                .filter(x -> !x.getAddress().addr().equals(nic.getIPv4Address()))
+                .collect(Collectors.toList());
+        if (ips.size() != 1) {
+            throw new CloudRuntimeException(String.format(
+                    "Expected one tenant source NAT IP for VPC %s, found %d", vpc, ips.size()));
+        }
         // Use Source NAT IP address from the NSX Public Range. Do not Use the VR Public IP address
         ipAddress = ips.get(0);
-        if (ipAddress.isSourceNat() && !ipAddress.isForSystemVms()) {
+        if (ipAddress.isSourceNat()) {
             VlanDetailsVO detail = vlanDetailsDao.findDetail(ipAddress.getVlanId(), ApiConstants.NSX_DETAIL_KEY);
             if (detail != null && detail.getValue().equalsIgnoreCase("true")) {
                 long accountId = vpc.getAccountId();
@@ -123,7 +131,8 @@ public class NsxPublicNetworkGuru extends PublicNetworkGuru {
                         vpcOfferingServiceMapDao.areServicesSupportedByVpcOffering(vpc.getVpcOfferingId(), services);
 
                 logger.info("Creating Tier 1 Gateway for VPC {}", vpc);
-                boolean result = nsxService.createVpcNetwork(dataCenterId, accountId, domainId, resourceId, vpc.getName(), sourceNatEnabled);
+                boolean result = nsxService.createVpcNetwork(dataCenterId, accountId, domainId, resourceId,
+                        vpc.getName(), sourceNatEnabled, ipAddress.getVlanId());
                 if (!result) {
                     String msg = String.format("Error creating Tier 1 Gateway for VPC %s", vpc);
                     logger.error(msg);

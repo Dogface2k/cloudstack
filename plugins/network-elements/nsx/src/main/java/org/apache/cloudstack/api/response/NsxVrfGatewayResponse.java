@@ -74,6 +74,10 @@ public class NsxVrfGatewayResponse extends BaseResponse {
     @Param(description = "Whether the gateway has been assigned to a tenant")
     private boolean allocated;
 
+    @SerializedName(ApiConstants.VLAN_ID)
+    @Param(description = "ID of the public IP range advertised by this tier-0")
+    private String publicVlanId;
+
     public NsxVrfGatewayResponse() {
         setObjectName("nsxvrfgateway");
     }
@@ -124,6 +128,10 @@ public class NsxVrfGatewayResponse extends BaseResponse {
 
     public void setAllocated(boolean allocated) {
         this.allocated = allocated;
+    }
+
+    public void setPublicVlanId(String publicVlanId) {
+        this.publicVlanId = publicVlanId;
     }
 
     public String getId() {

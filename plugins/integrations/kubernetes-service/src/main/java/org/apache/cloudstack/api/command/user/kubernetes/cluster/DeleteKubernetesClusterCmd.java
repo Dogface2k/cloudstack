@@ -19,6 +19,8 @@ package org.apache.cloudstack.api.command.user.kubernetes.cluster;
 import javax.inject.Inject;
 
 import org.apache.cloudstack.acl.RoleType;
+import org.apache.cloudstack.acl.SecurityChecker;
+import org.apache.cloudstack.api.ACL;
 import org.apache.cloudstack.api.APICommand;
 import org.apache.cloudstack.api.ApiCommandResourceType;
 import org.apache.cloudstack.api.ApiConstants;
@@ -50,6 +52,7 @@ public class DeleteKubernetesClusterCmd extends BaseAsyncCmd {
     //////////////// API parameters /////////////////////
     /////////////////////////////////////////////////////
 
+    @ACL(accessType = SecurityChecker.AccessType.OperateEntry)
     @Parameter(name = ApiConstants.ID,
             type = CommandType.UUID,
             entityType = KubernetesClusterResponse.class,
@@ -122,6 +125,17 @@ public class DeleteKubernetesClusterCmd extends BaseAsyncCmd {
     @Override
     public Long getApiResourceId() {
         return getId();
+    }
+
+    @Override
+    public String getSyncObjType() {
+        return BaseAsyncCmd.networkSyncObject;
+    }
+
+    @Override
+    public Long getSyncObjId() {
+        KubernetesCluster cluster = kubernetesClusterService.findById(getId());
+        return cluster == null ? null : cluster.getNetworkId();
     }
 
     @Override

@@ -28,6 +28,7 @@ import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.hypervisor.Hypervisor;
 import com.cloud.network.IpAddress;
 import com.cloud.network.IpAddressManager;
+import com.cloud.network.addr.PublicIp;
 import com.cloud.network.Network;
 import com.cloud.network.NetworkModel;
 import com.cloud.network.Networks;
@@ -107,6 +108,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -669,6 +671,7 @@ public class NsxElementTest {
             VpcVO vpcVO = mockVpcWithNsxVpnSupport();
             when(vpcVO.getAccountId()).thenReturn(2L);
             when(vpcVO.getZoneId()).thenReturn(1L);
+            when(nsxService.getPublicVlanId(anyLong(), anyLong(), anyLong(), anyLong(), any())).thenReturn(null);
             IpAddress allocatedIp = Mockito.mock(IpAddress.class);
             when(allocatedIp.getId()).thenReturn(30L);
             when(ipAddressManager.allocateIp(any(), anyBoolean(), any(), any(), any(), any(), any())).thenReturn(allocatedIp);
@@ -691,6 +694,7 @@ public class NsxElementTest {
             VpcVO vpcVO = mockVpcWithNsxVpnSupport();
             when(vpcVO.getAccountId()).thenReturn(2L);
             when(vpcVO.getZoneId()).thenReturn(1L);
+            when(nsxService.getPublicVlanId(anyLong(), anyLong(), anyLong(), anyLong(), any())).thenReturn(null);
             IpAddress allocatedIp = Mockito.mock(IpAddress.class);
             when(allocatedIp.getId()).thenReturn(31L);
             when(ipAddressManager.allocateIp(any(), anyBoolean(), any(), any(), any(), any(), any())).thenReturn(allocatedIp);
@@ -714,6 +718,7 @@ public class NsxElementTest {
             VpcVO vpcVO = mockVpcWithNsxVpnSupport();
             when(vpcVO.getAccountId()).thenReturn(2L);
             when(vpcVO.getZoneId()).thenReturn(1L);
+            when(nsxService.getPublicVlanId(anyLong(), anyLong(), anyLong(), anyLong(), any())).thenReturn(null);
             IpAddress allocatedIp = Mockito.mock(IpAddress.class);
             when(allocatedIp.getId()).thenReturn(32L);
             when(ipAddressManager.allocateIp(any(), anyBoolean(), any(), any(), any(), any(), any())).thenReturn(allocatedIp);
@@ -724,6 +729,36 @@ public class NsxElementTest {
         } finally {
             verify(userIpAddressDetailsDao, never()).removeDetail(32L, "nsxVpnGatewayIp");
             verify(ipAddressManager, never()).disassociatePublicIpAddress(any(IPAddressVO.class), anyLong(), any());
+            CallContext.unregister();
+        }
+    }
+
+    @Test
+    public void testAcquireVpnGatewayIpUsesRecordedVrfPublicRangeWithoutFallback() throws Exception {
+        CallContext.register(Mockito.mock(User.class), Mockito.mock(Account.class));
+        try {
+            VpcVO vpcVO = mockVpcWithNsxVpnSupport();
+            when(vpcVO.getAccountId()).thenReturn(2L);
+            when(vpcVO.getZoneId()).thenReturn(1L);
+            when(nsxService.getPublicVlanId(anyLong(), anyLong(), anyLong(), anyLong(), any())).thenReturn(73L);
+            PublicIp allocatedIp = Mockito.mock(PublicIp.class);
+            when(allocatedIp.getId()).thenReturn(33L);
+            when(ipAddressManager.assignDedicateIpAddressFromNsxVrfPublicRange(eq(account), isNull(),
+                    eq(9L), eq(1L), eq(false), eq(73L))).thenReturn(allocatedIp);
+            IPAddressVO ipAddressVO = mockIpAddressVO(33L, "10.1.13.33");
+            when(ipAddressVO.getVlanId()).thenReturn(73L);
+            when(nsxService.createVpnGateway(vpcVO, "10.1.13.33"))
+                    .thenReturn(new NsxVpnGatewayResult(true, false));
+
+            IpAddress result = nsxElement.acquireVpnGatewayIp(vpcVO, null);
+
+            assertEquals(ipAddressVO, result);
+            verify(ipAddressManager).assignDedicateIpAddressFromNsxVrfPublicRange(eq(account), isNull(),
+                    eq(9L), eq(1L), eq(false), eq(73L));
+            verify(ipAddressManager, never()).allocateIp(any(), anyBoolean(), any(), any(), any(), any(), any());
+            verify(vpcService, never()).associateIPToVpc(anyLong(), anyLong());
+            verify(userIpAddressDetailsDao).addDetail(33L, "nsxVpnGatewayIp", "true", false);
+        } finally {
             CallContext.unregister();
         }
     }

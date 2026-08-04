@@ -19,6 +19,7 @@
 
 package com.cloud.kubernetes.cluster;
 
+import com.cloud.api.ApiAsyncJobDispatcher;
 import com.cloud.api.query.dao.TemplateJoinDao;
 import com.cloud.api.query.vo.TemplateJoinVO;
 import com.cloud.cpu.CPU;
@@ -49,25 +50,32 @@ import com.cloud.user.User;
 import com.cloud.utils.Pair;
 import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.VMInstanceVO;
+import com.cloud.vm.VirtualMachine;
 import com.cloud.vm.dao.VMInstanceDao;
 import com.cloud.host.HostVO;
 import com.cloud.host.dao.HostDao;
 import org.apache.cloudstack.affinity.AffinityGroupVO;
 import org.apache.cloudstack.affinity.dao.AffinityGroupDao;
+import org.apache.cloudstack.api.BaseAsyncCmd;
 import org.apache.cloudstack.api.BaseCmd;
 import org.apache.cloudstack.api.command.admin.kubernetes.cluster.AdoptKubernetesClusterNetworkRulesCmd;
+import org.apache.cloudstack.api.command.user.kubernetes.cluster.AddNodesToKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.AddVirtualMachinesToKubernetesClusterCmd;
+import org.apache.cloudstack.api.command.user.kubernetes.cluster.RemoveNodesFromKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.RemoveVirtualMachinesFromKubernetesClusterCmd;
 import org.apache.cloudstack.api.command.user.kubernetes.cluster.ReconcileKubernetesClusterNetworkRulesCmd;
 import org.apache.cloudstack.api.response.KubernetesClusterResponse;
 import org.apache.cloudstack.context.CallContext;
 import org.apache.cloudstack.framework.config.ConfigKey;
+import org.apache.cloudstack.framework.jobs.AsyncJob;
+import org.apache.cloudstack.framework.jobs.AsyncJobManager;
 import org.apache.commons.collections.MapUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Mockito;
@@ -126,6 +134,12 @@ public class KubernetesClusterManagerImplTest {
     @Mock
     private HostDao hostDao;
 
+    @Mock
+    private AsyncJobManager asyncJobManager;
+
+    @Mock
+    private ApiAsyncJobDispatcher apiAsyncJobDispatcher;
+
     @Spy
     @InjectMocks
     KubernetesClusterManagerImpl kubernetesClusterManager;
@@ -168,6 +182,60 @@ public class KubernetesClusterManagerImplTest {
         kubernetesClusterManager.validateNetworkRuleOwnershipForTopologyMutation(cluster);
 
         Mockito.verify(cluster, Mockito.never()).getNetworkRuleOwnershipState();
+    }
+
+    @Test
+    public void nodeTopologyAccessValidationChecksClusterAndEveryNode() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        VMInstanceVO firstNode = Mockito.mock(VMInstanceVO.class);
+        VMInstanceVO secondNode = Mockito.mock(VMInstanceVO.class);
+        Mockito.when(vmInstanceDao.findById(10L)).thenReturn(firstNode);
+        Mockito.when(vmInstanceDao.findById(11L)).thenReturn(secondNode);
+
+        kubernetesClusterManager.validateAccessToClusterAndNodes(cluster, List.of(10L, 11L));
+
+        Mockito.verify(accountManager).checkAccess(Mockito.any(Account.class),
+                Mockito.eq(org.apache.cloudstack.acl.SecurityChecker.AccessType.OperateEntry), Mockito.eq(false), Mockito.eq(cluster));
+        Mockito.verify(accountManager).checkAccess(Mockito.any(Account.class),
+                Mockito.eq(org.apache.cloudstack.acl.SecurityChecker.AccessType.OperateEntry), Mockito.eq(false), Mockito.eq(firstNode));
+        Mockito.verify(accountManager).checkAccess(Mockito.any(Account.class),
+                Mockito.eq(org.apache.cloudstack.acl.SecurityChecker.AccessType.OperateEntry), Mockito.eq(false), Mockito.eq(secondNode));
+    }
+
+    @Test(expected = InvalidParameterValueException.class)
+    public void nodeTopologyAccessValidationRejectsMissingNode() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        Mockito.when(vmInstanceDao.findById(10L)).thenReturn(null);
+
+        kubernetesClusterManager.validateAccessToClusterAndNodes(cluster, List.of(10L));
+    }
+
+    @Test(expected = PermissionDeniedException.class)
+    public void addNodesRejectsCrossTenantClusterBeforeTopologyValidation() {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        AddNodesToKubernetesClusterCmd cmd = Mockito.mock(AddNodesToKubernetesClusterCmd.class);
+        Mockito.when(cmd.getClusterId()).thenReturn(1L);
+        Mockito.when(cmd.getNodeIds()).thenReturn(List.of(10L));
+        Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(cluster);
+        Mockito.doThrow(new PermissionDeniedException("denied")).when(accountManager).checkAccess(
+                Mockito.any(Account.class), Mockito.any(), Mockito.eq(false), Mockito.eq(cluster));
+
+        kubernetesClusterManager.addNodesToKubernetesCluster(cmd);
+    }
+
+    @Test(expected = PermissionDeniedException.class)
+    public void removeNodesRejectsCrossTenantNodeBeforeWorkerMutation() throws Exception {
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        VMInstanceVO node = Mockito.mock(VMInstanceVO.class);
+        RemoveNodesFromKubernetesClusterCmd cmd = Mockito.mock(RemoveNodesFromKubernetesClusterCmd.class);
+        Mockito.when(cmd.getClusterId()).thenReturn(1L);
+        Mockito.when(cmd.getNodeIds()).thenReturn(List.of(10L));
+        Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(cluster);
+        Mockito.when(vmInstanceDao.findById(10L)).thenReturn(node);
+        Mockito.doThrow(new PermissionDeniedException("denied")).when(accountManager).checkAccess(
+                Mockito.any(Account.class), Mockito.any(), Mockito.eq(false), Mockito.eq(node));
+
+        kubernetesClusterManager.removeNodesFromKubernetesCluster(cmd);
     }
 
     @Test
@@ -472,6 +540,70 @@ public class KubernetesClusterManagerImplTest {
 
         Mockito.verify(accountManager).checkAccess(Mockito.any(Account.class), Mockito.any(), Mockito.eq(false), Mockito.eq(cluster));
         Mockito.verify(worker).reconcileKubernetesClusterNetworkRules();
+    }
+
+    @Test
+    public void systemAlertReconciliationRunsAlertRecoveryInsideQueuedJob() {
+        CallContext.unregister();
+        User systemUser = Mockito.mock(User.class);
+        Mockito.when(systemUser.getId()).thenReturn(User.UID_SYSTEM);
+        CallContext.register(systemUser, Mockito.mock(Account.class));
+
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        KubernetesClusterStartWorker worker = Mockito.mock(KubernetesClusterStartWorker.class);
+        ReconcileKubernetesClusterNetworkRulesCmd cmd = Mockito.mock(ReconcileKubernetesClusterNetworkRulesCmd.class);
+        Mockito.when(cmd.getId()).thenReturn(1L);
+        Mockito.when(cmd.getActualCommandName()).thenReturn(BaseCmd.getCommandNameByClass(ReconcileKubernetesClusterNetworkRulesCmd.class));
+        Mockito.when(kubernetesClusterDao.findById(1L)).thenReturn(cluster);
+        Mockito.when(cluster.getClusterType()).thenReturn(KubernetesCluster.ClusterType.CloudManaged);
+        Mockito.when(cluster.getState()).thenReturn(KubernetesCluster.State.Recovering);
+        Mockito.doReturn(worker).when(kubernetesClusterManager).createKubernetesClusterStartWorker(cluster);
+        Mockito.when(worker.reconcileAlertCluster()).thenReturn(true);
+
+        Assert.assertTrue(kubernetesClusterManager.reconcileKubernetesClusterNetworkRules(cmd));
+
+        Mockito.verify(worker).reconcileAlertCluster();
+        Mockito.verify(worker, Mockito.never()).reconcileKubernetesClusterNetworkRules();
+        Mockito.verify(cluster, Mockito.never()).getNetworkRuleOwnershipState();
+    }
+
+    @Test
+    public void alertRecoveryUsesSameNetworkQueueAndRejectsDuplicateScheduling() {
+        long clusterId = 1L;
+        long networkId = 2L;
+        long accountId = 3L;
+        KubernetesClusterVO cluster = Mockito.mock(KubernetesClusterVO.class);
+        KubernetesClusterVmMapVO vmMap = Mockito.mock(KubernetesClusterVmMapVO.class);
+        VMInstanceVO vm = Mockito.mock(VMInstanceVO.class);
+        Mockito.when(cluster.getId()).thenReturn(clusterId);
+        Mockito.when(cluster.getNetworkId()).thenReturn(networkId);
+        Mockito.when(cluster.getAccountId()).thenReturn(accountId);
+        Mockito.when(cluster.getTotalNodeCount()).thenReturn(1L);
+        Mockito.when(kubernetesClusterDao.findManagedKubernetesClustersInState(KubernetesCluster.State.Alert))
+                .thenReturn(List.of(cluster));
+        Mockito.when(kubernetesClusterVmMapDao.listByClusterId(clusterId)).thenReturn(List.of(vmMap));
+        Mockito.when(vmMap.getVmId()).thenReturn(10L);
+        Mockito.when(vmInstanceDao.findByIdIncludingRemoved(10L)).thenReturn(vm);
+        Mockito.when(vm.getState()).thenReturn(VirtualMachine.State.Running);
+        Mockito.when(apiAsyncJobDispatcher.getName()).thenReturn("ApiAsyncJobDispatcher");
+        Mockito.doReturn(true, false).when(kubernetesClusterManager).stateTransitTo(
+                clusterId, KubernetesCluster.Event.RecoveryRequested);
+        Mockito.doReturn(44L).when(kubernetesClusterManager).createAlertClusterReconciliationEvent(cluster);
+        Mockito.when(asyncJobManager.submitAsyncJob(Mockito.any(AsyncJob.class),
+                Mockito.eq(BaseAsyncCmd.networkSyncObject), Mockito.eq(networkId))).thenReturn(99L);
+
+        KubernetesClusterManagerImpl.KubernetesClusterStatusScanner scanner =
+                kubernetesClusterManager.new KubernetesClusterStatusScanner();
+        scanner.reallyRun();
+        scanner.reallyRun();
+
+        ArgumentCaptor<AsyncJob> jobCaptor = ArgumentCaptor.forClass(AsyncJob.class);
+        Mockito.verify(asyncJobManager, Mockito.times(1)).submitAsyncJob(jobCaptor.capture(),
+                Mockito.eq(BaseAsyncCmd.networkSyncObject), Mockito.eq(networkId));
+        Assert.assertEquals(ReconcileKubernetesClusterNetworkRulesCmd.class.getName(), jobCaptor.getValue().getCmd());
+        Assert.assertEquals(Long.valueOf(clusterId), jobCaptor.getValue().getInstanceId());
+        Assert.assertTrue(jobCaptor.getValue().getCmdInfo().contains("\"ctxStartEventId\":\"44\""));
+        Mockito.verify(kubernetesClusterManager, Mockito.never()).createKubernetesClusterStartWorker(cluster);
     }
 
     @Test(expected = PermissionDeniedException.class)

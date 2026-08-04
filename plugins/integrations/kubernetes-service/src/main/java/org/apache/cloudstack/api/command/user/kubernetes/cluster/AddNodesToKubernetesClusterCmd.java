@@ -17,9 +17,12 @@
 package org.apache.cloudstack.api.command.user.kubernetes.cluster;
 
 import com.cloud.kubernetes.cluster.KubernetesClusterEventTypes;
+import com.cloud.kubernetes.cluster.KubernetesCluster;
 import com.cloud.kubernetes.cluster.KubernetesClusterService;
 
 import org.apache.cloudstack.acl.RoleType;
+import org.apache.cloudstack.acl.SecurityChecker;
+import org.apache.cloudstack.api.ACL;
 import org.apache.cloudstack.api.APICommand;
 import org.apache.cloudstack.api.ApiCommandResourceType;
 import org.apache.cloudstack.api.ApiConstants;
@@ -46,6 +49,7 @@ public class AddNodesToKubernetesClusterCmd extends BaseAsyncCmd {
     @Inject
     public KubernetesClusterService kubernetesClusterService;
 
+    @ACL(accessType = SecurityChecker.AccessType.OperateEntry)
     @Parameter(name = ApiConstants.NODE_IDS,
             type = CommandType.LIST,
             collectionType = CommandType.UUID,
@@ -55,6 +59,7 @@ public class AddNodesToKubernetesClusterCmd extends BaseAsyncCmd {
             required = true)
     private List<Long> nodeIds;
 
+    @ACL(accessType = SecurityChecker.AccessType.OperateEntry)
     @Parameter(name = ApiConstants.ID, type = CommandType.UUID, required = true,
             entityType = KubernetesClusterResponse.class,
             description = "the ID of the Kubernetes cluster", since = "4.21.0")
@@ -128,6 +133,17 @@ public class AddNodesToKubernetesClusterCmd extends BaseAsyncCmd {
     @Override
     public Long getApiResourceId() {
         return getClusterId();
+    }
+
+    @Override
+    public String getSyncObjType() {
+        return BaseAsyncCmd.networkSyncObject;
+    }
+
+    @Override
+    public Long getSyncObjId() {
+        KubernetesCluster cluster = kubernetesClusterService.findById(getClusterId());
+        return cluster == null ? null : cluster.getNetworkId();
     }
 
 }

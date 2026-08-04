@@ -38,6 +38,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import org.apache.cloudstack.alert.AlertService;
@@ -72,7 +73,10 @@ import com.cloud.bgp.BGPService;
 import com.cloud.configuration.ConfigurationManager;
 import com.cloud.dc.DataCenter;
 import com.cloud.dc.DataCenterVO;
+import com.cloud.dc.Vlan;
+import com.cloud.dc.VlanVO;
 import com.cloud.dc.dao.DataCenterDao;
+import com.cloud.dc.dao.VlanDao;
 import com.cloud.domain.Domain;
 import com.cloud.domain.DomainVO;
 import com.cloud.domain.dao.DomainDao;
@@ -85,6 +89,8 @@ import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.NsxProviderDao;
+import com.cloud.network.dao.NsxVrfGatewayDao;
+import com.cloud.network.element.NsxVrfGatewayVO;
 import com.cloud.network.dao.PhysicalNetworkDao;
 import com.cloud.network.dao.PhysicalNetworkVO;
 import com.cloud.network.dao.PublicIpQuarantineDao;
@@ -167,6 +173,8 @@ public class NetworkServiceImplTest {
     @Mock
     IPAddressDao ipAddressDao;
     @Mock
+    VlanDao vlanDao;
+    @Mock
     ConfigurationManager configMgr;
     @Mock
     ConfigKey<Integer> publicMtuKey;
@@ -237,6 +245,8 @@ public class NetworkServiceImplTest {
     private Ip ipMock;
     @Mock
     private NsxProviderDao nsxProviderDao;
+    @Mock
+    private NsxVrfGatewayDao nsxVrfGatewayDao;
 
     private static Date beforeDate;
 
@@ -273,6 +283,110 @@ public class NetworkServiceImplTest {
     private NetworkOfferingVO networkOfferingVO;
     private Long zoneId = 10L;
     private Long networkId = 11L;
+
+    @Test
+    public void testAllocateIpWithoutNsxPlacementKeepsStandardAllocationPath() throws Exception {
+        long allocationZoneId = 2L;
+        IpAddress allocatedIp = mock(IpAddress.class);
+        when(entityMgr.findById(DataCenter.class, allocationZoneId)).thenReturn(dc);
+        when(ipAddressManagerMock.allocateIp(accountMock, false, accountMock, null, dc, true, null))
+                .thenReturn(allocatedIp);
+
+        try (MockedStatic<ComponentContext> componentContext = Mockito.mockStatic(ComponentContext.class)) {
+            IpAddress result = service.allocateIP(accountMock, allocationZoneId, null, null, true, null);
+
+            Assert.assertEquals(allocatedIp, result);
+            componentContext.verifyNoInteractions();
+        }
+
+        Mockito.verify(ipAddressManagerMock).allocateIp(accountMock, false, accountMock, null, dc, true, null);
+    }
+
+    @Test
+    public void testAllocateIpForNsxVpcReservesPlacementAfterAccessCheck() throws Exception {
+        long allocationZoneId = 2L;
+        IpAddress allocatedIp = mock(IpAddress.class);
+        when(accountMock.getId()).thenReturn(42L);
+        when(entityMgr.findById(DataCenter.class, allocationZoneId)).thenReturn(dc);
+        VpcVO nsxVpc = mock(VpcVO.class);
+        when(nsxVpc.getId()).thenReturn(9L);
+        when(nsxVpc.getZoneId()).thenReturn(allocationZoneId);
+        when(nsxVpc.getAccountId()).thenReturn(42L);
+        when(nsxVpc.getDomainId()).thenReturn(6L);
+        when(nsxVpc.getVpcOfferingId()).thenReturn(7L);
+        when(vpcDao.findById(9L)).thenReturn(nsxVpc);
+        when(vpcMgr.getVpcOffSvcProvidersMap(7L)).thenReturn(
+                Map.of(Network.Service.SourceNat, Set.of(Network.Provider.Nsx)));
+        NsxService nsxService = mock(NsxService.class);
+        when(nsxService.reserveTier1PlacementAndGetPublicVlanId(allocationZoneId, 42L, 6L, 9L, null))
+                .thenReturn(73L);
+        when(ipAddressManagerMock.allocateIpFromNsxVrfPublicRange(accountMock, false, accountMock, null, dc,
+                true, null, 73L))
+                .thenReturn(allocatedIp);
+
+        try (MockedStatic<ComponentContext> componentContext = Mockito.mockStatic(ComponentContext.class)) {
+            componentContext.when(() -> ComponentContext.getDelegateComponentOfType(NsxService.class))
+                    .thenReturn(nsxService);
+
+            Assert.assertEquals(allocatedIp,
+                    service.allocateIP(accountMock, allocationZoneId, null, 9L, true, null));
+        }
+
+        org.mockito.InOrder order = Mockito.inOrder(accountManager, nsxService, ipAddressManagerMock);
+        order.verify(accountManager).checkAccess(accountMock, null, false, accountMock);
+        order.verify(nsxService).reserveTier1PlacementAndGetPublicVlanId(allocationZoneId, 42L, 6L, 9L, null);
+        order.verify(ipAddressManagerMock).allocateIpFromNsxVrfPublicRange(accountMock, false, accountMock,
+                null, dc, true, null, 73L);
+    }
+
+    @Test
+    public void testAllocateIpRejectsForeignVpcBeforePlacementReservation() throws Exception {
+        long allocationZoneId = 2L;
+        when(accountMock.getId()).thenReturn(42L);
+        when(entityMgr.findById(DataCenter.class, allocationZoneId)).thenReturn(dc);
+        VpcVO foreignVpc = mock(VpcVO.class);
+        when(foreignVpc.getZoneId()).thenReturn(allocationZoneId);
+        when(foreignVpc.getAccountId()).thenReturn(43L);
+        when(vpcDao.findById(9L)).thenReturn(foreignVpc);
+
+        try (MockedStatic<ComponentContext> componentContext = Mockito.mockStatic(ComponentContext.class)) {
+            Assert.assertThrows(InvalidParameterValueException.class,
+                    () -> service.allocateIP(accountMock, allocationZoneId, null, 9L, true, null));
+            componentContext.verifyNoInteractions();
+        }
+
+        Mockito.verifyNoInteractions(ipAddressManagerMock);
+    }
+
+    @Test
+    public void testAllocatePortableIpRejectsNsxTier1Vpc() {
+        VpcVO nsxVpc = mock(VpcVO.class);
+        when(nsxVpc.getVpcOfferingId()).thenReturn(7L);
+        when(vpcDao.findById(9L)).thenReturn(nsxVpc);
+        when(vpcMgr.getVpcOffSvcProvidersMap(7L)).thenReturn(
+                Map.of(Network.Service.Gateway, Set.of(Network.Provider.Nsx)));
+
+        Assert.assertThrows(InvalidParameterValueException.class,
+                () -> service.allocatePortableIP(accountMock, 1, 2L, null, 9L));
+        Mockito.verifyNoInteractions(ipAddressManagerMock);
+    }
+
+    @Test
+    public void testReserveIpAddressRejectsRegisteredNsxVrfPublicRange() {
+        IPAddressVO ip = mock(IPAddressVO.class);
+        when(ip.getVlanId()).thenReturn(73L);
+        when(ipAddressDao.findById(5L)).thenReturn(ip);
+        VlanVO vlan = mock(VlanVO.class);
+        when(vlan.getId()).thenReturn(73L);
+        when(vlan.getVlanType()).thenReturn(Vlan.VlanType.VirtualNetwork);
+        when(vlanDao.findById(73L)).thenReturn(vlan);
+        when(nsxVrfGatewayDao.findByPublicVlan(73L)).thenReturn(mock(NsxVrfGatewayVO.class));
+
+        Assert.assertThrows(InvalidParameterValueException.class,
+                () -> service.reserveIpAddress(accountMock, true, 5L));
+
+        Mockito.verify(ipAddressDao, Mockito.never()).persist(any(IPAddressVO.class));
+    }
 
     @BeforeClass
     public static void setUpBeforeClass() {
@@ -317,11 +431,13 @@ public class NetworkServiceImplTest {
         service._networksDao = networkDao;
         service._nicDao = nicDao;
         service._ipAddressDao = ipAddressDao;
+        service._vlanDao = vlanDao;
         service.routerDao = routerDao;
         service.commandSetupHelper = commandSetupHelper;
         service.networkHelper = networkHelper;
         service._ipAddrMgr = ipAddressManagerMock;
         service.nsxProviderDao = nsxProviderDao;
+        service.nsxVrfGatewayDao = nsxVrfGatewayDao;
         callContextMocked = Mockito.mockStatic(CallContext.class);
         CallContext callContextMock = Mockito.mock(CallContext.class);
         callContextMocked.when(CallContext::current).thenReturn(callContextMock);
@@ -1246,6 +1362,8 @@ public class NetworkServiceImplTest {
         NetworkOffering ntwkOff = Mockito.mock(NetworkOffering.class);
         Long networkId = 7l;
         when(networkVO.getId()).thenReturn(networkId);
+        when(networkVO.getDataCenterId()).thenReturn(zoneId);
+        when(networkVO.getAccountId()).thenReturn(account.getId());
         when(networkVO.getGuestType()).thenReturn(Network.GuestType.Isolated);
         when(networkDao.findById(networkId)).thenReturn(networkVO);
         when(entityMgr.findById(NetworkOffering.class, networkOfferingId)).thenReturn(ntwkOff);
@@ -1254,7 +1372,8 @@ public class NetworkServiceImplTest {
         when(networkVO.getId()).thenReturn(networkId);
         when(networkVO.getGuestType()).thenReturn(Network.GuestType.Isolated);
         try {
-            when(ipAddressManagerMock.allocateIp(any(), anyBoolean(), any(), any(), any(), any(), eq(srcNatIp))).thenReturn(ipAddress);
+            when(ipAddressManagerMock.allocateIp(any(), anyBoolean(), any(), any(), any(), any(), eq(srcNatIp)))
+                    .thenReturn(ipAddress);
             service.checkAndSetRouterSourceNatIp(account, createNetworkCmd, networkVO);
         } catch (InsufficientAddressCapacityException | ResourceAllocationException e) {
             Assert.fail(e.getMessage());

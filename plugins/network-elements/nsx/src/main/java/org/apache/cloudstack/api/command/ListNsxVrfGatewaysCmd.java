@@ -30,11 +30,12 @@ import org.apache.cloudstack.api.response.DomainResponse;
 import org.apache.cloudstack.api.response.ListResponse;
 import org.apache.cloudstack.api.response.NsxVrfGatewayResponse;
 import org.apache.cloudstack.api.response.ZoneResponse;
+import org.apache.cloudstack.acl.RoleType;
 import org.apache.cloudstack.service.NsxProviderService;
 
 @APICommand(name = ListNsxVrfGatewaysCmd.APINAME, description = "Lists the NSX VRF gateways registered with CloudStack",
         responseObject = NsxVrfGatewayResponse.class, requestHasSensitiveInfo = false,
-        responseHasSensitiveInfo = false, since = "4.23.0")
+        responseHasSensitiveInfo = false, since = "4.23.0", authorized = {RoleType.Admin})
 public class ListNsxVrfGatewaysCmd extends BaseListCmd {
     public static final String APINAME = "listNsxVrfGateways";
 

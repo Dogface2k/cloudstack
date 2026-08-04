@@ -165,6 +165,7 @@ import com.cloud.network.dao.NetworkDomainVO;
 import com.cloud.network.dao.NetworkServiceMapDao;
 import com.cloud.network.dao.NetworkVO;
 import com.cloud.network.dao.NsxProviderDao;
+import com.cloud.network.dao.NsxVrfGatewayDao;
 import com.cloud.network.dao.OvsProviderDao;
 import com.cloud.network.dao.PhysicalNetworkDao;
 import com.cloud.network.dao.PhysicalNetworkServiceProviderDao;
@@ -429,6 +430,8 @@ public class NetworkServiceImpl extends ManagerBase implements NetworkService, C
     PublicIpQuarantineDao publicIpQuarantineDao;
     @Inject
     NsxProviderDao nsxProviderDao;
+    @Inject
+    NsxVrfGatewayDao nsxVrfGatewayDao;
     @Inject
     private VirtualRouterProviderDao virtualRouterProviderDao;
     @Inject
@@ -731,15 +734,42 @@ public class NetworkServiceImpl extends ManagerBase implements NetworkService, C
     @ActionEvent(eventType = EventTypes.EVENT_NET_IP_ASSIGN, eventDescription = "allocating Ip", create = true)
     public IpAddress allocateIP(Account ipOwner, long zoneId, Long networkId, Boolean displayIp, String ipaddress)
             throws ResourceAllocationException, InsufficientAddressCapacityException, ConcurrentOperationException {
+        return allocateIP(ipOwner, zoneId, networkId, null, displayIp, ipaddress);
+    }
+
+    @Override
+    @ActionEvent(eventType = EventTypes.EVENT_NET_IP_ASSIGN, eventDescription = "allocating Ip", create = true)
+    public IpAddress allocateIP(Account ipOwner, long zoneId, Long networkId, Long vpcId, Boolean displayIp,
+            String ipaddress)
+            throws ResourceAllocationException, InsufficientAddressCapacityException, ConcurrentOperationException {
 
         Account caller = CallContext.current().getCallingAccount();
         User callerUser = CallContext.current().getCallingUser();
         DataCenter zone = _entityMgr.findById(DataCenter.class, zoneId);
+        Long publicVlanId = null;
+        VpcVO nsxVpc = null;
+        Network nsxNetwork = null;
+
+        if (vpcId != null) {
+            VpcVO vpc = _vpcDao.findById(vpcId);
+            if (vpc == null || vpc.getZoneId() != zoneId || vpc.getAccountId() != ipOwner.getId()) {
+                throw new InvalidParameterValueException("The VPC does not belong to the requested account and zone");
+            }
+            if (isNsxTier1Vpc(vpc)) {
+                nsxVpc = vpc;
+            }
+        }
 
         if (networkId != null) {
             Network network = _networksDao.findById(networkId);
             if (network == null) {
                 throw new InvalidParameterValueException("Invalid network id is given");
+            }
+            if (network.getDataCenterId() != zoneId || network.getAccountId() != ipOwner.getId()) {
+                throw new InvalidParameterValueException("The network does not belong to the requested account and zone");
+            }
+            if (network.getBroadcastDomainType() == BroadcastDomainType.NSX) {
+                nsxNetwork = network;
             }
 
             if (network.getGuestType() == Network.GuestType.Shared) {
@@ -764,11 +794,38 @@ public class NetworkServiceImpl extends ManagerBase implements NetworkService, C
             _accountMgr.checkAccess(caller, null, false, ipOwner);
         }
 
-        IpAddress address = _ipAddrMgr.allocateIp(ipOwner, false, caller, callerUser, zone, displayIp, ipaddress);
+        if (nsxVpc != null || nsxNetwork != null) {
+            NsxService nsxService = ComponentContext.getDelegateComponentOfType(NsxService.class);
+            if (nsxService == null) {
+                throw new CloudRuntimeException("The NSX service is unavailable");
+            }
+            if (nsxVpc != null) {
+                publicVlanId = nsxService.reserveTier1PlacementAndGetPublicVlanId(zoneId,
+                        nsxVpc.getAccountId(), nsxVpc.getDomainId(), nsxVpc.getId(), null);
+            } else {
+                Long networkVpcId = nsxNetwork.getVpcId();
+                publicVlanId = nsxService.reserveTier1PlacementAndGetPublicVlanId(zoneId,
+                        nsxNetwork.getAccountId(), nsxNetwork.getDomainId(), networkVpcId,
+                        networkVpcId == null ? nsxNetwork.getId() : null);
+            }
+        }
+
+        IpAddress address = publicVlanId == null
+                ? _ipAddrMgr.allocateIp(ipOwner, false, caller, callerUser, zone, displayIp, ipaddress)
+                : _ipAddrMgr.allocateIpFromNsxVrfPublicRange(ipOwner, false, caller, callerUser, zone,
+                        displayIp, ipaddress, publicVlanId);
         if (address != null) {
             CallContext.current().putContextParameter(IpAddress.class, address.getUuid());
         }
         return address;
+    }
+
+    private boolean isNsxTier1Vpc(Vpc vpc) {
+        Map<Service, Set<Provider>> providers = _vpcMgr.getVpcOffSvcProvidersMap(vpc.getVpcOfferingId());
+        Set<Provider> sourceNatProviders = providers.get(Service.SourceNat);
+        Set<Provider> gatewayProviders = providers.get(Service.Gateway);
+        return (sourceNatProviders != null && sourceNatProviders.contains(Provider.Nsx))
+                || (gatewayProviders != null && gatewayProviders.contains(Provider.Nsx));
     }
 
     @Override
@@ -813,6 +870,10 @@ public class NetworkServiceImpl extends ManagerBase implements NetworkService, C
             Vpc vpc = _vpcDao.findById(vpcId);
             if (vpc == null) {
                 throw new InvalidParameterValueException("Invalid vpc id is given");
+            }
+            if (isNsxTier1Vpc(vpc)) {
+                throw new InvalidParameterValueException(
+                        "Portable public IP ranges are not supported for NSX Tier-1 VPCs");
             }
         }
 
@@ -1138,6 +1199,10 @@ public class NetworkServiceImpl extends ManagerBase implements NetworkService, C
         if (!vlan.getVlanType().equals(VlanType.VirtualNetwork)) {
             throw new IllegalArgumentException("Only IP addresses that belong to a virtual network may be reserved.");
         }
+        if (nsxVrfGatewayDao.findByPublicVlan(vlan.getId()) != null) {
+            throw new InvalidParameterValueException(
+                    "Unable to reserve an IP from a range registered to an NSX VRF gateway");
+        }
         if (ipVO.isPortable()) {
             throw new InvalidParameterValueException("Unable to reserve a portable IP.");
         }
@@ -1224,6 +1289,9 @@ public class NetworkServiceImpl extends ManagerBase implements NetworkService, C
     private VlanVO findOneVlanRangeMatchingVlanDetailKey(DataCenter zone, String vlanDetailKey) {
         List<VlanVO> zoneVlans = _vlanDao.listByZone(zone.getId());
         for (VlanVO zoneVlan : zoneVlans) {
+            if (nsxVrfGatewayDao.findByPublicVlan(zoneVlan.getId()) != null) {
+                continue;
+            }
             VlanDetailsVO detail = vlanDetailsDao.findDetail(zoneVlan.getId(), vlanDetailKey);
             if (detail != null && detail.getValue().equalsIgnoreCase("true")) {
                 logger.debug(String.format("Found the VLAN range %s is set for NSX on zone %s", zoneVlan.getIpRange(), zone.getName()));
@@ -1953,6 +2021,16 @@ public class NetworkServiceImpl extends ManagerBase implements NetworkService, C
         List<IPAddressVO> userIps = _ipAddressDao.listByAssociatedNetwork(network.getId(), true);
         if (! userIps.isEmpty()) {
             try {
+                if (network.getBroadcastDomainType() == BroadcastDomainType.NSX) {
+                    NsxService nsxService = ComponentContext.getDelegateComponentOfType(NsxService.class);
+                    if (nsxService == null) {
+                        throw new CloudRuntimeException("The NSX service is unavailable");
+                    }
+                    Long vpcId = network.getVpcId();
+                    nsxService.validatePublicIpVlan(network.getDataCenterId(), network.getAccountId(),
+                            network.getDomainId(), vpcId, vpcId == null ? network.getId() : null,
+                            requestedIp.getVlanId());
+                }
                 _ipAddrMgr.updateSourceNatIpAddress(requestedIp, userIps);
             } catch (Exception e) { // pokemon exception from transaction
                 String msg = String.format("Update of source NAT IP to %s for Network \"%s\"/%s failed due to %s",

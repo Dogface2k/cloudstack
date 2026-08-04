@@ -42,12 +42,14 @@ import com.vmware.nsx_policy.infra.Segments;
 import com.vmware.nsx_policy.infra.Services;
 import com.vmware.nsx_policy.infra.Sites;
 import com.vmware.nsx_policy.infra.Tier1s;
+import com.vmware.nsx_policy.infra.Tier0s;
 import com.vmware.nsx_policy.infra.domains.Groups;
 import com.vmware.nsx_policy.infra.domains.SecurityPolicies;
 import com.vmware.nsx_policy.infra.domains.groups.members.SegmentPorts;
 import com.vmware.nsx_policy.infra.domains.security_policies.Rules;
 import com.vmware.nsx_policy.infra.sites.EnforcementPoints;
 import com.vmware.nsx_policy.infra.tier_0s.LocaleServices;
+import com.vmware.nsx_policy.infra.tier_0s.locale_services.Interfaces;
 import com.vmware.nsx_policy.infra.tier_1s.IpsecVpnServices;
 import com.vmware.nsx_policy.infra.tier_1s.ipsec_vpn_services.LocalEndpoints;
 import com.vmware.nsx_policy.infra.tier_1s.ipsec_vpn_services.Sessions;
@@ -91,6 +93,8 @@ import com.vmware.nsx_policy.model.LocaleServicesListResult;
 import com.vmware.nsx_policy.model.MacDiscoveryProfile;
 import com.vmware.nsx_policy.model.PathExpression;
 import com.vmware.nsx_policy.model.PolicyGroupMembersListResult;
+import com.vmware.nsx_policy.model.PolicyBgpNeighborStatus;
+import com.vmware.nsx_policy.model.PolicyBgpNeighborsStatusListResult;
 import com.vmware.nsx_policy.model.PolicyNatRule;
 import com.vmware.nsx_policy.model.PolicyNatRuleListResult;
 import com.vmware.nsx_policy.model.PolicyGroupMemberDetails;
@@ -108,6 +112,8 @@ import com.vmware.nsx_policy.model.Site;
 import com.vmware.nsx_policy.model.StaticRoutesListResult;
 import com.vmware.nsx_policy.model.Tag;
 import com.vmware.nsx_policy.model.Tier1;
+import com.vmware.nsx_policy.model.Tier0;
+import com.vmware.nsx_policy.model.Tier0InterfaceListResult;
 import com.vmware.nsx_policy.model.TunnelInterfaceIPSubnet;
 import com.vmware.vapi.bindings.Service;
 import com.vmware.vapi.bindings.Structure;
@@ -513,15 +519,128 @@ public class NsxApiClient {
         return null;
     }
 
-    private Optional<com.vmware.nsx_policy.model.LocaleServices> findTier0LocalServices(String tier0Gateway) {
+    private Optional<com.vmware.nsx_policy.model.LocaleServices> findTier0LocalServices(String tier0Gateway,
+            String expectedEdgeCluster) {
         try {
             LocaleServices tier0LocaleServices = (LocaleServices) nsxService.apply(LocaleServices.class);
-            LocaleServicesListResult result = tier0LocaleServices.list(tier0Gateway, null, false, null, 1L, null, null);
-            return Optional.ofNullable(result.getResults())
-                    .filter(Predicate.not(List::isEmpty))
-                    .map(l -> l.get(0));
+            LocaleServicesListResult result = tier0LocaleServices.list(tier0Gateway, null, false, null, 1000L, null, null);
+            List<com.vmware.nsx_policy.model.LocaleServices> localeServices = Optional.ofNullable(result.getResults())
+                    .orElseGet(List::of);
+            if (localeServices.isEmpty()) {
+                return Optional.empty();
+            }
+            if (StringUtils.isBlank(expectedEdgeCluster)) {
+                if (localeServices.size() != 1) {
+                    throw new CloudRuntimeException(String.format(
+                            "Tier-0 gateway %s has multiple locale services; specify the expected edge cluster",
+                            tier0Gateway));
+                }
+                return Optional.of(localeServices.get(0));
+            }
+            List<com.vmware.nsx_policy.model.LocaleServices> matchingLocaleServices = localeServices.stream()
+                    .filter(localeService -> expectedEdgeCluster.equals(localeService.getEdgeClusterPath())
+                            || StringUtils.endsWith(localeService.getEdgeClusterPath(), "/" + expectedEdgeCluster))
+                    .toList();
+            if (matchingLocaleServices.size() != 1) {
+                throw new CloudRuntimeException(String.format(
+                        "Tier-0 gateway %s has %d locale services on expected edge cluster %s",
+                        tier0Gateway, matchingLocaleServices.size(), expectedEdgeCluster));
+            }
+            return Optional.of(matchingLocaleServices.get(0));
+        } catch (CloudRuntimeException e) {
+            throw e;
         } catch (Exception e) {
             throw new CloudRuntimeException(String.format("Failed to fetch locale services for tier gateway %s due to %s", tier0Gateway, e.getMessage()));
+        }
+    }
+
+    public static class VrfGatewayValidation {
+        private final String edgeClusterPath;
+        private final String parentTier0Path;
+
+        VrfGatewayValidation(String edgeClusterPath, String parentTier0Path) {
+            this.edgeClusterPath = edgeClusterPath;
+            this.parentTier0Path = parentTier0Path;
+        }
+
+        public String getEdgeClusterPath() {
+            return edgeClusterPath;
+        }
+
+        public String getParentTier0Path() {
+            return parentTier0Path;
+        }
+    }
+
+    public VrfGatewayValidation validateVrfGateway(String tier0Gateway, String expectedParentTier0,
+            String expectedEdgeCluster) {
+        try {
+            Tier0s tier0s = (Tier0s) nsxService.apply(Tier0s.class);
+            Tier0 tier0 = tier0s.get(tier0Gateway);
+            if (tier0 == null || Boolean.TRUE.equals(tier0.getMarkedForDelete())) {
+                throw new CloudRuntimeException(String.format("Tier-0 gateway %s is not available", tier0Gateway));
+            }
+
+            String actualParentPath = tier0.getVrfConfig() == null ? null : tier0.getVrfConfig().getTier0Path();
+            if (StringUtils.isBlank(expectedParentTier0) != StringUtils.isBlank(actualParentPath)) {
+                throw new CloudRuntimeException(String.format(
+                        "Tier-0 gateway %s VRF parent does not match the declared gateway type", tier0Gateway));
+            }
+            if (StringUtils.isNotBlank(expectedParentTier0)) {
+                String expectedParentPath = expectedParentTier0.startsWith(TIER_0_GATEWAY_PATH_PREFIX)
+                        ? expectedParentTier0 : TIER_0_GATEWAY_PATH_PREFIX + expectedParentTier0;
+                if (!expectedParentPath.equals(actualParentPath)) {
+                    throw new CloudRuntimeException(String.format(
+                            "Tier-0 gateway %s has parent %s, expected %s",
+                            tier0Gateway, actualParentPath, expectedParentPath));
+                }
+            }
+
+            com.vmware.nsx_policy.model.LocaleServices localeService = findTier0LocalServices(tier0Gateway, expectedEdgeCluster)
+                    .orElseThrow(() -> new CloudRuntimeException(String.format(
+                            "Tier-0 gateway %s has no locale service", tier0Gateway)));
+            String edgeClusterPath = localeService.getEdgeClusterPath();
+            if (StringUtils.isBlank(edgeClusterPath)) {
+                throw new CloudRuntimeException(String.format(
+                        "Tier-0 gateway %s locale service has no edge cluster", tier0Gateway));
+            }
+            if (StringUtils.isNotBlank(expectedEdgeCluster)
+                    && !edgeClusterPath.equals(expectedEdgeCluster)
+                    && !edgeClusterPath.endsWith("/" + expectedEdgeCluster)) {
+                throw new CloudRuntimeException(String.format(
+                        "Tier-0 gateway %s uses edge cluster %s, expected %s",
+                        tier0Gateway, edgeClusterPath, expectedEdgeCluster));
+            }
+
+            Interfaces interfaces = (Interfaces) nsxService.apply(Interfaces.class);
+            Tier0InterfaceListResult interfaceResult = interfaces.list(tier0Gateway, localeService.getId(),
+                    null, false, null, 1L, null, null);
+            if (CollectionUtils.isEmpty(interfaceResult.getResults())) {
+                throw new CloudRuntimeException(String.format(
+                        "Tier-0 gateway %s has no locale-service interface", tier0Gateway));
+            }
+
+            com.vmware.nsx_policy.infra.tier_0s.locale_services.bgp.neighbors.Status statusService =
+                    (com.vmware.nsx_policy.infra.tier_0s.locale_services.bgp.neighbors.Status) nsxService.apply(
+                            com.vmware.nsx_policy.infra.tier_0s.locale_services.bgp.neighbors.Status.class);
+            PolicyBgpNeighborsStatusListResult statuses = statusService.list(tier0Gateway, localeService.getId(),
+                    null, null, null, false, null, null, null, null);
+            boolean established = !CollectionUtils.isEmpty(statuses.getResults()) && statuses.getResults().stream()
+                    .anyMatch(status -> PolicyBgpNeighborStatus.CONNECTION_STATE_ESTABLISHED.equals(status.getConnectionState()));
+            if (!established) {
+                throw new CloudRuntimeException(String.format(
+                        "Tier-0 gateway %s has no established BGP neighbor", tier0Gateway));
+            }
+            return new VrfGatewayValidation(edgeClusterPath, actualParentPath);
+        } catch (CloudRuntimeException e) {
+            throw e;
+        } catch (Error error) {
+            ApiError apiError = error.getData()._convertTo(ApiError.class);
+            throw new CloudRuntimeException(String.format(
+                    "Failed to validate Tier-0 gateway %s: %s", tier0Gateway, apiError.getErrorMessage()));
+        } catch (Exception e) {
+            throw new CloudRuntimeException(String.format(
+                    "Failed to validate Tier-0 gateway %s: %s", tier0Gateway, e.getMessage()), e);
         }
     }
 
@@ -530,7 +649,7 @@ public class NsxApiClient {
      */
     private void createTier1LocaleServices(String tier1Id, String edgeCluster, String tier0Gateway) {
         try {
-            Optional<com.vmware.nsx_policy.model.LocaleServices> localeServices = findTier0LocalServices(tier0Gateway);
+            Optional<com.vmware.nsx_policy.model.LocaleServices> localeServices = findTier0LocalServices(tier0Gateway, edgeCluster);
             if (localeServices.isEmpty()) {
                 throw new CloudRuntimeException(String.format("Failed to find locale services for tier-0 gateway %s", tier0Gateway));
             }
@@ -558,8 +677,12 @@ public class NsxApiClient {
         String tier0GatewayPath = TIER_0_GATEWAY_PATH_PREFIX + tier0Gateway;
         Tier1 tier1 = getTier1Gateway(name);
         if (tier1 != null) {
-            logger.info("VPC network with name {} exists in NSX zone", name);
-            return;
+            if (!tier0GatewayPath.equals(tier1.getTier0Path())) {
+                throw new CloudRuntimeException(String.format(
+                        "Tier-1 gateway %s already exists under %s, not requested parent %s",
+                        name, tier1.getTier0Path(), tier0GatewayPath));
+            }
+            logger.info("Reconciling existing Tier-1 gateway {} in NSX", name);
         }
 
         List<String> routeAdvertisementTypes = getRouterAdvertisementTypeList(sourceNatEnabled);

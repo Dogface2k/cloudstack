@@ -62,6 +62,7 @@ public class ScaleKubernetesClusterCmd extends BaseAsyncCmd {
     /////////////////////////////////////////////////////
     //////////////// API parameters /////////////////////
     /////////////////////////////////////////////////////
+    @ACL(accessType = SecurityChecker.AccessType.OperateEntry)
     @Parameter(name = ApiConstants.ID, type = CommandType.UUID, required = true,
         entityType = KubernetesClusterResponse.class,
         description = "The ID of the Kubernetes cluster")
@@ -162,6 +163,17 @@ public class ScaleKubernetesClusterCmd extends BaseAsyncCmd {
     @Override
     public ApiCommandResourceType getApiResourceType() {
         return ApiCommandResourceType.KubernetesCluster;
+    }
+
+    @Override
+    public String getSyncObjType() {
+        return BaseAsyncCmd.networkSyncObject;
+    }
+
+    @Override
+    public Long getSyncObjId() {
+        KubernetesCluster cluster = kubernetesClusterService.findById(getId());
+        return cluster == null ? null : cluster.getNetworkId();
     }
 
     /////////////////////////////////////////////////////

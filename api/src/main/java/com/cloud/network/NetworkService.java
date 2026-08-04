@@ -89,6 +89,10 @@ public interface NetworkService {
     IpAddress allocateIP(Account ipOwner, long zoneId, Long networkId, Boolean displayIp, String ipaddress) throws ResourceAllocationException, InsufficientAddressCapacityException,
         ConcurrentOperationException;
 
+    IpAddress allocateIP(Account ipOwner, long zoneId, Long networkId, Long vpcId, Boolean displayIp,
+                         String ipaddress) throws ResourceAllocationException, InsufficientAddressCapacityException,
+        ConcurrentOperationException;
+
     IpAddress reserveIpAddress(Account account, Boolean displayIp, Long ipAddressId) throws ResourceAllocationException;
 
     IpAddress reserveIpAddressWithVlanDetail(Account account, DataCenter zone, Boolean displayIp, String vlanDetailKey) throws ResourceAllocationException;

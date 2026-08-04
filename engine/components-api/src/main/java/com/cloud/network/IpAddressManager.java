@@ -192,7 +192,15 @@ public interface IpAddressManager {
     PublicIp assignDedicateIpAddress(Account owner, Long guestNtwkId, Long vpcId, long dcId, boolean isSourceNat)
             throws ConcurrentOperationException, InsufficientAddressCapacityException;
 
+    PublicIp assignDedicateIpAddressFromNsxVrfPublicRange(Account owner, Long guestNtwkId, Long vpcId, long dcId,
+                                     boolean isSourceNat, Long vlanDbId)
+            throws ConcurrentOperationException, InsufficientAddressCapacityException;
+
     IpAddress allocateIp(Account ipOwner, boolean isSystem, Account caller, User callerId, DataCenter zone, Boolean displayIp, String ipaddress)
+            throws ConcurrentOperationException, ResourceAllocationException, InsufficientAddressCapacityException;
+
+    IpAddress allocateIpFromNsxVrfPublicRange(Account ipOwner, boolean isSystem, Account caller, User callerId, DataCenter zone,
+                         Boolean displayIp, String ipaddress, Long vlanDbId)
             throws ConcurrentOperationException, ResourceAllocationException, InsufficientAddressCapacityException;
 
     PublicIp assignPublicIpAddressFromVlans(long dcId, Long podId, Account owner, VlanType type, List<Long> vlanDbIds, Long networkId, String requestedIp, String requestedGateway, boolean isSystem)

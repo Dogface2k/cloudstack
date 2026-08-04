@@ -25,6 +25,8 @@ import org.apache.cloudstack.api.Parameter;
 import org.apache.cloudstack.api.ServerApiException;
 import org.apache.cloudstack.api.response.NsxVrfGatewayResponse;
 import org.apache.cloudstack.api.response.ZoneResponse;
+import org.apache.cloudstack.api.response.VlanIpRangeResponse;
+import org.apache.cloudstack.acl.RoleType;
 import org.apache.cloudstack.context.CallContext;
 import org.apache.cloudstack.service.NsxProviderService;
 
@@ -35,7 +37,7 @@ import org.apache.cloudstack.service.NsxProviderService;
  */
 @APICommand(name = AddNsxVrfGatewayCmd.APINAME, description = "Registers an existing NSX VRF or dedicated tier-0 gateway with CloudStack, so tenant tier-1 gateways can be attached to it",
         responseObject = NsxVrfGatewayResponse.class, requestHasSensitiveInfo = false,
-        responseHasSensitiveInfo = false, since = "4.23.0")
+        responseHasSensitiveInfo = false, since = "4.23.0", authorized = {RoleType.Admin})
 public class AddNsxVrfGatewayCmd extends BaseCmd {
     public static final String APINAME = "addNsxVrfGateway";
 
@@ -50,13 +52,17 @@ public class AddNsxVrfGatewayCmd extends BaseCmd {
             description = "name of the VRF or dedicated tier-0 gateway as it exists in NSX")
     private String tier0Gateway;
 
-    @Parameter(name = ApiConstants.EDGE_CLUSTER, type = CommandType.STRING, required = true,
-            description = "name of the edge cluster the tier-0 gateway lives on; may differ from the zone default")
+    @Parameter(name = ApiConstants.EDGE_CLUSTER, type = CommandType.STRING,
+            description = "optional expected edge-cluster ID or path; CloudStack reads and stores the actual path from NSX")
     private String edgeCluster;
 
     @Parameter(name = ApiConstants.PARENT_TIER0_GATEWAY, type = CommandType.STRING,
             description = "parent tier-0 gateway when registering a VRF gateway; omit for a dedicated tier-0")
     private String parentTier0Gateway;
+
+    @Parameter(name = ApiConstants.VLAN_ID, type = CommandType.UUID, entityType = VlanIpRangeResponse.class,
+            required = true, description = "public IP range advertised by this tier-0; it must be dedicated to the tenant before assignment")
+    private Long publicVlanId;
 
     public Long getZoneId() {
         return zoneId;
@@ -72,6 +78,10 @@ public class AddNsxVrfGatewayCmd extends BaseCmd {
 
     public String getParentTier0Gateway() {
         return parentTier0Gateway;
+    }
+
+    public Long getPublicVlanId() {
+        return publicVlanId;
     }
 
     @Override

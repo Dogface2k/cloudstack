@@ -26,6 +26,7 @@ import org.apache.cloudstack.api.ServerApiException;
 import org.apache.cloudstack.api.response.AccountResponse;
 import org.apache.cloudstack.api.response.DomainResponse;
 import org.apache.cloudstack.api.response.NsxVrfGatewayResponse;
+import org.apache.cloudstack.acl.RoleType;
 import org.apache.cloudstack.context.CallContext;
 import org.apache.cloudstack.service.NsxProviderService;
 
@@ -36,7 +37,7 @@ import org.apache.cloudstack.service.NsxProviderService;
  */
 @APICommand(name = AssignNsxVrfGatewayCmd.APINAME, description = "Assigns a registered NSX VRF gateway to an account or a domain",
         responseObject = NsxVrfGatewayResponse.class, requestHasSensitiveInfo = false,
-        responseHasSensitiveInfo = false, since = "4.23.0")
+        responseHasSensitiveInfo = false, since = "4.23.0", authorized = {RoleType.Admin})
 public class AssignNsxVrfGatewayCmd extends BaseCmd {
     public static final String APINAME = "assignNsxVrfGateway";
 

@@ -311,7 +311,8 @@ public class AssociateIPAddrCmd extends BaseAsyncCreateCmd implements UserCmd {
             IpAddress ip = null;
 
             if (!isPortable()) {
-                ip = _networkService.allocateIP(_accountService.getAccount(getEntityOwnerId()), getZoneId(), getNetworkId(), getDisplayIp(), ipAddress);
+                ip = _networkService.allocateIP(_accountService.getAccount(getEntityOwnerId()), getZoneId(),
+                        getNetworkId(), getVpcId(), getDisplayIp(), ipAddress);
             } else {
                 ip = _networkService.allocatePortableIP(_accountService.getAccount(getEntityOwnerId()), 1, getZoneId(), getNetworkId(), getVpcId());
             }

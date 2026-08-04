@@ -18,27 +18,16 @@ package com.cloud.network.dao;
 
 import java.util.List;
 
-import com.cloud.network.element.NsxVrfGatewayVO;
+import com.cloud.network.element.NsxVrfGatewayPlacementVO;
 import com.cloud.utils.db.GenericDao;
 
-public interface NsxVrfGatewayDao extends GenericDao<NsxVrfGatewayVO, Long> {
+public interface NsxVrfGatewayPlacementDao extends GenericDao<NsxVrfGatewayPlacementVO, Long> {
 
-    NsxVrfGatewayVO findByUuid(String uuid);
+    NsxVrfGatewayPlacementVO findByVpcId(long vpcId);
 
-    NsxVrfGatewayVO findByZoneAndTier0Name(long zoneId, String tier0Name);
+    NsxVrfGatewayPlacementVO findByNetworkId(long networkId);
 
-    NsxVrfGatewayVO findByPublicVlan(long publicVlanDbId);
+    long countByGatewayId(long gatewayId);
 
-    NsxVrfGatewayVO lockByPublicVlan(long publicVlanDbId);
-
-    /** The gateway claimed by this exact account, if any. */
-    NsxVrfGatewayVO findByAccount(long zoneId, long accountId);
-
-    /** The gateway claimed by this exact domain, if any — no ancestor walking. */
-    NsxVrfGatewayVO findByDomain(long zoneId, long domainId);
-
-    List<NsxVrfGatewayVO> listByZone(long zoneId);
-
-    /** Pool members in this zone that no tenant has claimed. */
-    List<NsxVrfGatewayVO> listUnclaimed(long zoneId);
+    List<NsxVrfGatewayPlacementVO> listByZone(long zoneId);
 }

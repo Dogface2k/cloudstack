@@ -25,6 +25,10 @@ import com.cloud.network.vpc.Vpc;
 
 public interface NsxService {
 
+    static String getVrfZoneLockName(long zoneId) {
+        return String.format("NsxVrfGateway.Zone.%s", zoneId);
+    }
+
     ConfigKey<Integer> NSX_API_FAILURE_RETRIES = new ConfigKey<>("Advanced", Integer.class,
             "nsx.api.failure.retries", "30",
             "Number of retries for NSX API operations in case of failures",
@@ -34,9 +38,13 @@ public interface NsxService {
             "Waiting time (in seconds) before retrying an NSX API operation in case of failure",
             true, ConfigKey.Scope.Zone);
 
-    boolean createVpcNetwork(Long zoneId, long accountId, long domainId, Long vpcId, String vpcName, boolean sourceNatEnabled);
+    boolean createVpcNetwork(Long zoneId, long accountId, long domainId, Long vpcId, String vpcName,
+                             boolean sourceNatEnabled, Long sourceNatVlanId);
     boolean createNetwork(Long zoneId, long accountId, long domainId, Long networkId, String networkName, boolean sourceNatEnabled);
     boolean updateVpcSourceNatIp(Vpc vpc, IpAddress address);
+    Long reserveTier1PlacementAndGetPublicVlanId(long zoneId, long accountId, long domainId, Long vpcId, Long networkId);
+    Long getPublicVlanId(long zoneId, long accountId, long domainId, Long vpcId, Long networkId);
+    void validatePublicIpVlan(long zoneId, long accountId, long domainId, Long vpcId, Long networkId, long vlanId);
     String getSegmentId(long domainId, long accountId, long zoneId, Long vpcId, long networkId);
 
     NsxVpnGatewayResult createVpnGateway(Vpc vpc, String localEndpointIp);

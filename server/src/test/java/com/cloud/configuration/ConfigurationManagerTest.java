@@ -57,6 +57,7 @@ import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.Ipv6GuestPrefixSubnetNetworkMapDao;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
+import com.cloud.network.dao.NsxVrfGatewayDao;
 import com.cloud.network.dao.PhysicalNetworkDao;
 import com.cloud.network.dao.PhysicalNetworkVO;
 import com.cloud.offering.DiskOffering;
@@ -76,6 +77,7 @@ import com.cloud.user.UserVO;
 import com.cloud.user.dao.AccountDao;
 import com.cloud.utils.Pair;
 import com.cloud.utils.db.Filter;
+import com.cloud.utils.db.GlobalLock;
 import com.cloud.utils.db.SearchCriteria;
 import com.cloud.utils.db.TransactionLegacy;
 import com.cloud.utils.exception.CloudRuntimeException;
@@ -110,6 +112,7 @@ import org.junit.Before;
 import org.junit.Test;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
+import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
 import org.mockito.Spy;
@@ -199,6 +202,8 @@ public class ConfigurationManagerTest {
     HostPodDao _podDao;
     @Mock
     NetworkDao _networkDao;
+    @Mock
+    NsxVrfGatewayDao nsxVrfGatewayDao;
     @Mock
     PhysicalNetworkDao _physicalNetworkDao;
     @Mock
@@ -316,25 +321,32 @@ public class ConfigurationManagerTest {
 
         logger.info("Running tests for DedicatePublicIpRange API");
 
-        /*
-         * TEST 1: given valid parameters and no allocated public ip's in the range ReleasePublicIpRange should succeed
-         */
-        runReleasePublicIpRangePostiveTest1();
+        GlobalLock lock = mock(GlobalLock.class);
+        when(lock.lock(30)).thenReturn(true);
 
-        /*
-         * TEST 2: given valid parameters ReleasePublicIpRange should succeed
-         */
-        runReleasePublicIpRangePostiveTest2();
+        try (MockedStatic<GlobalLock> globalLock = Mockito.mockStatic(GlobalLock.class)) {
+            globalLock.when(() -> GlobalLock.getInternLock(anyString())).thenReturn(lock);
 
-        /*
-         * TEST 3: given range doesn't exist
-         */
-        runReleasePublicIpRangeInvalidIpRange();
+            /*
+             * TEST 1: given valid parameters and no allocated public ip's in the range ReleasePublicIpRange should succeed
+             */
+            runReleasePublicIpRangePostiveTest1();
 
-        /*
-         * TEST 4: given range is not dedicated to any account
-         */
-        runReleaseNonDedicatedPublicIpRange();
+            /*
+             * TEST 2: given valid parameters ReleasePublicIpRange should succeed
+             */
+            runReleasePublicIpRangePostiveTest2();
+
+            /*
+             * TEST 3: given range doesn't exist
+             */
+            runReleasePublicIpRangeInvalidIpRange();
+
+            /*
+             * TEST 4: given range is not dedicated to any account
+             */
+            runReleaseNonDedicatedPublicIpRange();
+        }
     }
 
     void runDedicatePublicIpRangePostiveTest() throws Exception {

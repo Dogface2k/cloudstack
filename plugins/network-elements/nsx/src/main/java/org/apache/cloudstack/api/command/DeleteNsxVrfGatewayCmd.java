@@ -25,6 +25,7 @@ import org.apache.cloudstack.api.Parameter;
 import org.apache.cloudstack.api.ServerApiException;
 import org.apache.cloudstack.api.response.NsxVrfGatewayResponse;
 import org.apache.cloudstack.api.response.SuccessResponse;
+import org.apache.cloudstack.acl.RoleType;
 import org.apache.cloudstack.context.CallContext;
 import org.apache.cloudstack.service.NsxProviderService;
 
@@ -34,7 +35,7 @@ import org.apache.cloudstack.service.NsxProviderService;
  */
 @APICommand(name = DeleteNsxVrfGatewayCmd.APINAME, description = "Removes CloudStack's registration of an NSX VRF gateway. The gateway itself is not deleted from NSX",
         responseObject = SuccessResponse.class, requestHasSensitiveInfo = false,
-        responseHasSensitiveInfo = false, since = "4.23.0")
+        responseHasSensitiveInfo = false, since = "4.23.0", authorized = {RoleType.Admin})
 public class DeleteNsxVrfGatewayCmd extends BaseCmd {
     public static final String APINAME = "deleteNsxVrfGateway";
 

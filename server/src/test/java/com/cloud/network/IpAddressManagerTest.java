@@ -57,6 +57,10 @@ import com.cloud.network.dao.IPAddressDao;
 import com.cloud.network.dao.IPAddressVO;
 import com.cloud.network.dao.NetworkDao;
 import com.cloud.network.dao.NetworkVO;
+import com.cloud.network.dao.NetrisProviderDao;
+import com.cloud.network.dao.NsxProviderDao;
+import com.cloud.network.dao.NsxVrfGatewayDao;
+import com.cloud.network.element.NsxVrfGatewayVO;
 import com.cloud.network.rules.FirewallRule;
 import com.cloud.network.rules.StaticNat;
 import com.cloud.network.rules.StaticNatImpl;
@@ -67,6 +71,7 @@ import com.cloud.dc.dao.VlanDao;
 import com.cloud.offerings.NetworkOfferingVO;
 import com.cloud.offerings.dao.NetworkOfferingDao;
 import com.cloud.user.AccountVO;
+import com.cloud.user.dao.AccountDao;
 import com.cloud.utils.net.Ip;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -122,6 +127,18 @@ public class IpAddressManagerTest {
     @Mock
     VlanDao vlanDao;
 
+    @Mock
+    AccountDao accountDao;
+
+    @Mock
+    NsxProviderDao nsxProviderDao;
+
+    @Mock
+    NsxVrfGatewayDao nsxVrfGatewayDao;
+
+    @Mock
+    NetrisProviderDao netrisProviderDao;
+
     final long dummyID = 1L;
 
     final String UUID = "uuid";
@@ -145,6 +162,110 @@ public class IpAddressManagerTest {
         networkOfferingVO.setSharedSourceNat(false);
 
         Mockito.when(networkOfferingDao.findById(Mockito.anyLong())).thenReturn(networkOfferingVO);
+    }
+
+    @Test
+    public void testAllocateIpRejectsReservedAddressOutsideRequiredVlan() throws Exception {
+        com.cloud.dc.DataCenter zone = mock(com.cloud.dc.DataCenter.class);
+        when(zone.getId()).thenReturn(2L);
+        when(zone.getAllocationState()).thenReturn(com.cloud.org.Grouping.AllocationState.Enabled);
+        when(accountDao.acquireInLockTable(account.getId())).thenReturn(account);
+        NsxVrfGatewayVO gateway = mock(NsxVrfGatewayVO.class);
+        when(gateway.getZoneId()).thenReturn(2L);
+        when(nsxVrfGatewayDao.findByPublicVlan(10L)).thenReturn(gateway);
+        IPAddressVO reserved = mock(IPAddressVO.class);
+        when(reserved.getVlanId()).thenReturn(9L);
+        when(ipAddressDao.findByAccountIdAndZoneIdAndStateAndIpAddress(account.getId(), 2L,
+                IpAddress.State.Reserved, "192.0.2.10")).thenReturn(reserved);
+
+        Assert.assertThrows(com.cloud.exception.InvalidParameterValueException.class,
+                () -> ipAddressManager.allocateIpFromNsxVrfPublicRange(account, false, account, null, zone,
+                        true, "192.0.2.10", 10L));
+
+        verify(accountDao).releaseFromLockTable(account.getId());
+    }
+
+    @Test
+    public void testAllocateIpWithoutRequiredVlanKeepsReservedAddressPath() throws Exception {
+        com.cloud.dc.DataCenter zone = mock(com.cloud.dc.DataCenter.class);
+        when(zone.getId()).thenReturn(2L);
+        when(zone.getAllocationState()).thenReturn(com.cloud.org.Grouping.AllocationState.Enabled);
+        when(accountDao.acquireInLockTable(account.getId())).thenReturn(account);
+        IPAddressVO reserved = mock(IPAddressVO.class);
+        when(reserved.getId()).thenReturn(5L);
+        when(reserved.getVlanId()).thenReturn(9L);
+        when(ipAddressDao.findByAccountIdAndZoneIdAndStateAndIpAddress(account.getId(), 2L,
+                IpAddress.State.Reserved, "192.0.2.10")).thenReturn(reserved);
+        com.cloud.dc.VlanVO vlan = mock(com.cloud.dc.VlanVO.class);
+        when(vlanDao.findById(9L)).thenReturn(vlan);
+
+        IpAddress result = ipAddressManager.allocateIp(account, false, account, null, zone, true,
+                "192.0.2.10");
+
+        Assert.assertEquals(5L, result.getId());
+        verify(accountDao).releaseFromLockTable(account.getId());
+    }
+
+    @Test
+    public void testGenericAllocateIpRejectsReservedAddressFromRegisteredNsxVrfRange() throws Exception {
+        com.cloud.dc.DataCenter zone = mock(com.cloud.dc.DataCenter.class);
+        when(zone.getId()).thenReturn(2L);
+        when(zone.getAllocationState()).thenReturn(com.cloud.org.Grouping.AllocationState.Enabled);
+        when(accountDao.acquireInLockTable(account.getId())).thenReturn(account);
+        IPAddressVO reserved = mock(IPAddressVO.class);
+        when(reserved.getVlanId()).thenReturn(9L);
+        when(ipAddressDao.findByAccountIdAndZoneIdAndStateAndIpAddress(account.getId(), 2L,
+                IpAddress.State.Reserved, "192.0.2.10")).thenReturn(reserved);
+        when(nsxVrfGatewayDao.findByPublicVlan(9L)).thenReturn(mock(NsxVrfGatewayVO.class));
+
+        Assert.assertThrows(com.cloud.exception.InvalidParameterValueException.class,
+                () -> ipAddressManager.allocateIp(account, false, account, null, zone, true,
+                        "192.0.2.10"));
+
+        verify(accountDao).releaseFromLockTable(account.getId());
+    }
+
+    @Test
+    public void testNsxVrfAllocateIpAcceptsReservedAddressFromItsRegisteredRange() throws Exception {
+        com.cloud.dc.DataCenter zone = mock(com.cloud.dc.DataCenter.class);
+        when(zone.getId()).thenReturn(2L);
+        when(zone.getAllocationState()).thenReturn(com.cloud.org.Grouping.AllocationState.Enabled);
+        when(accountDao.acquireInLockTable(account.getId())).thenReturn(account);
+        NsxVrfGatewayVO gateway = mock(NsxVrfGatewayVO.class);
+        when(gateway.getZoneId()).thenReturn(2L);
+        when(nsxVrfGatewayDao.findByPublicVlan(9L)).thenReturn(gateway);
+        IPAddressVO reserved = mock(IPAddressVO.class);
+        when(reserved.getId()).thenReturn(5L);
+        when(reserved.getVlanId()).thenReturn(9L);
+        when(ipAddressDao.findByAccountIdAndZoneIdAndStateAndIpAddress(account.getId(), 2L,
+                IpAddress.State.Reserved, "192.0.2.10")).thenReturn(reserved);
+        com.cloud.dc.VlanVO vlan = mock(com.cloud.dc.VlanVO.class);
+        when(vlanDao.findById(9L)).thenReturn(vlan);
+
+        IpAddress result = ipAddressManager.allocateIpFromNsxVrfPublicRange(account, false, account, null,
+                zone, true, "192.0.2.10", 9L);
+
+        Assert.assertEquals(5L, result.getId());
+        verify(accountDao).releaseFromLockTable(account.getId());
+    }
+
+    @Test
+    public void testGenericAllocationRejectsRangeRegisteredAfterAddressLock() {
+        IPAddressVO address = mock(IPAddressVO.class);
+        when(address.getVlanId()).thenReturn(9L);
+        when(nsxVrfGatewayDao.lockByPublicVlan(9L)).thenReturn(mock(NsxVrfGatewayVO.class));
+
+        Assert.assertThrows(com.cloud.exception.InsufficientAddressCapacityException.class,
+                () -> ipAddressManager.validateSelectedPublicIpRangeRegistration(address, false, 2L));
+    }
+
+    @Test
+    public void testNsxVrfAllocationAllowsItsRegisteredRangeAfterAddressLock() throws Exception {
+        IPAddressVO address = mock(IPAddressVO.class);
+
+        ipAddressManager.validateSelectedPublicIpRangeRegistration(address, true, 2L);
+
+        verify(nsxVrfGatewayDao, never()).lockByPublicVlan(9L);
     }
 
     @Test

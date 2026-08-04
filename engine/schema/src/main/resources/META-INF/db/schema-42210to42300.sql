@@ -653,7 +653,7 @@ WHERE `name`='user.vm.readonly.details' AND `value` IS NOT NULL;
 -- CloudStack never creates or deletes the gateway in NSX, it only records and claims.
 CREATE TABLE IF NOT EXISTS `cloud`.`nsx_vrf_gateways` (
     `id` bigint unsigned NOT NULL auto_increment COMMENT 'id',
-    `uuid` varchar(40),
+    `uuid` varchar(40) NOT NULL,
     `zone_id` bigint unsigned NOT NULL COMMENT 'Zone ID',
     `nsx_tier0_name` varchar(255) NOT NULL COMMENT 'VRF Tier-0, or a dedicated Tier-0, as named in NSX',
     `edge_cluster` varchar(255) NOT NULL COMMENT 'Edge cluster this Tier-0 lives on; may differ from the zone default',
@@ -666,10 +666,124 @@ CREATE TABLE IF NOT EXISTS `cloud`.`nsx_vrf_gateways` (
     `removed` datetime COMMENT 'date removed if not null',
     PRIMARY KEY (`id`),
     CONSTRAINT `fk_nsx_vrf_gateways__zone_id` FOREIGN KEY (`zone_id`) REFERENCES `data_center`(`id`) ON DELETE CASCADE,
-    INDEX `i_nsx_vrf_gateways__zone_id`(`zone_id`),
-    INDEX `i_nsx_vrf_gateways__account_id`(`account_id`),
-    INDEX `i_nsx_vrf_gateways__domain_id`(`domain_id`)
+    CONSTRAINT `fk_nsx_vrf_gateways__account_id` FOREIGN KEY (`account_id`) REFERENCES `account`(`id`) ON DELETE RESTRICT,
+    CONSTRAINT `fk_nsx_vrf_gateways__domain_id` FOREIGN KEY (`domain_id`) REFERENCES `domain`(`id`) ON DELETE RESTRICT,
+    CONSTRAINT `fk_nsx_vrf_gateways__public_vlan_db_id` FOREIGN KEY (`public_vlan_db_id`) REFERENCES `vlan`(`id`) ON DELETE RESTRICT,
+    UNIQUE KEY `uk_nsx_vrf_gateways__uuid` (`uuid`),
+    UNIQUE KEY `uk_nsx_vrf_gateways__zone_tier0` (`zone_id`, `nsx_tier0_name`),
+    UNIQUE KEY `uk_nsx_vrf_gateways__zone_account` (`zone_id`, `account_id`),
+    UNIQUE KEY `uk_nsx_vrf_gateways__zone_domain` (`zone_id`, `domain_id`),
+    UNIQUE KEY `uk_nsx_vrf_gateways__public_vlan` (`public_vlan_db_id`),
+    INDEX `i_nsx_vrf_gateways__zone_id`(`zone_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- Normalize an existing table before applying ownership constraints; CREATE TABLE IF NOT
+-- EXISTS does not alter an earlier table definition.
+UPDATE `cloud`.`nsx_vrf_gateways` SET `uuid` = UUID() WHERE `uuid` IS NULL OR `uuid` = '';
+
+DROP PROCEDURE IF EXISTS `cloud`.`VALIDATE_NSX_VRF_GATEWAY_OWNERSHIP`;
+CREATE PROCEDURE `cloud`.`VALIDATE_NSX_VRF_GATEWAY_OWNERSHIP`()
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM `cloud`.`nsx_vrf_gateways`
+        WHERE (`scope` = 'ACCOUNT' AND (`account_id` IS NULL OR `domain_id` IS NOT NULL))
+           OR (`scope` = 'DOMAIN' AND (`domain_id` IS NULL OR `account_id` IS NOT NULL))
+           OR (`scope` IS NULL AND (`account_id` IS NOT NULL OR `domain_id` IS NOT NULL))
+           OR (`scope` IS NOT NULL AND `scope` NOT IN ('ACCOUNT', 'DOMAIN'))
+    ) THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Invalid NSX VRF ownership state'
+;   END IF
+; END;
+CALL `cloud`.`VALIDATE_NSX_VRF_GATEWAY_OWNERSHIP`();
+DROP PROCEDURE `cloud`.`VALIDATE_NSX_VRF_GATEWAY_OWNERSHIP`;
+
+ALTER TABLE `cloud`.`nsx_vrf_gateways` MODIFY COLUMN `uuid` varchar(40) NOT NULL;
+
+CALL `cloud`.`IDEMPOTENT_DROP_INDEX`('i_nsx_vrf_gateways__account_id', 'cloud.nsx_vrf_gateways');
+CALL `cloud`.`IDEMPOTENT_DROP_INDEX`('i_nsx_vrf_gateways__domain_id', 'cloud.nsx_vrf_gateways');
+CALL `cloud`.`IDEMPOTENT_CREATE_UNIQUE_INDEX`('uk_nsx_vrf_gateways__uuid', 'cloud.nsx_vrf_gateways', '(`uuid`)');
+CALL `cloud`.`IDEMPOTENT_CREATE_UNIQUE_INDEX`('uk_nsx_vrf_gateways__zone_tier0', 'cloud.nsx_vrf_gateways', '(`zone_id`, `nsx_tier0_name`)');
+CALL `cloud`.`IDEMPOTENT_CREATE_UNIQUE_INDEX`('uk_nsx_vrf_gateways__zone_account', 'cloud.nsx_vrf_gateways', '(`zone_id`, `account_id`)');
+CALL `cloud`.`IDEMPOTENT_CREATE_UNIQUE_INDEX`('uk_nsx_vrf_gateways__zone_domain', 'cloud.nsx_vrf_gateways', '(`zone_id`, `domain_id`)');
+CALL `cloud`.`IDEMPOTENT_CREATE_UNIQUE_INDEX`('uk_nsx_vrf_gateways__public_vlan', 'cloud.nsx_vrf_gateways', '(`public_vlan_db_id`)');
+
+CALL `cloud`.`IDEMPOTENT_DROP_FOREIGN_KEY`('cloud.nsx_vrf_gateways', 'fk_nsx_vrf_gateways__account_id');
+CALL `cloud`.`IDEMPOTENT_DROP_FOREIGN_KEY`('cloud.nsx_vrf_gateways', 'fk_nsx_vrf_gateways__domain_id');
+CALL `cloud`.`IDEMPOTENT_DROP_FOREIGN_KEY`('cloud.nsx_vrf_gateways', 'fk_nsx_vrf_gateways__public_vlan_db_id');
+ALTER TABLE `cloud`.`nsx_vrf_gateways`
+    ADD CONSTRAINT `fk_nsx_vrf_gateways__account_id` FOREIGN KEY (`account_id`) REFERENCES `account`(`id`) ON DELETE RESTRICT,
+    ADD CONSTRAINT `fk_nsx_vrf_gateways__domain_id` FOREIGN KEY (`domain_id`) REFERENCES `domain`(`id`) ON DELETE RESTRICT,
+    ADD CONSTRAINT `fk_nsx_vrf_gateways__public_vlan_db_id` FOREIGN KEY (`public_vlan_db_id`) REFERENCES `vlan`(`id`) ON DELETE RESTRICT;
+
+-- Durable record of the Tier-0 selected for each CloudStack-owned NSX Tier-1.
+-- Shared Tier-0 placements deliberately have gateway_id NULL: recording them prevents a
+-- later VRF assignment from silently changing the parent on an idempotent create retry.
+CREATE TABLE IF NOT EXISTS `cloud`.`nsx_vrf_gateway_placements` (
+    `id` bigint unsigned NOT NULL auto_increment COMMENT 'id',
+    `gateway_id` bigint unsigned COMMENT 'Registered VRF gateway, NULL for the zone shared Tier-0',
+    `zone_id` bigint unsigned NOT NULL COMMENT 'Zone ID',
+    `domain_id` bigint unsigned NOT NULL COMMENT 'Owning domain at placement time',
+    `account_id` bigint unsigned NOT NULL COMMENT 'Owning account at placement time',
+    `vpc_id` bigint unsigned COMMENT 'VPC whose Tier-1 was placed',
+    `network_id` bigint unsigned COMMENT 'Isolated network whose Tier-1 was placed',
+    `tier0_name` varchar(255) NOT NULL COMMENT 'Resolved Tier-0 name at placement time',
+    `state` varchar(32) NOT NULL COMMENT 'PENDING_CREATE, ACTIVE, PENDING_DELETE, or FAILED',
+    `created` datetime NOT NULL,
+    `updated` datetime NOT NULL,
+    PRIMARY KEY (`id`),
+    CONSTRAINT `fk_nsx_vrf_gateway_placements__gateway_id` FOREIGN KEY (`gateway_id`) REFERENCES `nsx_vrf_gateways`(`id`) ON DELETE RESTRICT,
+    CONSTRAINT `fk_nsx_vrf_gateway_placements__zone_id` FOREIGN KEY (`zone_id`) REFERENCES `data_center`(`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_nsx_vrf_gateway_placements__domain_id` FOREIGN KEY (`domain_id`) REFERENCES `domain`(`id`) ON DELETE RESTRICT,
+    CONSTRAINT `fk_nsx_vrf_gateway_placements__account_id` FOREIGN KEY (`account_id`) REFERENCES `account`(`id`) ON DELETE RESTRICT,
+    CONSTRAINT `fk_nsx_vrf_gateway_placements__vpc_id` FOREIGN KEY (`vpc_id`) REFERENCES `vpc`(`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_nsx_vrf_gateway_placements__network_id` FOREIGN KEY (`network_id`) REFERENCES `networks`(`id`) ON DELETE CASCADE,
+    UNIQUE KEY `uk_nsx_vrf_gateway_placements__vpc_id` (`vpc_id`),
+    UNIQUE KEY `uk_nsx_vrf_gateway_placements__network_id` (`network_id`),
+    INDEX `i_nsx_vrf_gateway_placements__gateway_id` (`gateway_id`),
+    INDEX `i_nsx_vrf_gateway_placements__zone_id` (`zone_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- Before per-tenant VRF placement existed, every CloudStack-created NSX Tier-1 used the
+-- active NSX provider's zone-wide Tier-0. Preserve that parent deterministically so a
+-- later tenant assignment cannot re-parent an existing Tier-1 on an idempotent retry.
+INSERT INTO `cloud`.`nsx_vrf_gateway_placements`
+    (`gateway_id`, `zone_id`, `domain_id`, `account_id`, `vpc_id`, `network_id`,
+     `tier0_name`, `state`, `created`, `updated`)
+SELECT NULL, v.`zone_id`, v.`domain_id`, v.`account_id`, v.`id`, NULL,
+       np.`tier0_gateway`, 'ACTIVE', v.`created`, NOW()
+FROM `cloud`.`vpc` v
+JOIN `cloud`.`nsx_providers` np
+  ON np.`zone_id` = v.`zone_id` AND np.`removed` IS NULL
+WHERE v.`removed` IS NULL
+  AND np.`tier0_gateway` IS NOT NULL
+  AND np.`tier0_gateway` <> ''
+  AND EXISTS (
+      SELECT 1
+      FROM `cloud`.`vpc_offering_service_map` vosm
+      WHERE vosm.`vpc_offering_id` = v.`vpc_offering_id`
+        AND vosm.`provider` = 'Nsx'
+        AND vosm.`service` IN ('SourceNat', 'Gateway')
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM `cloud`.`nsx_vrf_gateway_placements` p WHERE p.`vpc_id` = v.`id`
+  );
+
+INSERT INTO `cloud`.`nsx_vrf_gateway_placements`
+    (`gateway_id`, `zone_id`, `domain_id`, `account_id`, `vpc_id`, `network_id`,
+     `tier0_name`, `state`, `created`, `updated`)
+SELECT NULL, n.`data_center_id`, n.`domain_id`, n.`account_id`, NULL, n.`id`,
+       np.`tier0_gateway`, 'ACTIVE', n.`created`, NOW()
+FROM `cloud`.`networks` n
+JOIN `cloud`.`nsx_providers` np
+  ON np.`zone_id` = n.`data_center_id` AND np.`removed` IS NULL
+WHERE n.`removed` IS NULL
+  AND n.`vpc_id` IS NULL
+  AND n.`broadcast_domain_type` = 'NSX'
+  AND np.`tier0_gateway` IS NOT NULL
+  AND np.`tier0_gateway` <> ''
+  AND NOT EXISTS (
+      SELECT 1 FROM `cloud`.`nsx_vrf_gateway_placements` p WHERE p.`network_id` = n.`id`
+  );
 
 CALL `cloud`.`IDEMPOTENT_ADD_COLUMN`('cloud.kubernetes_cluster', 'network_rule_ownership_state',
     'varchar(32) NOT NULL DEFAULT ''LEGACY_UNMANAGED'' COMMENT ''CKS managed network-rule ownership migration state'' AFTER `cluster_type`');

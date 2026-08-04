@@ -67,6 +67,7 @@ import org.apache.cloudstack.api.ApiCommandResourceType;
 import org.apache.cloudstack.api.ApiConstants;
 import org.apache.cloudstack.api.ApiConstants.VMDetails;
 import org.apache.cloudstack.api.ApiErrorCode;
+import org.apache.cloudstack.api.BaseAsyncCmd;
 import org.apache.cloudstack.api.BaseCmd;
 import org.apache.cloudstack.api.ResponseObject.ResponseView;
 import org.apache.cloudstack.api.ServerApiException;
@@ -124,6 +125,8 @@ import org.apache.cloudstack.config.ApiServiceConfiguration;
 import org.apache.cloudstack.context.CallContext;
 import org.apache.cloudstack.engine.orchestration.service.NetworkOrchestrationService;
 import org.apache.cloudstack.framework.config.ConfigKey;
+import org.apache.cloudstack.framework.jobs.AsyncJobManager;
+import org.apache.cloudstack.framework.jobs.impl.AsyncJobVO;
 import org.apache.cloudstack.managed.context.ManagedContextRunnable;
 import org.apache.cloudstack.network.RoutedIpv4Manager;
 import org.apache.commons.beanutils.BeanUtils;
@@ -134,7 +137,9 @@ import org.apache.commons.lang3.ObjectUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.Level;
 
+import com.cloud.api.ApiAsyncJobDispatcher;
 import com.cloud.api.ApiDBUtils;
+import com.cloud.api.ApiGsonHelper;
 import com.cloud.api.ApiResponseHelper;
 import com.cloud.api.query.dao.NetworkOfferingJoinDao;
 import com.cloud.api.query.dao.TemplateJoinDao;
@@ -154,6 +159,7 @@ import com.cloud.dc.dao.DataCenterDao;
 import com.cloud.dc.dao.DedicatedResourceDao;
 import com.cloud.deploy.DeployDestination;
 import com.cloud.event.ActionEvent;
+import com.cloud.event.ActionEventUtils;
 import com.cloud.exception.ConcurrentOperationException;
 import com.cloud.exception.InsufficientCapacityException;
 import com.cloud.exception.InsufficientServerCapacityException;
@@ -419,6 +425,10 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
     RoleService roleService;
     @Inject
     ResourceLimitService resourceLimitService;
+    @Inject
+    AsyncJobManager asyncJobManager;
+    @Inject
+    ApiAsyncJobDispatcher apiAsyncJobDispatcher;
 
     private void logMessage(final Level logLevel, final String message, final Exception e) {
         if (logLevel == Level.WARN) {
@@ -2311,17 +2321,31 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
         if (!isCommandSupported(cluster, cmd.getActualCommandName())) {
             throw new InvalidParameterValueException(String.format("Network rule reconciliation is not supported for an externally managed cluster (%s)", cluster.getName()));
         }
-        if (!KubernetesCluster.State.Running.equals(cluster.getState())) {
+        boolean alertRecovery = KubernetesCluster.State.Recovering.equals(cluster.getState())
+                && Objects.equals(CallContext.current().getCallingUserId(), User.UID_SYSTEM);
+        if (!alertRecovery && !KubernetesCluster.State.Running.equals(cluster.getState())) {
             throw new InvalidParameterValueException(String.format("Kubernetes cluster %s must be running to reconcile its network rules", cluster.getName()));
         }
-        if (!KubernetesClusterNetworkRuleOwnershipState.MANAGED.equals(cluster.getNetworkRuleOwnershipState())) {
+        if (!alertRecovery && !KubernetesClusterNetworkRuleOwnershipState.MANAGED.equals(cluster.getNetworkRuleOwnershipState())) {
             throw new InvalidParameterValueException(String.format(
                     "Kubernetes cluster %s network-rule ownership must be adopted before reconciliation",
                     cluster.getName()));
         }
 
         KubernetesClusterStartWorker worker = createKubernetesClusterStartWorker(cluster);
-        return worker.reconcileKubernetesClusterNetworkRules();
+        if (!alertRecovery) {
+            return worker.reconcileKubernetesClusterNetworkRules();
+        }
+        try {
+            boolean recovered = worker.reconcileAlertCluster();
+            if (!recovered) {
+                stateTransitTo(cluster.getId(), KubernetesCluster.Event.OperationFailed);
+            }
+            return recovered;
+        } catch (RuntimeException e) {
+            stateTransitTo(cluster.getId(), KubernetesCluster.Event.OperationFailed);
+            throw e;
+        }
     }
 
     @Override
@@ -2356,6 +2380,42 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
 
     protected KubernetesClusterStartWorker createKubernetesClusterStartWorker(KubernetesCluster cluster) {
         return ComponentContext.inject(new KubernetesClusterStartWorker(cluster, this));
+    }
+
+    protected long scheduleAlertClusterReconciliation(KubernetesClusterVO cluster) {
+        Long networkId = cluster.getNetworkId();
+        if (networkId == null) {
+            throw new CloudRuntimeException(String.format(
+                    "Kubernetes cluster %s has no network to synchronize alert reconciliation on", cluster.getName()));
+        }
+
+        Map<String, String> params = new HashMap<>();
+        params.put(ApiConstants.ID, String.valueOf(cluster.getId()));
+        params.put("ctxUserId", String.valueOf(User.UID_SYSTEM));
+        params.put("ctxAccountId", String.valueOf(cluster.getAccountId()));
+        params.put(ApiConstants.CTX_START_EVENT_ID, String.valueOf(createAlertClusterReconciliationEvent(cluster)));
+
+        AsyncJobVO job = new AsyncJobVO("", User.UID_SYSTEM, cluster.getAccountId(),
+                ReconcileKubernetesClusterNetworkRulesCmd.class.getName(),
+                ApiGsonHelper.getBuilder().create().toJson(params), cluster.getId(),
+                ApiCommandResourceType.KubernetesCluster.toString(), null);
+        job.setDispatcher(apiAsyncJobDispatcher.getName());
+
+        // Submit directly to the lifecycle network queue. The resumed API job executes the
+        // command body and must not submit another nested reconciliation job for the same queue.
+        long jobId = asyncJobManager.submitAsyncJob(job, BaseAsyncCmd.networkSyncObject, networkId);
+        if (jobId == 0L) {
+            throw new CloudRuntimeException(String.format(
+                    "Failed to schedule alert reconciliation for Kubernetes cluster %s", cluster.getName()));
+        }
+        return jobId;
+    }
+
+    protected long createAlertClusterReconciliationEvent(KubernetesClusterVO cluster) {
+        return ActionEventUtils.onScheduledActionEvent(User.UID_SYSTEM, cluster.getAccountId(),
+                KubernetesClusterEventTypes.EVENT_KUBERNETES_CLUSTER_NETWORK_RULES_RECONCILE,
+                String.format("Reconciling alert Kubernetes cluster %s", cluster.getUuid()), cluster.getId(),
+                ApiCommandResourceType.KubernetesCluster.toString(), true, 0L);
     }
 
     /**
@@ -2542,6 +2602,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
             logAndThrow(Level.ERROR, "Kubernetes Service plugin is disabled");
         }
         KubernetesClusterVO kubernetesCluster = validateCluster(cmd.getClusterId());
+        validateAccessToClusterAndNodes(kubernetesCluster, cmd.getNodeIds());
         validateNetworkRuleOwnershipForTopologyMutation(kubernetesCluster);
         long networkId = kubernetesCluster.getNetworkId();
         NetworkVO networkVO = networkDao.findById(networkId);
@@ -2561,6 +2622,7 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
             logAndThrow(Level.ERROR, "Kubernetes Service plugin is disabled");
         }
         KubernetesClusterVO kubernetesCluster = validateCluster(cmd.getClusterId());
+        validateAccessToClusterAndNodes(kubernetesCluster, cmd.getNodeIds());
         validateNetworkRuleOwnershipForTopologyMutation(kubernetesCluster);
         List<Long> validNodeIds = validateNodes(cmd.getNodeIds(), null, null, kubernetesCluster, true);
         if (validNodeIds.isEmpty()) {
@@ -2577,6 +2639,18 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
             throw new InvalidParameterValueException("Invalid Kubernetes cluster ID specified");
         }
         return kubernetesCluster;
+    }
+
+    protected void validateAccessToClusterAndNodes(KubernetesClusterVO kubernetesCluster, List<Long> nodeIds) {
+        Account caller = CallContext.current().getCallingAccount();
+        accountManager.checkAccess(caller, SecurityChecker.AccessType.OperateEntry, false, kubernetesCluster);
+        for (Long nodeId : nodeIds) {
+            VMInstanceVO node = vmInstanceDao.findById(nodeId);
+            if (node == null) {
+                throw new InvalidParameterValueException(String.format("Invalid node ID %d specified", nodeId));
+            }
+            accountManager.checkAccess(caller, SecurityChecker.AccessType.OperateEntry, false, node);
+        }
     }
 
     protected void validateNetworkRuleOwnershipForTopologyMutation(KubernetesClusterVO kubernetesCluster) {
@@ -2977,10 +3051,19 @@ public class KubernetesClusterManagerImpl extends ManagerBase implements Kuberne
                     }
                     try {
                         if (isClusterVMsInDesiredState(kubernetesCluster, VirtualMachine.State.Running)) {
-                            KubernetesClusterStartWorker startWorker =
-                                    new KubernetesClusterStartWorker(kubernetesCluster, KubernetesClusterManagerImpl.this);
-                            startWorker = ComponentContext.inject(startWorker);
-                            startWorker.reconcileAlertCluster();
+                            if (!stateTransitTo(kubernetesCluster.getId(), KubernetesCluster.Event.RecoveryRequested)) {
+                                logger.debug("Kubernetes cluster {} is no longer eligible for alert reconciliation",
+                                        kubernetesCluster);
+                                continue;
+                            }
+                            try {
+                                long jobId = scheduleAlertClusterReconciliation(kubernetesCluster);
+                                logger.info("Scheduled Kubernetes cluster {} alert reconciliation as job {}",
+                                        kubernetesCluster, jobId);
+                            } catch (RuntimeException e) {
+                                stateTransitTo(kubernetesCluster.getId(), KubernetesCluster.Event.OperationFailed);
+                                throw e;
+                            }
                         } else if (isClusterVMsInDesiredState(kubernetesCluster, VirtualMachine.State.Stopped)) {
                             stateTransitTo(kubernetesCluster.getId(), KubernetesCluster.Event.StopRequested);
                             stateTransitTo(kubernetesCluster.getId(), KubernetesCluster.Event.OperationSucceeded);

@@ -24,6 +24,7 @@ import org.apache.cloudstack.api.BaseCmd;
 import org.apache.cloudstack.api.Parameter;
 import org.apache.cloudstack.api.ServerApiException;
 import org.apache.cloudstack.api.response.NsxVrfGatewayResponse;
+import org.apache.cloudstack.acl.RoleType;
 import org.apache.cloudstack.context.CallContext;
 import org.apache.cloudstack.service.NsxProviderService;
 
@@ -34,7 +35,7 @@ import org.apache.cloudstack.service.NsxProviderService;
  */
 @APICommand(name = ReleaseNsxVrfGatewayCmd.APINAME, description = "Releases an NSX VRF gateway from its account or domain, returning it to the pool",
         responseObject = NsxVrfGatewayResponse.class, requestHasSensitiveInfo = false,
-        responseHasSensitiveInfo = false, since = "4.23.0")
+        responseHasSensitiveInfo = false, since = "4.23.0", authorized = {RoleType.Admin})
 public class ReleaseNsxVrfGatewayCmd extends BaseCmd {
     public static final String APINAME = "releaseNsxVrfGateway";
 

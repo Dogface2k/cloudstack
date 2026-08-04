@@ -581,6 +581,9 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
             String networkResourceName = Objects.nonNull(vpc) ? vpc.getName() : network.getName();
             boolean isVpcResource = Objects.nonNull(vpc);
             if (!staticNat.isForRevoke()) {
+                validatePublicIpVlan(ipAddressVO, config.getDataCenterId(), config.getAccountId(),
+                        config.getDomainId(), isVpcResource ? networkResourceId : null,
+                        isVpcResource ? null : networkResourceId);
                 return nsxService.createStaticNatRule(config.getDataCenterId(), config.getDomainId(), config.getAccountId(),
                         networkResourceId, networkResourceName, isVpcResource, vm.getId(),
                         ipAddressVO.getAddress().addr(), staticNat.getDestIpAddress());
@@ -627,6 +630,9 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
 
                 FirewallRuleDetailVO ruleDetail = firewallRuleDetailsDao.findDetail(rule.getId(), ApiConstants.FOR_NSX);
                 if (Arrays.asList(FirewallRule.State.Add, FirewallRule.State.Active).contains(rule.getState())) {
+                    validatePublicIpVlan(publicIp, nsxObject.getZoneId(), nsxObject.getAccountId(),
+                            nsxObject.getDomainId(), nsxObject.isVpcResource() ? nsxObject.getNetworkResourceId() : null,
+                            nsxObject.isVpcResource() ? null : nsxObject.getNetworkResourceId());
                     if ((ruleDetail == null && FirewallRule.State.Add == rule.getState()) || (ruleDetail != null && !ruleDetail.getValue().equalsIgnoreCase("true"))) {
                         logger.debug("Creating port forwarding rule on NSX for VM {} to ports {} - {}",
                                 vm, rule.getDestinationPortStart(), rule.getDestinationPortEnd());
@@ -744,12 +750,25 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
             networkRule.setBaseRule(baseNetRule);
             networkRule.setMemberList(lbMembers);
             if (Arrays.asList(FirewallRule.State.Add, FirewallRule.State.Active).contains(loadBalancingRule.getState())) {
+                if (LoadBalancerContainer.Scheme.Public == loadBalancingRule.getScheme()) {
+                    validatePublicIpVlan(publicIp, nsxObject.getZoneId(), nsxObject.getAccountId(),
+                            nsxObject.getDomainId(), nsxObject.isVpcResource() ? nsxObject.getNetworkResourceId() : null,
+                            nsxObject.isVpcResource() ? null : nsxObject.getNetworkResourceId());
+                }
                 result &= nsxService.createLbRule(networkRule);
             } else if (loadBalancingRule.getState() == FirewallRule.State.Revoke) {
                 result &= nsxService.deleteLbRule(networkRule);
             }
         }
         return result;
+    }
+
+    private void validatePublicIpVlan(IPAddressVO publicIp, long zoneId, long accountId, long domainId,
+            Long vpcId, Long networkId) {
+        if (publicIp == null) {
+            throw new CloudRuntimeException("The public IP address could not be found");
+        }
+        nsxService.validatePublicIpVlan(zoneId, accountId, domainId, vpcId, networkId, publicIp.getVlanId());
     }
 
     @Override
@@ -1077,6 +1096,8 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
             throw new InvalidParameterValueException(String.format(
                     "The requested IP %s cannot be used as the VPN gateway IP as it is already in use by static NAT or network rules", ip.getAddress().addr()));
         }
+        nsxService.validatePublicIpVlan(vpc.getZoneId(), vpc.getAccountId(), vpc.getDomainId(),
+                vpc.getId(), null, ip.getVlanId());
         return ip;
     }
 
@@ -1085,9 +1106,16 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
         DataCenterVO zone = dataCenterDao.findById(vpc.getZoneId());
         IpAddress allocatedIp = null;
         try {
-            allocatedIp = ipAddressManager.allocateIp(owner, false, CallContext.current().getCallingAccount(),
-                    CallContext.current().getCallingUser(), zone, null, null);
-            vpcService.associateIPToVpc(allocatedIp.getId(), vpc.getId());
+            Long publicVlanId = nsxService.getPublicVlanId(vpc.getZoneId(), vpc.getAccountId(),
+                    vpc.getDomainId(), vpc.getId(), null);
+            if (publicVlanId == null) {
+                allocatedIp = ipAddressManager.allocateIp(owner, false, CallContext.current().getCallingAccount(),
+                        CallContext.current().getCallingUser(), zone, null, null);
+                vpcService.associateIPToVpc(allocatedIp.getId(), vpc.getId());
+            } else {
+                allocatedIp = ipAddressManager.assignDedicateIpAddressFromNsxVrfPublicRange(owner, null,
+                        vpc.getId(), zone.getId(), false, publicVlanId);
+            }
             userIpAddressDetailsDao.addDetail(allocatedIp.getId(), NSX_VPN_GATEWAY_IP_DETAIL, "true", false);
             IPAddressVO ip = ipAddressDao.findById(allocatedIp.getId());
             if (ip == null) {
@@ -1099,6 +1127,8 @@ public class NsxElement extends AdapterBase implements  DhcpServiceProvider, Dns
                         "The allocated IP %s became a source NAT IP when it was associated to VPC %s; it cannot be used as a dedicated VPN endpoint",
                         ip.getAddress(), vpc.getName()));
             }
+            nsxService.validatePublicIpVlan(vpc.getZoneId(), vpc.getAccountId(), vpc.getDomainId(),
+                    vpc.getId(), null, ip.getVlanId());
             return ip;
         } catch (Exception e) {
             // do not leak the IP when associating or tagging it fails after allocation succeeded

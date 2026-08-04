@@ -35,6 +35,8 @@ public interface VpcDao extends GenericDao<VpcVO, Long> {
 
     List<? extends Vpc> listByAccountId(long accountId);
 
+    List<VpcVO> listByZone(long zoneId);
+
     List<VpcVO> listInactiveVpcs();
 
     long countByAccountId(long accountId);

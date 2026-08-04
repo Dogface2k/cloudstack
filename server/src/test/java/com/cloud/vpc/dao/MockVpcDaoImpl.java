@@ -60,6 +60,11 @@ public class MockVpcDaoImpl extends GenericDaoBase<VpcVO, Long> implements VpcDa
         return null;
     }
 
+    @Override
+    public List<VpcVO> listByZone(long zoneId) {
+        return null;
+    }
+
     /* (non-Javadoc)
      * @see com.cloud.network.vpc.Dao.VpcDao#listInactiveVpcs()
      */

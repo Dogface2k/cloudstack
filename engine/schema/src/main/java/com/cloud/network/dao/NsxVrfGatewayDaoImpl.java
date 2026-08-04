@@ -40,12 +40,15 @@ public class NsxVrfGatewayDaoImpl extends GenericDaoBase<NsxVrfGatewayVO, Long> 
         allFieldsSearch.and("uuid", allFieldsSearch.entity().getUuid(), SearchCriteria.Op.EQ);
         allFieldsSearch.and("zone_id", allFieldsSearch.entity().getZoneId(), SearchCriteria.Op.EQ);
         allFieldsSearch.and("nsx_tier0_name", allFieldsSearch.entity().getNsxTier0Name(), SearchCriteria.Op.EQ);
+        allFieldsSearch.and("scope", allFieldsSearch.entity().getScope(), SearchCriteria.Op.EQ);
         allFieldsSearch.and("account_id", allFieldsSearch.entity().getAccountId(), SearchCriteria.Op.EQ);
         allFieldsSearch.and("domain_id", allFieldsSearch.entity().getDomainId(), SearchCriteria.Op.EQ);
+        allFieldsSearch.and("public_vlan_db_id", allFieldsSearch.entity().getPublicVlanDbId(), SearchCriteria.Op.EQ);
         allFieldsSearch.done();
 
         unclaimedSearch = createSearchBuilder();
         unclaimedSearch.and("zone_id", unclaimedSearch.entity().getZoneId(), SearchCriteria.Op.EQ);
+        unclaimedSearch.and("scope", unclaimedSearch.entity().getScope(), SearchCriteria.Op.NULL);
         unclaimedSearch.and("account_id", unclaimedSearch.entity().getAccountId(), SearchCriteria.Op.NULL);
         unclaimedSearch.and("domain_id", unclaimedSearch.entity().getDomainId(), SearchCriteria.Op.NULL);
         unclaimedSearch.done();
@@ -67,9 +70,24 @@ public class NsxVrfGatewayDaoImpl extends GenericDaoBase<NsxVrfGatewayVO, Long> 
     }
 
     @Override
+    public NsxVrfGatewayVO findByPublicVlan(long publicVlanDbId) {
+        SearchCriteria<NsxVrfGatewayVO> sc = allFieldsSearch.create();
+        sc.setParameters("public_vlan_db_id", publicVlanDbId);
+        return findOneBy(sc);
+    }
+
+    @Override
+    public NsxVrfGatewayVO lockByPublicVlan(long publicVlanDbId) {
+        SearchCriteria<NsxVrfGatewayVO> sc = allFieldsSearch.create();
+        sc.setParameters("public_vlan_db_id", publicVlanDbId);
+        return lockOneRandomRow(sc, true);
+    }
+
+    @Override
     public NsxVrfGatewayVO findByAccount(long zoneId, long accountId) {
         SearchCriteria<NsxVrfGatewayVO> sc = allFieldsSearch.create();
         sc.setParameters("zone_id", zoneId);
+        sc.setParameters("scope", NsxVrfGatewayVO.Scope.ACCOUNT.name());
         sc.setParameters("account_id", accountId);
         return findOneBy(sc);
     }
@@ -78,6 +96,7 @@ public class NsxVrfGatewayDaoImpl extends GenericDaoBase<NsxVrfGatewayVO, Long> 
     public NsxVrfGatewayVO findByDomain(long zoneId, long domainId) {
         SearchCriteria<NsxVrfGatewayVO> sc = allFieldsSearch.create();
         sc.setParameters("zone_id", zoneId);
+        sc.setParameters("scope", NsxVrfGatewayVO.Scope.DOMAIN.name());
         sc.setParameters("domain_id", domainId);
         return findOneBy(sc);
     }

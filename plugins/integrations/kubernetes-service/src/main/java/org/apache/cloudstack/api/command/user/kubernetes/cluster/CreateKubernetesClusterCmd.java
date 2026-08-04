@@ -44,6 +44,7 @@ import org.apache.cloudstack.api.APICommand;
 import org.apache.cloudstack.api.ApiCommandResourceType;
 import org.apache.cloudstack.api.ApiConstants;
 import org.apache.cloudstack.api.ApiErrorCode;
+import org.apache.cloudstack.api.BaseAsyncCmd;
 import org.apache.cloudstack.api.BaseAsyncCreateCmd;
 import org.apache.cloudstack.api.Parameter;
 import org.apache.cloudstack.api.ResponseObject.ResponseView;
@@ -430,6 +431,17 @@ public class CreateKubernetesClusterCmd extends BaseAsyncCreateCmd {
     @Override
     public ApiCommandResourceType getApiResourceType() {
         return ApiCommandResourceType.KubernetesCluster;
+    }
+
+    @Override
+    public String getSyncObjType() {
+        return BaseAsyncCmd.networkSyncObject;
+    }
+
+    @Override
+    public Long getSyncObjId() {
+        KubernetesCluster cluster = getEntityId() == null ? null : kubernetesClusterService.findById(getEntityId());
+        return cluster == null ? getNetworkId() : cluster.getNetworkId();
     }
 
     @Override
