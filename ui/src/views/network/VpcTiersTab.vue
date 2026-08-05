@@ -315,43 +315,43 @@
       :closable="true"
       :footer="null"
       :destroyOnClose="true"
-      @cancel="showReplaceAclModal = false">
-      <a-spin :spinning="modalLoading" v-ctrl-enter="handleReplaceAclSubmit">
+      @cancel="handleCloseReplaceAclModal">
+      <a-spin :spinning="replaceAclLoading || replaceAclFetchLoading" v-ctrl-enter="handleReplaceAclSubmit">
         <a-form
           layout="vertical"
-          :ref="formRef"
-          :model="form"
-          :rules="rules"
+          :ref="replaceAclFormRef"
+          :model="replaceAclForm"
+          :rules="replaceAclRules"
           @finish="handleReplaceAclSubmit"
          >
           <p>{{ $t('message.confirm.replace.acl.new.one') }}</p>
-          <a-form-item ref="acl" name="acl" :colon="false">
+          <a-form-item ref="replaceAcl" name="acl" :colon="false">
             <template #label>
               <tooltip-label :title="$t('label.aclid')" :tooltip="$t('label.create.tier.aclid.description')"/>
             </template>
             <a-select
               :placeholder="$t('label.create.tier.aclid.description')"
-              v-model:value="form.acl"
+              v-model:value="replaceAclForm.acl"
               v-focus="true"
-              @change="val => { handleNetworkAclChange(val) }"
+              @change="val => { handleReplaceAclChange(val) }"
               showSearch
               optionFilterProp="label"
               :filterOption="(input, option) => {
                 return option.label.toLowerCase().indexOf(input.toLowerCase()) >= 0
               }" >
-              <a-select-option v-for="item in networkAclList" :key="item.id" :value="item.id" :label="`${item.name}(${item.description})`">
+              <a-select-option v-for="item in replaceAclList" :key="item.id" :value="item.id" :label="`${item.name}(${item.description})`">
                 <strong>{{ item.name }}</strong> ({{ item.description }})
               </a-select-option>
             </a-select>
           </a-form-item>
-          <a-alert v-if="selectedNetworkAcl.name==='default_allow'" type="warning" show-icon>
+          <a-alert v-if="replaceAclSelected.name==='default_allow'" type="warning" show-icon>
             <template #message><div v-html="$t('message.network.acl.default.allow')"/></template>
           </a-alert>
-          <a-alert v-else-if="selectedNetworkAcl.name==='default_deny'" type="warning" show-icon>
+          <a-alert v-else-if="replaceAclSelected.name==='default_deny'" type="warning" show-icon>
             <template #message><div v-html="$t('message.network.acl.default.deny')"/></template>
           </a-alert>
           <div :span="24" class="action-button">
-            <a-button @click="showReplaceAclModal = false">{{ $t('label.cancel') }}</a-button>
+            <a-button @click="handleCloseReplaceAclModal">{{ $t('label.cancel') }}</a-button>
             <a-button type="primary" ref="submit" @click="handleReplaceAclSubmit">{{ $t('label.ok') }}</a-button>
           </div>
         </a-form>
@@ -458,6 +458,15 @@ export default {
       networkOfferings: [],
       networkAclList: [],
       selectedNetworkAcl: {},
+      replaceAclFormRef: null,
+      replaceAclForm: {},
+      replaceAclRules: {},
+      replaceAclList: [],
+      replaceAclSelected: {},
+      replaceAclNetworkId: '',
+      replaceAclLoading: false,
+      replaceAclFetchLoading: false,
+      replaceAclInteractionGeneration: 0,
       modalLoading: false,
       internalLB: {},
       LBPublicIPs: {},
@@ -619,6 +628,25 @@ export default {
         this.modalLoading = false
       })
     },
+    fetchReplaceAclList (interactionGeneration, selectedAclId) {
+      this.replaceAclFetchLoading = true
+      return getAPI('listNetworkACLLists', { vpcid: this.resource.id }).then(json => {
+        if (interactionGeneration !== this.replaceAclInteractionGeneration) {
+          return
+        }
+        this.replaceAclList = json.listnetworkacllistsresponse.networkacllist || []
+        this.replaceAclForm.acl = selectedAclId
+        this.handleReplaceAclChange(selectedAclId)
+      }).catch(error => {
+        if (interactionGeneration === this.replaceAclInteractionGeneration) {
+          this.$notifyError(error)
+        }
+      }).finally(() => {
+        if (interactionGeneration === this.replaceAclInteractionGeneration) {
+          this.replaceAclFetchLoading = false
+        }
+      })
+    },
     getNetworkOffering (networkId) {
       return new Promise((resolve, reject) => {
         getAPI('listNetworkOfferings', {
@@ -760,6 +788,13 @@ export default {
         this.selectedNetworkAcl = {}
       }
     },
+    handleReplaceAclChange (aclId) {
+      if (aclId) {
+        this.replaceAclSelected = this.replaceAclList.filter(acl => acl.id === aclId)[0] || {}
+      } else {
+        this.replaceAclSelected = {}
+      }
+    },
     closeModal () {
       this.$emit('close-action')
     },
@@ -785,32 +820,52 @@ export default {
       }
     },
     handleOpenReplaceAclModal (network) {
-      this.initForm()
-      this.networkid = network.id
-      this.fetchNetworkAclList(network.aclid)
-      this.showReplaceAclModal = true
-      this.rules = {
+      const interactionGeneration = ++this.replaceAclInteractionGeneration
+      this.replaceAclFormRef = ref()
+      this.replaceAclForm = reactive({ acl: network.aclid })
+      this.replaceAclRules = reactive({
         acl: [{ required: true, message: this.$t('label.required') }]
-      }
+      })
+      this.replaceAclList = []
+      this.replaceAclSelected = {}
+      this.replaceAclNetworkId = network.id
+      this.replaceAclLoading = false
+      this.replaceAclFetchLoading = false
+      this.showReplaceAclModal = true
+      return this.fetchReplaceAclList(interactionGeneration, network.aclid)
+    },
+    handleCloseReplaceAclModal () {
+      this.showReplaceAclModal = false
+      this.replaceAclInteractionGeneration += 1
+      this.replaceAclList = []
+      this.replaceAclSelected = {}
+      this.replaceAclNetworkId = ''
+      this.replaceAclLoading = false
+      this.replaceAclFetchLoading = false
     },
     handleReplaceAclSubmit () {
-      if (this.modalLoading) return
+      if (this.replaceAclLoading || this.replaceAclFetchLoading) return
 
-      this.formRef.value.validate().then(() => {
-        const values = this.handleRemoveFields(toRaw(this.form))
+      const interactionGeneration = this.replaceAclInteractionGeneration
+      const networkId = this.replaceAclNetworkId
+      const aclId = this.replaceAclForm.acl
+      const formRef = this.replaceAclFormRef
+      this.replaceAclLoading = true
 
-        this.fetchLoading = true
-        this.modalLoading = true
+      return formRef.value.validate().then(() => {
+        if (interactionGeneration !== this.replaceAclInteractionGeneration) {
+          return
+        }
         this.showReplaceAclModal = false
 
-        postAPI('replaceNetworkACLList', {
-          aclid: values.acl,
-          networkid: this.networkid
+        return postAPI('replaceNetworkACLList', {
+          aclid: aclId,
+          networkid: networkId
         }).then(response => {
           this.$pollJob({
             jobId: response.replacenetworkacllistresponse.jobid,
             title: this.$t('label.replace.acl'),
-            description: this.networkid,
+            description: networkId,
             successMessage: this.$t('message.replace.acl.success'),
             successMethod: () => {
               this.parentFetchData()
@@ -822,11 +877,18 @@ export default {
         }).catch(error => {
           this.$notifyError(error)
         }).finally(() => {
-          this.fetchLoading = false
-          this.modalLoading = false
+          if (interactionGeneration === this.replaceAclInteractionGeneration) {
+            this.replaceAclLoading = false
+          }
         })
       }).catch((error) => {
-        this.formRef.value.scrollToField(error.errorFields[0].name)
+        if (interactionGeneration !== this.replaceAclInteractionGeneration) {
+          return
+        }
+        this.replaceAclLoading = false
+        if (error?.errorFields?.length > 0) {
+          formRef.value.scrollToField(error.errorFields[0].name)
+        }
       })
     },
     handleAddInternalLB (id) {
