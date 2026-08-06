@@ -63,6 +63,7 @@ import com.cloud.offerings.dao.NetworkOfferingDao;
 import com.cloud.offerings.dao.NetworkOfferingServiceMapDao;
 import com.cloud.utils.Pair;
 import com.cloud.utils.net.Ip;
+import com.cloud.utils.net.NetUtils;
 import com.cloud.vm.Nic;
 import com.cloud.vm.NicProfile;
 import com.cloud.vm.VirtualMachine;
@@ -184,6 +185,41 @@ public class NetworkModelImplTest {
     @Test
     public void testGetNetworkIp6Dns() {
         testDnsCases(true);
+    }
+
+    @Test
+    public void testGetValidNetworkCidrPrefersNetworkCidr() {
+        Network network = mock(Network.class);
+        when(network.getNetworkCidr()).thenReturn("10.10.0.0/16");
+
+        Assert.assertEquals("10.10.0.0/16", networkModel.getValidNetworkCidr(network));
+        Mockito.verify(network, Mockito.never()).getCidr();
+    }
+
+    @Test
+    public void testGetValidNetworkCidrReturnsFirstCidrFromSharedNetworkRanges() {
+        Network network = mock(Network.class);
+        when(network.getCidr()).thenReturn("172.30.10.0/24,172.30.11.0/25");
+
+        String cidr = networkModel.getValidNetworkCidr(network);
+
+        Assert.assertEquals("172.30.10.0/24", cidr);
+        Assert.assertEquals("255.255.255.0", NetUtils.getCidrNetmask(cidr));
+    }
+
+    @Test
+    public void testGetValidNetworkCidrReturnsSingleCidr() {
+        Network network = mock(Network.class);
+        when(network.getCidr()).thenReturn("172.30.10.0/24");
+
+        Assert.assertEquals("172.30.10.0/24", networkModel.getValidNetworkCidr(network));
+    }
+
+    @Test
+    public void testGetValidNetworkCidrReturnsNullWhenNoCidrExists() {
+        Network network = mock(Network.class);
+
+        assertNull(networkModel.getValidNetworkCidr(network));
     }
 
     @Test(expected = InvalidParameterValueException.class)
