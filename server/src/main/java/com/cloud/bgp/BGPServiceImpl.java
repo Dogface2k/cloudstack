@@ -119,7 +119,8 @@ public class BGPServiceImpl implements BGPService {
             throw new InvalidParameterException(msg);
         }
         if (!routedIpv4Manager.isRoutedNetworkVpcEnabled(zoneId)) {
-            throw new InvalidParameterValueException("Cannot create ASN range as Routed networks and VPCs are not enabled for the zone.");
+            throw new InvalidParameterValueException(String.format("Cannot create ASN range because routed networks and VPCs are disabled in zone ID %s by configuration '%s'.",
+                    zoneId, RoutedIpv4Manager.RoutedNetworkVpcEnabled.key()));
         }
         if (startASNumber > endASNumber) {
             String msg = "Please specify a valid AS Number range";

@@ -18,6 +18,9 @@
 
 package com.cloud.bgp;
 
+import com.cloud.dc.DataCenterVO;
+import com.cloud.dc.dao.DataCenterDao;
+import com.cloud.exception.InvalidParameterValueException;
 import com.cloud.exception.ResourceUnavailableException;
 import com.cloud.network.Network;
 import com.cloud.network.NetworkModel;
@@ -62,6 +65,9 @@ public class BGPServiceImplTest {
     RoutedIpv4Manager routedIpv4Manager;
 
     @Mock
+    DataCenterDao dataCenterDao;
+
+    @Mock
     NetworkServiceMapDao ntwkSrvcDao;
 
     @Mock
@@ -75,6 +81,22 @@ public class BGPServiceImplTest {
 
     @Mock
     VpcServiceMapDao vpcServiceMapDao;
+
+    @Test
+    public void testCreateASNumberRangeWhenRoutedModeDisabled() {
+        long zoneId = 1L;
+        DataCenterVO zone = Mockito.mock(DataCenterVO.class);
+        when(dataCenterDao.findById(zoneId)).thenReturn(zone);
+        when(routedIpv4Manager.isRoutedNetworkVpcEnabled(zoneId)).thenReturn(false);
+
+        try {
+            bGPServiceImplSpy.createASNumberRange(zoneId, 64512L, 64513L);
+            Assert.fail("Creating an ASN range should fail when routed mode is disabled for the zone.");
+        } catch (InvalidParameterValueException ex) {
+            Assert.assertEquals(String.format("Cannot create ASN range because routed networks and VPCs are disabled in zone ID %s by configuration '%s'.",
+                    zoneId, RoutedIpv4Manager.RoutedNetworkVpcEnabled.key()), ex.getMessage());
+        }
+    }
 
     @Test
     public void testASNumbersOverlap() {
