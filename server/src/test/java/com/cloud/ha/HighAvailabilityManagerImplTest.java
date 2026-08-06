@@ -271,6 +271,34 @@ public class HighAvailabilityManagerImplTest {
     }
 
     @Test
+    public void scheduleRestartVMInErrorState() {
+        VMInstanceVO vm = Mockito.mock(VMInstanceVO.class);
+        Mockito.when(vm.getState()).thenReturn(VirtualMachine.State.Error);
+
+        highAvailabilityManager.scheduleRestart(vm, true);
+
+        Mockito.verifyNoInteractions(_haDao, _itMgr, _alertMgr);
+    }
+
+    @Test
+    public void restartVMInErrorState() {
+        long vmId = 1L;
+        long workId = 2L;
+        VMInstanceVO vm = Mockito.mock(VMInstanceVO.class);
+
+        Mockito.when(mockWork.getInstanceId()).thenReturn(vmId);
+        Mockito.when(mockWork.getId()).thenReturn(workId);
+        Mockito.when(_haDao.listFutureHaWorkForVm(vmId, workId)).thenReturn(new ArrayList<HaWorkVO>());
+        Mockito.when(_haDao.listRunningHaWorkForVm(vmId)).thenReturn(new ArrayList<HaWorkVO>());
+        Mockito.when(_itMgr.findById(vmId)).thenReturn(vm);
+        Mockito.when(vm.getState()).thenReturn(VirtualMachine.State.Error);
+
+        assertNull(highAvailabilityManager.restart(mockWork));
+
+        Mockito.verify(_hostDao, Mockito.never()).findById(Mockito.anyLong());
+    }
+
+    @Test
     public void scheduleStop() {
         VMInstanceVO vm = Mockito.mock(VMInstanceVO.class);
         Mockito.when(vm.getId()).thenReturn(1L);
