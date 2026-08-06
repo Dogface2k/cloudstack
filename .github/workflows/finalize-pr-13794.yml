@@ -1,0 +1,68 @@
+name: Finalize PR 13794
+
+on:
+  push:
+    branches:
+      - automation/pr13794-finalize
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: draft/ui-vpc-tier-acl
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 16
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Apply and verify the final follow-up
+        env:
+          PATCH_GZIP_BASE64: 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
+          EXPECTED_PARENT: abdded0988b85c853da69b1d9db41a8ef490b99b
+          EXPECTED_COMPONENT_BLOB: d6b4f0c29b9d573623ab36a1a69df0090bddfda4
+          EXPECTED_TEST_BLOB: 56073fa32e8798947d3d6408a280458f40cdaf97
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_PARENT"
+          printf '%s' "$PATCH_GZIP_BASE64" | base64 --decode | gzip --decompress > /tmp/pr13794-final.patch
+          git apply --check /tmp/pr13794-final.patch
+          git apply --index /tmp/pr13794-final.patch
+          git diff --cached --check
+          test "$(git diff --cached --name-only)" = $'ui/src/views/network/VpcTiersTab.vue\nui/tests/unit/views/network/VpcTiersTab.spec.js'
+          test "$(git hash-object ui/src/views/network/VpcTiersTab.vue)" = "$EXPECTED_COMPONENT_BLOB"
+          test "$(git hash-object ui/tests/unit/views/network/VpcTiersTab.spec.js)" = "$EXPECTED_TEST_BLOB"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          source = Path('ui/src/views/network/VpcTiersTab.vue').read_text()
+          script = source.split('<script>', 1)[1].split('</script>', 1)[0]
+          Path('/tmp/VpcTiersTab.mjs').write_text(script)
+          PYCODE
+          node --check /tmp/VpcTiersTab.mjs
+          node --check ui/tests/unit/views/network/VpcTiersTab.spec.js
+          cd ui
+          npm install
+          npx eslint src/views/network/VpcTiersTab.vue tests/unit/views/network/VpcTiersTab.spec.js
+          npm run test:unit -- --runTestsByPath tests/unit/views/network/VpcTiersTab.spec.js --runInBand
+          cd ..
+          git config user.name Dogface2k
+          git config user.email 100990646+Dogface2k@users.noreply.github.com
+          git commit -m 'UI: preserve VPC tier ACL replacement lifecycle'
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          git push origin HEAD:refs/heads/draft/ui-vpc-tier-acl
+
+      - name: Remove the temporary helper branch
+        if: always()
+        shell: bash
+        run: |
+          git push origin --delete automation/pr13794-finalize || true
