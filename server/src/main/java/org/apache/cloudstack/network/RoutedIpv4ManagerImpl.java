@@ -168,9 +168,6 @@ public class RoutedIpv4ManagerImpl extends ComponentLifecycleBase implements Rou
     @Override
     public List<Class<?>> getCommands() {
         final List<Class<?>> cmdList = new ArrayList<Class<?>>();
-        if (!RoutedNetworkVpcEnabled.value()) {
-            return cmdList;
-        }
         cmdList.add(CreateIpv4SubnetForZoneCmd.class);
         cmdList.add(DeleteIpv4SubnetForZoneCmd.class);
         cmdList.add(ListIpv4SubnetsForZoneCmd.class);
@@ -1667,7 +1664,8 @@ public class RoutedIpv4ManagerImpl extends ComponentLifecycleBase implements Rou
 
     private void checkIfRoutedNetworkVpcEnabled(long zoneId) {
         if (!isRoutedNetworkVpcEnabled(zoneId)) {
-            throw new InvalidParameterValueException("Routed networks and VPCs are not enabled for the zone.");
+            throw new InvalidParameterValueException(String.format("Routed networks and VPCs are disabled in zone ID %s by configuration '%s'.",
+                    zoneId, RoutedNetworkVpcEnabled.key()));
         }
     }
 }

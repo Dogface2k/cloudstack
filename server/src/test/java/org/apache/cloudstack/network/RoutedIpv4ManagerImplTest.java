@@ -245,11 +245,14 @@ public class RoutedIpv4ManagerImplTest {
 
     @Test
     public void testGetCommands() throws NoSuchFieldException, IllegalAccessException {
-        Assert.assertTrue(CollectionUtils.isNotEmpty(routedIpv4Manager.getCommands()));
-        Assert.assertEquals(26, routedIpv4Manager.getCommands().size());
-
-        overrideDefaultConfigValue(RoutedIpv4Manager.RoutedNetworkVpcEnabled, "_defaultValue", "false");
-        Assert.assertTrue(CollectionUtils.isEmpty(routedIpv4Manager.getCommands()));
+        final String originalDefaultValue = RoutedIpv4Manager.RoutedNetworkVpcEnabled.defaultValue();
+        try {
+            overrideDefaultConfigValue(RoutedIpv4Manager.RoutedNetworkVpcEnabled, "_defaultValue", "false");
+            Assert.assertTrue(CollectionUtils.isNotEmpty(routedIpv4Manager.getCommands()));
+            Assert.assertEquals(26, routedIpv4Manager.getCommands().size());
+        } finally {
+            overrideDefaultConfigValue(RoutedIpv4Manager.RoutedNetworkVpcEnabled, "_defaultValue", originalDefaultValue);
+        }
     }
 
     private static void overrideDefaultConfigValue(final ConfigKey configKey, final String name, final Object o) throws IllegalAccessException, NoSuchFieldException {

@@ -60,7 +60,7 @@ public interface RoutedIpv4Manager extends PluggableService, Configurable {
     ConfigKey<Boolean> RoutedNetworkVpcEnabled = new ConfigKey<>(ConfigKey.CATEGORY_NETWORK, Boolean.class,
             "routed.network.vpc.enabled",
             "true",
-            "If true, the Routed network and VPC are enabled in the zone.",
+            "Controls provisioning of routed networks and VPCs and their supporting IPv4 subnet, BGP peer and ASN range resources in the zone.",
             true,
             ConfigKey.Scope.Zone);
 
