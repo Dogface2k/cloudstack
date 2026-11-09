@@ -42,6 +42,7 @@ import org.apache.cloudstack.agent.api.DeleteNsxSegmentCommand;
 import org.apache.cloudstack.agent.api.DeleteNsxTier1GatewayCommand;
 import org.apache.cloudstack.resourcedetail.UserIpAddressDetailVO;
 import org.apache.cloudstack.resourcedetail.dao.UserIpAddressDetailsDao;
+import org.apache.cloudstack.resource.NsxResource;
 import org.apache.cloudstack.utils.NsxControllerUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -58,7 +59,6 @@ import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -138,6 +138,33 @@ public class NsxServiceImplTest {
 
         assertFalse(result.isSuccessful());
         assertTrue(result.isEndpointMayBeInUse());
+    }
+
+    @Test
+    public void testCreateVpnGatewayPropagatesReconciliationPreflightOwnership() {
+        Vpc vpc = mock(Vpc.class);
+        when(vpc.getDomainId()).thenReturn(domainId);
+        when(vpc.getAccountId()).thenReturn(accountId);
+        when(vpc.getZoneId()).thenReturn(zoneId);
+        when(vpc.getId()).thenReturn(3L);
+        NsxApiClient apiClient = mock(NsxApiClient.class);
+        when(apiClient.isVpnServicePresent("D1-A2-Z1-V3"))
+                .thenThrow(new CloudRuntimeException("NSX unavailable"));
+        NsxResource resource = new NsxResource() {
+            {
+                nsxApiClient = apiClient;
+            }
+        };
+        when(nsxControllerUtils.sendNsxCommandForResult(any(CreateNsxVpnGatewayCommand.class), eq(zoneId)))
+                .thenAnswer(invocation -> resource.executeRequest(invocation.getArgument(0)));
+
+        NsxVpnGatewayResult retained = nsxService.createVpnGateway(vpc, "203.0.113.20", true);
+        NsxVpnGatewayResult fresh = nsxService.createVpnGateway(vpc, "203.0.113.21", false);
+
+        assertFalse(retained.isSuccessful());
+        assertTrue(retained.isEndpointMayBeInUse());
+        assertFalse(fresh.isSuccessful());
+        assertFalse(fresh.isEndpointMayBeInUse());
     }
 
     @Test
@@ -221,151 +248,88 @@ public class NsxServiceImplTest {
 
     @Test
     public void testPollVpnConnectionStatusTransitionsUp() {
-        Site2SiteVpnConnectionVO connection = mock(Site2SiteVpnConnectionVO.class);
+        Site2SiteVpnConnectionVO connection = preparePollingConnection(Site2SiteVpnConnection.State.Connecting);
         VpcVO vpc = mock(VpcVO.class);
-        AtomicReference<Site2SiteVpnConnection.State> transitionedState = new AtomicReference<>();
-
-        NsxServiceImpl service = new NsxServiceImpl() {
-            @Override
-            public String getVpnConnectionStatus(Vpc vpc, long connectionId) {
-                return "UP";
-            }
-
-            @Override
-            protected void transitionVpnConnectionState(Site2SiteVpnConnectionVO connection, VpcVO vpc,
-                                                        Site2SiteVpnConnection.State observedState,
-                                                        Site2SiteVpnConnection.State newState) {
-                transitionedState.set(newState);
-            }
-        };
+        NsxServiceImpl service = Mockito.spy(nsxService);
+        Mockito.doReturn("UP").when(service).getVpnConnectionStatus(vpc, connection.getId());
 
         service.pollVpnConnectionStatus(connection, vpc);
 
-        assertEquals(Site2SiteVpnConnection.State.Connected, transitionedState.get());
+        assertEquals(Site2SiteVpnConnection.State.Connected, connection.getState());
+        org.mockito.InOrder order = Mockito.inOrder(site2SiteVpnConnectionDao, service, alertManager);
+        order.verify(site2SiteVpnConnectionDao).acquireInLockTable(connection.getId());
+        order.verify(service).getVpnConnectionStatus(vpc, connection.getId());
+        order.verify(site2SiteVpnConnectionDao).persist(connection);
+        order.verify(alertManager).sendAlert(any(), anyLong(), any(), any(), any());
+        order.verify(site2SiteVpnConnectionDao).releaseFromLockTable(connection.getId());
     }
 
     @Test
     public void testPollVpnConnectionStatusTransitionsDown() {
-        Site2SiteVpnConnectionVO connection = mock(Site2SiteVpnConnectionVO.class);
+        Site2SiteVpnConnectionVO connection = preparePollingConnection(Site2SiteVpnConnection.State.Connected);
         VpcVO vpc = mock(VpcVO.class);
-        when(connection.getState()).thenReturn(Site2SiteVpnConnection.State.Connected);
-        AtomicReference<Site2SiteVpnConnection.State> transitionedState = new AtomicReference<>();
-
-        NsxServiceImpl service = new NsxServiceImpl() {
-            @Override
-            public String getVpnConnectionStatus(Vpc vpc, long connectionId) {
-                return VPN_SESSION_STATUS_DOWN;
-            }
-
-            @Override
-            protected void transitionVpnConnectionState(Site2SiteVpnConnectionVO connection, VpcVO vpc,
-                                                        Site2SiteVpnConnection.State observedState,
-                                                        Site2SiteVpnConnection.State newState) {
-                transitionedState.set(newState);
-            }
-        };
+        NsxServiceImpl service = Mockito.spy(nsxService);
+        Mockito.doReturn("DOWN").when(service).getVpnConnectionStatus(vpc, connection.getId());
 
         service.pollVpnConnectionStatus(connection, vpc);
 
-        assertEquals(Site2SiteVpnConnection.State.Disconnected, transitionedState.get());
+        assertEquals(Site2SiteVpnConnection.State.Disconnected, connection.getState());
+        verify(site2SiteVpnConnectionDao).persist(connection);
+        verify(site2SiteVpnConnectionDao).releaseFromLockTable(connection.getId());
     }
 
     @Test
     public void testPollVpnConnectionStatusKeepsPendingConnectionWhenSessionIsNotFound() {
-        Site2SiteVpnConnectionVO connection = mock(Site2SiteVpnConnectionVO.class);
+        Site2SiteVpnConnectionVO connection = preparePollingConnection(Site2SiteVpnConnection.State.Pending);
         VpcVO vpc = mock(VpcVO.class);
-        when(connection.getState()).thenReturn(Site2SiteVpnConnection.State.Pending);
-        AtomicBoolean transitioned = new AtomicBoolean();
-
-        NsxServiceImpl service = new NsxServiceImpl() {
-            @Override
-            public String getVpnConnectionStatus(Vpc vpc, long connectionId) {
-                return VPN_SESSION_STATUS_NOT_FOUND;
-            }
-
-            @Override
-            protected void transitionVpnConnectionState(Site2SiteVpnConnectionVO connection, VpcVO vpc,
-                                                        Site2SiteVpnConnection.State observedState,
-                                                        Site2SiteVpnConnection.State newState) {
-                transitioned.set(true);
-            }
-        };
+        NsxServiceImpl service = Mockito.spy(nsxService);
+        Mockito.doReturn("NOT_FOUND").when(service).getVpnConnectionStatus(vpc, connection.getId());
 
         service.pollVpnConnectionStatus(connection, vpc);
 
-        assertFalse(transitioned.get());
+        assertEquals(Site2SiteVpnConnection.State.Pending, connection.getState());
+        verify(site2SiteVpnConnectionDao, never()).persist(any());
+        verify(site2SiteVpnConnectionDao).releaseFromLockTable(connection.getId());
     }
 
     @Test
     public void testPollVpnConnectionStatusMarksMissingConnectedSessionAsError() {
-        Site2SiteVpnConnectionVO connection = mock(Site2SiteVpnConnectionVO.class);
+        Site2SiteVpnConnectionVO connection = preparePollingConnection(Site2SiteVpnConnection.State.Connected);
         VpcVO vpc = mock(VpcVO.class);
-        when(connection.getState()).thenReturn(Site2SiteVpnConnection.State.Connected);
-        AtomicReference<Site2SiteVpnConnection.State> transitionedState = new AtomicReference<>();
-
-        NsxServiceImpl service = new NsxServiceImpl() {
-            @Override
-            public String getVpnConnectionStatus(Vpc vpc, long connectionId) {
-                return VPN_SESSION_STATUS_NOT_FOUND;
-            }
-
-            @Override
-            protected void transitionVpnConnectionState(Site2SiteVpnConnectionVO connection, VpcVO vpc,
-                                                        Site2SiteVpnConnection.State observedState,
-                                                        Site2SiteVpnConnection.State newState) {
-                transitionedState.set(newState);
-            }
-        };
+        NsxServiceImpl service = Mockito.spy(nsxService);
+        Mockito.doReturn("NOT_FOUND").when(service).getVpnConnectionStatus(vpc, connection.getId());
 
         service.pollVpnConnectionStatus(connection, vpc);
 
-        assertEquals(Site2SiteVpnConnection.State.Error, transitionedState.get());
+        assertEquals(Site2SiteVpnConnection.State.Error, connection.getState());
+        verify(site2SiteVpnConnectionDao).persist(connection);
+        verify(site2SiteVpnConnectionDao).releaseFromLockTable(connection.getId());
     }
 
     @Test
     public void testPollVpnConnectionStatusDoesNotTransitionOnQueryFailure() {
-        Site2SiteVpnConnectionVO connection = mock(Site2SiteVpnConnectionVO.class);
+        Site2SiteVpnConnectionVO connection = preparePollingConnection(Site2SiteVpnConnection.State.Connected);
         VpcVO vpc = mock(VpcVO.class);
-        when(connection.getId()).thenReturn(11L);
-        AtomicBoolean transitioned = new AtomicBoolean();
-
-        NsxServiceImpl service = new NsxServiceImpl() {
-            @Override
-            public String getVpnConnectionStatus(Vpc vpc, long connectionId) {
-                throw new CloudRuntimeException("NSX unavailable");
-            }
-
-            @Override
-            protected void transitionVpnConnectionState(Site2SiteVpnConnectionVO connection, VpcVO vpc,
-                                                        Site2SiteVpnConnection.State observedState,
-                                                        Site2SiteVpnConnection.State newState) {
-                transitioned.set(true);
-            }
-        };
+        NsxServiceImpl service = Mockito.spy(nsxService);
+        Mockito.doThrow(new CloudRuntimeException("NSX unavailable"))
+                .when(service).getVpnConnectionStatus(vpc, connection.getId());
 
         service.pollVpnConnectionStatus(connection, vpc);
 
-        // A transient management-plane error must not turn a valid connection into Error.
-        assertTrue(!transitioned.get());
+        assertEquals(Site2SiteVpnConnection.State.Connected, connection.getState());
+        verify(site2SiteVpnConnectionDao, never()).persist(any());
+        verify(site2SiteVpnConnectionDao).releaseFromLockTable(connection.getId());
     }
 
     @Test
     public void testPollVpnConnectionStatusAlertsAfterThreeConsecutiveQueryFailures() {
-        Site2SiteVpnConnectionVO connection = mock(Site2SiteVpnConnectionVO.class);
+        Site2SiteVpnConnectionVO connection = preparePollingConnection(Site2SiteVpnConnection.State.Connected);
         VpcVO vpc = mock(VpcVO.class);
-        when(connection.getId()).thenReturn(11L);
-        when(connection.getUuid()).thenReturn("vpn-connection-uuid");
-        when(connection.getState()).thenReturn(Site2SiteVpnConnection.State.Connected);
         when(vpc.getName()).thenReturn("production-vpc");
         when(vpc.getZoneId()).thenReturn(7L);
-
-        NsxServiceImpl service = new NsxServiceImpl() {
-            @Override
-            public String getVpnConnectionStatus(Vpc vpc, long connectionId) {
-                throw new CloudRuntimeException("NSX unavailable");
-            }
-        };
-        service.alertManager = alertManager;
+        NsxServiceImpl service = Mockito.spy(nsxService);
+        Mockito.doThrow(new CloudRuntimeException("NSX unavailable"))
+                .when(service).getVpnConnectionStatus(vpc, connection.getId());
 
         service.pollVpnConnectionStatus(connection, vpc);
         service.pollVpnConnectionStatus(connection, vpc);
@@ -378,32 +342,72 @@ public class NsxServiceImplTest {
         // The counter resets after the alert, so the next failure starts a new sequence.
         service.pollVpnConnectionStatus(connection, vpc);
         verify(alertManager, times(1)).sendAlert(any(), anyLong(), any(), any(), any());
+        verify(site2SiteVpnConnectionDao, times(4)).releaseFromLockTable(connection.getId());
+        verify(site2SiteVpnConnectionDao, never()).persist(any());
     }
 
     @Test
-    public void testTransitionVpnConnectionStateIgnoresStaleStatusObservation() {
-        Site2SiteVpnConnectionVO connection = mock(Site2SiteVpnConnectionVO.class);
-        Site2SiteVpnConnectionVO lock = mock(Site2SiteVpnConnectionVO.class);
-        Site2SiteVpnConnectionVO current = mock(Site2SiteVpnConnectionVO.class);
+    public void testPollQueriesReplacementSessionAfterResetReturnsToSameState() {
+        Site2SiteVpnConnectionVO listed = new Site2SiteVpnConnectionVO(accountId, domainId, 7L, 9L, false);
+        listed.setState(Site2SiteVpnConnection.State.Connecting);
+        Site2SiteVpnConnectionVO current = new Site2SiteVpnConnectionVO(accountId, domainId, 7L, 9L, false);
+        current.setState(Site2SiteVpnConnection.State.Connecting);
         VpcVO vpc = mock(VpcVO.class);
-        when(connection.getId()).thenReturn(11L);
-        when(lock.getId()).thenReturn(11L);
-        when(current.getState()).thenReturn(Site2SiteVpnConnection.State.Disconnected);
-        when(site2SiteVpnConnectionDao.acquireInLockTable(11L)).thenReturn(lock);
-        when(site2SiteVpnConnectionDao.findById(11L)).thenReturn(current);
+        AtomicBoolean resetCompleted = new AtomicBoolean();
+        when(site2SiteVpnConnectionDao.acquireInLockTable(listed.getId())).thenAnswer(invocation -> {
+            // A reset finishes while the poller waits for its lock. Both generations have the
+            // same CloudStack state, but the replacement session has a different NSX status.
+            resetCompleted.set(true);
+            return current;
+        });
+        NsxServiceImpl service = Mockito.spy(nsxService);
+        Mockito.doAnswer(invocation -> resetCompleted.get() ? "DOWN" : "UP")
+                .when(service).getVpnConnectionStatus(vpc, listed.getId());
 
-        nsxService.transitionVpnConnectionState(connection, vpc, Site2SiteVpnConnection.State.Connecting,
-                Site2SiteVpnConnection.State.Connected);
+        service.pollVpnConnectionStatus(listed, vpc);
 
-        verify(site2SiteVpnConnectionDao, never()).persist(current);
-        verify(site2SiteVpnConnectionDao).releaseFromLockTable(11L);
+        assertEquals(Site2SiteVpnConnection.State.Disconnected, current.getState());
+        assertEquals(Site2SiteVpnConnection.State.Connecting, listed.getState());
+        verify(site2SiteVpnConnectionDao).persist(current);
+        verify(site2SiteVpnConnectionDao).releaseFromLockTable(current.getId());
     }
 
     @Test
-    public void testVpnStatusTransitionDefinesDatabaseContextForConnectionLock() throws NoSuchMethodException {
-        assertTrue(NsxServiceImpl.class.getDeclaredMethod("transitionVpnConnectionState",
-                Site2SiteVpnConnectionVO.class, VpcVO.class, Site2SiteVpnConnection.State.class,
-                Site2SiteVpnConnection.State.class).isAnnotationPresent(DB.class));
+    public void testPollSkipsConnectionThatLeftPolledStatesBeforeLock() {
+        Site2SiteVpnConnectionVO listed = mock(Site2SiteVpnConnectionVO.class);
+        Site2SiteVpnConnectionVO current = preparePollingConnection(Site2SiteVpnConnection.State.Error);
+        NsxServiceImpl service = Mockito.spy(nsxService);
+
+        service.pollVpnConnectionStatus(listed, mock(VpcVO.class));
+
+        verify(service, never()).getVpnConnectionStatus(any(), anyLong());
+        verify(site2SiteVpnConnectionDao, never()).persist(any());
+        verify(site2SiteVpnConnectionDao).releaseFromLockTable(current.getId());
+    }
+
+    @Test
+    public void testPollSkipsMissingOrLockedConnectionBeforeQuery() {
+        Site2SiteVpnConnectionVO listed = mock(Site2SiteVpnConnectionVO.class);
+        NsxServiceImpl service = Mockito.spy(nsxService);
+
+        service.pollVpnConnectionStatus(listed, mock(VpcVO.class));
+
+        verify(service, never()).getVpnConnectionStatus(any(), anyLong());
+        verify(site2SiteVpnConnectionDao, never()).persist(any());
+        verify(site2SiteVpnConnectionDao, never()).releaseFromLockTable(anyLong());
+    }
+
+    @Test
+    public void testVpnStatusPollDefinesDatabaseContextForConnectionLock() throws NoSuchMethodException {
+        assertTrue(NsxServiceImpl.class.getDeclaredMethod("pollVpnConnectionStatus",
+                Site2SiteVpnConnectionVO.class, VpcVO.class).isAnnotationPresent(DB.class));
+    }
+
+    private Site2SiteVpnConnectionVO preparePollingConnection(Site2SiteVpnConnection.State state) {
+        Site2SiteVpnConnectionVO connection = new Site2SiteVpnConnectionVO(accountId, domainId, 7L, 9L, false);
+        connection.setState(state);
+        when(site2SiteVpnConnectionDao.acquireInLockTable(connection.getId())).thenReturn(connection);
+        return connection;
     }
 
     @Test
